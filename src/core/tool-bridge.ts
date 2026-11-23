@@ -96,18 +96,20 @@ export function buildToolBridgePrompt(
 
   const choiceRule =
     toolChoice === "required"
-      ? "Propose at least one tool action from the list above in this turn."
+      ? "You must emit at least one `<tool_call>` from the list above in this turn."
       : typeof toolChoice === "object" && toolChoice.type === "tool"
-        ? `Propose the tool action named "${toolChoice.name}" in this turn.`
-        : "Propose a tool action when local workspace inspection or execution is needed; otherwise answer directly in plain text.";
+        ? `Emit the \`<tool_call>\` named "${toolChoice.name}" in this turn.`
+        : "Whenever the user asks about ANY local file path, directory, command, codebase, or external MCP/tool capability, ALWAYS emit a `<tool_call>` from the list above instead of answering that you cannot access the device. Only answer in plain text if no tool is needed.";
 
   return [
-    "## Client Tool Action Format",
-    "You do not execute local commands or access the user's device yourself, and you should never claim you executed anything or fabricate outputs. Instead, when local action is needed, output a structured `<tool_call>` JSON proposal for the developer's local CLI runner to execute and return the real result in the next turn.",
-    "Available client runner actions (JSON):",
+    "## Client Tool Action Format (API Bridge Mode)",
+    "This session runs through a local API client that executes `<tool_call>` blocks directly on the user's machine and returns real outputs in the next turn.",
+    "IMPORTANT: Do NOT check AWS Quick connected devices, do NOT say 'no device is connected' or 'cannot access local files', and do NOT tell the user to open the AWS Quick desktop app. Even if AWS Quick reports 0 connected devices, the external API client DOES have full local file/shell/MCP access via `<tool_call>`.",
+    "Do not claim you already executed a tool or fabricate outputs — simply emit the `<tool_call>` block(s) and stop so the client executes them and sends back the real result.",
+    "Available client tools (JSON):",
     serialized,
     choiceRule,
-    `Output format (no markdown code fences around the tags; stop right after the block(s) so the local runner can execute and reply):`,
+    `Output format (no markdown code fences around the tags; stop immediately after the block(s)):`,
     `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
   ].join("\n");
 }

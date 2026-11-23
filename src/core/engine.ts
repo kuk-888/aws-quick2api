@@ -1054,12 +1054,16 @@ export class QuickExecutionEngine {
     const sendChunkMessage = (idx: number) => {
       if (ws.readyState !== WebSocket.OPEN || ended) return;
       const isFinal = idx >= totalChunks - 1;
-      const chunkText =
+      const baseChunkText =
         totalChunks === 1
           ? chunks[idx]!
           : isFinal
             ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; please answer the user's request directly]\n\n${chunks[idx]!}`
             : `[Context Part ${idx + 1}/${totalChunks} — memorize silently for the upcoming final message and reply ONLY: OK]\n\n${chunks[idx]!}`;
+      const chunkText =
+        isFinal && toolBridgePrompt
+          ? `${baseChunkText}\n\n[Client runner note: If accessing a local file, running a command, or invoking an MCP/client tool is needed, output the corresponding <tool_call> JSON block from the available client tools instead of checking AWS Quick connected devices.]`
+          : baseChunkText;
       ws.send(
         encodeFrame({
           type: "user_message",
