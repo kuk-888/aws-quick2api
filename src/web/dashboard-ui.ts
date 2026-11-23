@@ -4261,17 +4261,35 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             (v.hasUpdate ? ' <span class="tag tag-ok">' + esc(tr('有可用更新', 'Update Available')) + '</span>' : ' <span class="tag">' + esc(tr('已是最新', 'Up to date')) + '</span>') + '</div>');
         }
       } else {
-        lines.push('<div style="color:var(--fg-muted);">' + esc(tr('未配置 UPDATE_CHECK_REPO 环境变量，暂未连接 GitHub Releases 检测。可在 .env 中设置 UPDATE_CHECK_REPO=owner/aws-quick2api 开启。', 'UPDATE_CHECK_REPO is not set. Configure UPDATE_CHECK_REPO=owner/aws-quick2api in .env to enable GitHub Releases check.')) + '</div>');
+        lines.push('<div style="color:var(--fg-muted);">' + esc(tr('已通过 UPDATE_CHECK_REPO=off 关闭 GitHub Releases 版本检测。移除该配置即可恢复默认检测。', 'GitHub Releases check is disabled via UPDATE_CHECK_REPO=off. Remove it to re-enable.')) + '</div>');
       }
       if (v.releaseNotes) {
         lines.push('<div style="margin-top:8px;"><strong>' + esc(tr('更新日志：', 'Release Notes:')) + '</strong><pre class="code-block mono" style="max-height:180px;overflow:auto;white-space:pre-wrap;">' + esc(v.releaseNotes) + '</pre></div>');
       }
-      lines.push('<div style="margin-top:10px;"><strong>' + esc(tr('升级命令参考：', 'Upgrade Commands:')) + '</strong>' +
-        '<pre class="code-block mono" style="margin-top:4px;"># Docker\\ndocker compose pull && docker compose up -d\\n\\n# Source\\ngit pull && npm ci && npm run build</pre></div>');
+      lines.push('<div style="margin-top:10px;"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;"><strong>' + esc(tr('升级命令参考：', 'Upgrade Commands:')) + '</strong>' +
+        '<div style="display:flex;gap:6px;">' +
+        '<button type="button" class="btn btn-sm" id="copyDockerUpgradeBtn">' + esc(tr('复制 Docker 升级命令', 'Copy Docker Upgrade')) + '</button>' +
+        '<button type="button" class="btn btn-sm" id="copySourceUpgradeBtn">' + esc(tr('复制源码升级命令', 'Copy Source Upgrade')) + '</button>' +
+        '</div></div>' +
+        '<pre class="code-block mono" style="margin-top:6px;"># Docker\\ndocker compose pull && docker compose up -d\\n\\n# Source\\ngit pull && npm ci && npm run build</pre></div>');
       if (v.releaseUrl && (String(v.releaseUrl).startsWith("https://") || String(v.releaseUrl).startsWith("http://"))) {
         lines.push('<div style="margin-top:6px;"><a href="' + esc(v.releaseUrl) + '" target="_blank" rel="noopener" style="color:var(--cta-bg);text-decoration:underline;">' + esc(tr('前往 GitHub Release 页面查看详情 →', 'View on GitHub Releases →')) + '</a></div>');
       }
       $("updateModalBody").innerHTML = lines.join("");
+      const copyCmd = async (cmd, label) => {
+        try {
+          await navigator.clipboard.writeText(cmd);
+          notify(tr("已复制 " + label + " 升级命令，在服务器终端执行即可完成升级。", "Copied " + label + " upgrade command."));
+        } catch {
+          notify(tr("复制失败，请手动复制下方命令。", "Copy failed, please copy manually."), true);
+        }
+      };
+      if ($("copyDockerUpgradeBtn")) {
+        $("copyDockerUpgradeBtn").onclick = () => void copyCmd("docker compose pull && docker compose up -d", "Docker");
+      }
+      if ($("copySourceUpgradeBtn")) {
+        $("copySourceUpgradeBtn").onclick = () => void copyCmd("git pull && npm ci && npm run build", tr("源码", "Source"));
+      }
     }
     async function checkAppVersion(force) {
       try {

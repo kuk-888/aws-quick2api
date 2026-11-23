@@ -244,7 +244,7 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.throws(() => validateProxyUrl("not-a-url"));
 
     const prevRepo = process.env.UPDATE_CHECK_REPO;
-    delete process.env.UPDATE_CHECK_REPO;
+    process.env.UPDATE_CHECK_REPO = "off";
     try {
       const ver = await checkLatestVersion();
       assert.equal(ver.hasUpdate, false);
@@ -252,6 +252,7 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.match(ver.currentVersion, /^\d+\.\d+\.\d+/);
     } finally {
       if (prevRepo !== undefined) process.env.UPDATE_CHECK_REPO = prevRepo;
+      else delete process.env.UPDATE_CHECK_REPO;
     }
   });
 

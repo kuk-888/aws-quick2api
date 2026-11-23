@@ -177,7 +177,7 @@ docker compose pull && docker compose up -d
 | `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | 超长上下文网关兜底压缩阈值（`0` 关闭） |
 | `AUTO_COMPACT_SUMMARY` | `true` | 触发超限压缩时优先对中间旧内容生成摘要 |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 关闭无痕时多轮增量热复用的缓存时长（30 分钟）与上限 |
-| `UPDATE_CHECK_REPO` | - | 可选填 GitHub `owner/repo`，开启管理台新版本提示 |
+| `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | 管理台新版本提示仓库（设为 `off` 关闭） |
 
 ---
 

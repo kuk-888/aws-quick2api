@@ -37,13 +37,17 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
+const DEFAULT_UPDATE_CHECK_REPO = "kuk-888/aws-quick2api";
+const DISABLED_VALUES = new Set(["off", "false", "none", "0", "disabled"]);
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 let cachedResult: VersionCheckResult | null = null;
 let cachedAtMs = 0;
 
 export async function checkLatestVersion(force = false): Promise<VersionCheckResult> {
   const currentVersion = readPackageVersion();
-  const rawRepo = process.env.UPDATE_CHECK_REPO?.trim() || "";
+  const envVal = process.env.UPDATE_CHECK_REPO?.trim();
+  const isDisabled = envVal !== undefined && DISABLED_VALUES.has(envVal.toLowerCase());
+  const rawRepo = isDisabled ? "" : envVal || DEFAULT_UPDATE_CHECK_REPO;
   const repo = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(rawRepo) ? rawRepo : null;
 
   if (!repo) {

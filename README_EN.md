@@ -169,7 +169,7 @@ See [.env.example](./.env.example) for the full template:
 | `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | Safety-net compaction threshold for oversized prompts (`0` to disable) |
 | `AUTO_COMPACT_SUMMARY` | `true` | Summarize middle history when overflow compaction triggers |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental cache TTL (30 min) and max entries when `INCOGNITO=false` |
-| `UPDATE_CHECK_REPO` | - | Optional GitHub `owner/repo` for non-blocking release check in Console |
+| `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | GitHub `owner/repo` for non-blocking release check in Console (set `off` to disable) |
 
 ---
 
