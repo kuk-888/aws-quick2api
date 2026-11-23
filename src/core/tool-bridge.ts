@@ -114,15 +114,152 @@ export function buildToolBridgePrompt(
   ].join("\n");
 }
 
+function repairJsonOutsideStrings(input: string): string {
+  // Single pass: (1) escape literal \n/\r/\t inside JSON strings;
+  // (2) strip trailing commas before `}` or `]` strictly OUTSIDE JSON strings so user code is never mutated.
+  let escapedOut = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i]!;
+    if (!inString) {
+      if (ch === "\"") inString = true;
+      escapedOut += ch;
+      continue;
+    }
+    if (escaped) {
+      escapedOut += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escapedOut += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = false;
+      escapedOut += ch;
+      continue;
+    }
+    if (ch === "\n") escapedOut += "\\n";
+    else if (ch === "\r") escapedOut += "\\r";
+    else if (ch === "\t") escapedOut += "\\t";
+    else escapedOut += ch;
+  }
+
+  // Second pass: remove trailing commas strictly outside string literals.
+  let finalOut = "";
+  inString = false;
+  escaped = false;
+  for (let i = 0; i < escapedOut.length; i += 1) {
+    const ch = escapedOut[i]!;
+    if (inString) {
+      finalOut += ch;
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      finalOut += ch;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < escapedOut.length && /\s/.test(escapedOut[j]!)) j += 1;
+      if (j < escapedOut.length && (escapedOut[j] === "}" || escapedOut[j] === "]")) {
+        continue; // drop trailing comma outside strings
+      }
+    }
+    finalOut += ch;
+  }
+  return finalOut;
+}
+
+function tryParseJsonObject(raw: string): Record<string, unknown> | null {
+  const unfenced = raw
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
+  if (!unfenced) return null;
+
+  const tryDirect = (s: string): Record<string, unknown> | null => {
+    try {
+      const parsed = JSON.parse(s);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const direct = tryDirect(unfenced);
+  if (direct) return direct;
+
+  // Repair pass: isolate outermost {...}, escape literal newlines inside strings, strip trailing commas OUTSIDE strings.
+  const firstBrace = unfenced.indexOf("{");
+  if (firstBrace === -1) return null;
+  const lastBrace = unfenced.lastIndexOf("}");
+  const sliced = lastBrace > firstBrace ? unfenced.slice(firstBrace, lastBrace + 1) : unfenced.slice(firstBrace);
+  const repaired = repairJsonOutsideStrings(sliced);
+  const fromRepaired = tryDirect(repaired);
+  if (fromRepaired) return fromRepaired;
+
+  // Last resort: recover 1-2 missing closing braces on truncated tail objects.
+  let openBraces = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < repaired.length; i += 1) {
+    const ch = repaired[i]!;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === "\"") inStr = false;
+    } else {
+      if (ch === "\"") inStr = true;
+      else if (ch === "{") openBraces += 1;
+      else if (ch === "}") openBraces -= 1;
+    }
+  }
+  if (!inStr && openBraces > 0 && openBraces <= 2) {
+    return tryDirect(repaired + "}".repeat(openBraces));
+  }
+  return null;
+}
+
+function buildNormalizedToolCall(parsed: Record<string, unknown>): NormalizedToolCall | null {
+  const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
+  if (!name) return null;
+  const rawArgs = parsed.arguments ?? parsed.input ?? {};
+  const argsObject: Record<string, unknown> =
+    typeof rawArgs === "string"
+      ? (tryParseJsonObject(rawArgs) ?? {})
+      : rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
+        ? (rawArgs as Record<string, unknown>)
+        : {};
+  return {
+    id: `call_${crypto.randomBytes(8).toString("hex")}`,
+    name,
+    argumentsJson: JSON.stringify(argsObject),
+    argsObject,
+  };
+}
+
 /**
- * Parse `<tool_call>{...}</tool_call>` blocks from model output text.
+ * Parse `<tool_call>{...}</tool_call>` blocks from model output text,
+ * with automatic recovery for minor JSON malformations (trailing commas,
+ * unescaped literal newlines in string values) and unclosed trailing `<tool_call>` tags.
  */
 export function parseToolCallsFromText(text: string): {
   cleanText: string;
   toolCalls: NormalizedToolCall[];
 } {
   const toolCalls: NormalizedToolCall[] = [];
-  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
   let lastIdx = 0;
   const textParts: string[] = [];
 
@@ -132,43 +269,32 @@ export function parseToolCallsFromText(text: string): {
     textParts.push(text.slice(lastIdx, start));
     lastIdx = start + match[0].length;
 
-    const unfenced = rawBlock
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/, "")
-      .trim();
-
-    try {
-      const parsed = JSON.parse(unfenced) as Record<string, unknown>;
-      const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
-      if (!name) continue;
-      const rawArgs = parsed.arguments ?? parsed.input ?? {};
-      const argsObject: Record<string, unknown> =
-        typeof rawArgs === "string"
-          ? (() => {
-            try {
-              const obj = JSON.parse(rawArgs);
-              return obj && typeof obj === "object" && !Array.isArray(obj) ? (obj as Record<string, unknown>) : {};
-            } catch {
-              return {};
-            }
-          })()
-          : rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
-            ? (rawArgs as Record<string, unknown>)
-            : {};
-      const argumentsJson = JSON.stringify(argsObject);
-      toolCalls.push({
-        id: `call_${crypto.randomBytes(8).toString("hex")}`,
-        name,
-        argumentsJson,
-        argsObject,
-      });
-    } catch {
-      // Malformed JSON inside <tool_call>: preserve raw block as text so nothing is silently lost.
+    const parsed = tryParseJsonObject(rawBlock);
+    const tc = parsed ? buildNormalizedToolCall(parsed) : null;
+    if (tc) {
+      toolCalls.push(tc);
+    } else {
+      // Unrecoverable malformed JSON inside <tool_call>: preserve raw block as text so nothing is silently lost.
       textParts.push(match[0]);
     }
   }
 
-  textParts.push(text.slice(lastIdx));
+  const tail = text.slice(lastIdx);
+  const unclosedMatch = /<tool_call>\s*([\s\S]+)$/i.exec(tail);
+  if (unclosedMatch) {
+    const beforeUnclosed = tail.slice(0, unclosedMatch.index);
+    const parsed = tryParseJsonObject(unclosedMatch[1] ?? "");
+    const tc = parsed ? buildNormalizedToolCall(parsed) : null;
+    if (tc) {
+      textParts.push(beforeUnclosed);
+      toolCalls.push(tc);
+    } else {
+      textParts.push(tail);
+    }
+  } else {
+    textParts.push(tail);
+  }
+
   return {
     cleanText: textParts.join("").trim(),
     toolCalls,
@@ -183,6 +309,8 @@ export class StreamingToolCallFilter {
   private pending = "";
   private capturing = false;
   private captured = "";
+  private inCodeFence = false;
+  private fenceLinePrefix = "";
 
   feed(delta: string): string {
     if (!delta) return "";
@@ -191,26 +319,51 @@ export class StreamingToolCallFilter {
       return "";
     }
     const combined = this.pending + delta;
-    const openIdx = combined.indexOf(TOOL_CALL_OPEN);
-    if (openIdx !== -1) {
-      const before = combined.slice(0, openIdx);
-      this.capturing = true;
-      this.captured = combined.slice(openIdx);
-      this.pending = "";
-      return before;
+    const lower = combined.toLowerCase();
+    const openLower = TOOL_CALL_OPEN.toLowerCase();
+
+    // Scan combined while tracking triple-backtick Markdown code fences so `<tool_call>` inside
+    // documentation/code examples is never mistaken for a real tool invocation.
+    let searchFrom = 0;
+    while (searchFrom < combined.length) {
+      const idx = lower.indexOf(openLower, searchFrom);
+      if (idx === -1) break;
+      // Advance fence state up to `idx`
+      const prefix = combined.slice(searchFrom, idx);
+      this.advanceFenceState(prefix);
+      if (!this.inCodeFence) {
+        const before = combined.slice(0, idx);
+        this.capturing = true;
+        this.captured = combined.slice(idx);
+        this.pending = "";
+        return before;
+      }
+      searchFrom = idx + openLower.length;
     }
 
-    // Hold back a potential partial prefix of `<tool_call>` at the tail of the chunk.
+    // Hold back a potential partial prefix of `<tool_call>` (case-insensitive) at the tail of the chunk.
     let holdLen = 0;
-    const maxCheck = Math.min(combined.length, TOOL_CALL_OPEN.length - 1);
+    const maxCheck = Math.min(combined.length, openLower.length - 1);
     for (let len = maxCheck; len >= 1; len--) {
-      if (TOOL_CALL_OPEN.startsWith(combined.slice(combined.length - len))) {
+      if (openLower.startsWith(lower.slice(lower.length - len))) {
         holdLen = len;
         break;
       }
     }
+    const emit = holdLen > 0 ? combined.slice(0, combined.length - holdLen) : combined;
+    this.advanceFenceState(emit.slice(searchFrom));
     this.pending = holdLen > 0 ? combined.slice(combined.length - holdLen) : "";
-    return holdLen > 0 ? combined.slice(0, combined.length - holdLen) : combined;
+    return emit;
+  }
+
+  private advanceFenceState(segment: string): void {
+    if (!segment) return;
+    const combined = this.fenceLinePrefix + segment;
+    const lines = combined.split("\n");
+    this.fenceLinePrefix = lines.pop() ?? "";
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) this.inCodeFence = !this.inCodeFence;
+    }
   }
 
   flush(): { remainingText: string; toolCalls: NormalizedToolCall[] } {

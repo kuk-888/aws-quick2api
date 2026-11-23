@@ -35,7 +35,8 @@ import {
   parseChatCompletionsRequest,
   parseResponsesRequest,
 } from "../src/protocols/openai.js";
-import { anthropicMessagesAdapter } from "../src/protocols/anthropic.js";
+import { anthropicMessagesAdapter, parseAnthropicMessagesRequest } from "../src/protocols/anthropic.js";
+import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
 import { AWS_QUICK_MODELS, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
 import { ClientGatewayKeyManager } from "../src/services/client-keys.js";
 import { checkLatestVersion } from "../src/services/update-checker.js";
@@ -344,6 +345,14 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.ok(splitBig.effectiveCustomPrompt && splitBig.effectiveCustomPrompt.includes("## Client Tool Action Format"));
     assert.ok(Buffer.byteLength(splitBig.effectiveCustomPrompt, "utf8") <= 36_000);
     assert.ok(!splitBig.chunks.join("").includes("[System Instructions]"));
+
+    // Intermediate chunks use full ~46.5KB budget instead of subtracting customPrompt (halves chunk count on long sessions)
+    const sys30k = "S".repeat(30_000);
+    const hist150k = "Line of long coding conversation history 0123456789.\n".repeat(2900); // ~153KB
+    const fastSplit = splitPromptIntoSafeChunks(hist150k, sys30k);
+    assert.ok(fastSplit.chunks.length <= 5, `Expected <=5 chunks for 153KB + 30KB sys, got ${fastSplit.chunks.length}`);
+    assert.equal(fastSplit.chunks.join(""), hist150k);
+    assert.ok(Buffer.byteLength(fastSplit.chunks[fastSplit.chunks.length - 1]!, "utf8") + 30_000 <= 46_500);
   });
 
   it("blocks private, loopback, and cloud-metadata image URLs against SSRF", async () => {
@@ -712,5 +721,135 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(firstAnth.done, false);
     await anthStream.return(undefined);
     assert.equal(anthFinalized, true);
+  });
+
+  it("keeps conversationKey and warm_incremental prefix hashes stable across dynamic systemPrompt and tool-call turns", () => {
+    // 1. Dynamic timestamps/dates in systemPrompt must normalize identically
+    const normA = normalizeSystemPromptForHash("You are Witan.\nCurrent time: 2026-11-23 23:34:01\nNow: 2026-11-23T15:34:01Z");
+    const normB = normalizeSystemPromptForHash("You are Witan.\nCurrent time: 2026-11-23 23:39:37\nNow: 2026-11-23T15:39:37Z");
+    assert.equal(normA, normB);
+
+    // 2. OpenAI Chat (Witan-like): dynamic systemPrompt + multi-turn tool calls maintain sticky conversationKey & warm prefix hit
+    const tools = [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }];
+    const t1 = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      tools,
+      messages: [
+        { role: "system", content: "You are Witan. Current time: 2026-11-23 23:34:01. Active todos: 0." },
+        { role: "user", content: "Help me refactor src/config.ts to use port 9443." },
+      ],
+    });
+    assert.ok(t1.conversationKey);
+    assert.ok(t1.currentInputPrefixHash);
+    const expectedAfterT1 = extendHashWithAssistantTurn(t1.currentInputPrefixHash!, "Reading config...", [
+      { id: "call_w1", name: "read_file" },
+    ]);
+
+    const t2 = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      tools,
+      messages: [
+        { role: "system", content: "You are Witan. Current time: 2026-11-23 23:35:48. Active todos: 2 (reading)." },
+        { role: "user", content: "Help me refactor src/config.ts to use port 9443." },
+        {
+          role: "assistant",
+          content: "Reading config...",
+          tool_calls: [{ id: "call_w1", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/config.ts\"}" } }],
+        },
+        { role: "tool", tool_call_id: "call_w1", name: "read_file", content: "export const PORT = 3000;" },
+      ],
+    });
+    assert.equal(t2.conversationKey, t1.conversationKey);
+    assert.equal(t2.priorPrefixHash, expectedAfterT1);
+    assert.ok(t2.incrementalUserText && t2.incrementalUserText.includes("[TOOL_RESULT name=read_file id=call_w1]:"));
+    assert.ok(!t2.incrementalUserText!.includes("Help me refactor"));
+
+    // 3. Anthropic Messages (Claude Code): tool_use -> tool_result hits warm_incremental
+    const anthTools = [{ name: "Read", input_schema: { type: "object" } }];
+    const a1 = parseAnthropicMessagesRequest({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: "Claude Code system prompt. Timestamp: 2026-11-23T15:34:01Z",
+      tools: anthTools,
+      messages: [{ role: "user", content: "Please inspect package.json and report the version." }],
+    });
+    const expectedAfterA1 = extendHashWithAssistantTurn(a1.currentInputPrefixHash!, "", [
+      { id: "toolu_01", name: "Read" },
+    ]);
+    const a2 = parseAnthropicMessagesRequest({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1024,
+      system: "Claude Code system prompt. Timestamp: 2026-11-23T15:36:12Z",
+      tools: anthTools,
+      messages: [
+        { role: "user", content: "Please inspect package.json and report the version." },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: "package.json" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01", content: "{\"version\":\"0.1.7\"}" }] },
+      ],
+    });
+    assert.equal(a2.conversationKey, a1.conversationKey);
+    assert.equal(a2.priorPrefixHash, expectedAfterA1);
+    assert.ok(a2.incrementalUserText && a2.incrementalUserText.includes("[TOOL_RESULT id=toolu_01]:"));
+
+    // 4. OpenAI Responses (Codex CLI): coalesces assistant text + function_call and hits warm_incremental
+    const r1 = parseResponsesRequest({
+      model: "gpt-5.4",
+      instructions: "Codex CLI. Current date: 2026-11-23 23:34:01",
+      tools: [{ type: "custom", name: "apply_patch" }],
+      input: [{ role: "user", content: "Patch src/app.ts to export VERSION." }],
+    });
+    const expectedAfterR1 = extendHashWithAssistantTurn(r1.currentInputPrefixHash!, "Applying patch now.", [
+      { id: "call_c1", name: "apply_patch" },
+    ]);
+    const r2 = parseResponsesRequest({
+      model: "gpt-5.4",
+      instructions: "Codex CLI. Current date: 2026-11-23 23:38:55",
+      tools: [{ type: "custom", name: "apply_patch" }],
+      input: [
+        { role: "user", content: "Patch src/app.ts to export VERSION." },
+        { role: "assistant", content: "Applying patch now." },
+        { type: "custom_tool_call", call_id: "call_c1", name: "apply_patch", input: "*** Begin Patch" },
+        { type: "custom_tool_call_output", call_id: "call_c1", output: "Patched src/app.ts" },
+      ],
+    });
+    assert.equal(r2.conversationKey, r1.conversationKey);
+    assert.equal(r2.priorPrefixHash, expectedAfterR1);
+    assert.equal(r2.incrementalUserText, "[TOOL_RESULT id=call_c1]:\nPatched src/app.ts");
+  });
+
+  it("recovers malformed JSON (trailing commas, literal newlines) and missing </tool_call> closing tags without mutating user code", () => {
+    // 1. Trailing comma + unescaped literal newline inside code string: MUST preserve legal trailing commas INSIDE user code!
+    const malformed = `Updating file now.\n<tool_call>\n{\n  "name": "write_file",\n  "arguments": {\n    "path": "src/a.ts",\n    "content": "const arr = [\n  1,\n  2,\n];",\n  },\n}\n</tool_call>`;
+    const r1 = parseToolCallsFromText(malformed);
+    assert.equal(r1.cleanText, "Updating file now.");
+    assert.equal(r1.toolCalls.length, 1);
+    assert.equal(r1.toolCalls[0]!.name, "write_file");
+    assert.equal(r1.toolCalls[0]!.argsObject.path, "src/a.ts");
+    assert.equal(r1.toolCalls[0]!.argsObject.content, "const arr = [\n  1,\n  2,\n];");
+
+    // 2. Missing closing </tool_call> tag at end of turn
+    const unclosed = `Checking status.\n<tool_call>\n{"name": "run_shell", "arguments": {"command": "git status"}}`;
+    const r2 = parseToolCallsFromText(unclosed);
+    assert.equal(r2.cleanText, "Checking status.");
+    assert.equal(r2.toolCalls.length, 1);
+    assert.equal(r2.toolCalls[0]!.name, "run_shell");
+    assert.equal(r2.toolCalls[0]!.argsObject.command, "git status");
+
+    // 3. StreamingToolCallFilter ignores <tool_call> inside Markdown code fences but captures real case-insensitive <TOOL_CALL>
+    const f = new StreamingToolCallFilter();
+    const out1 = f.feed("Example:\n```xml\n<tool_call>{\"name\":\"fake\"}</tool_call>\n```\nNow real: ");
+    const out2 = f.feed("<TOOL_CALL>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.ts\"}}</TOOL_CALL>");
+    const fl = f.flush();
+    assert.ok((out1 + out2 + fl.remainingText).includes("<tool_call>{\"name\":\"fake\"}</tool_call>"));
+    assert.equal(fl.toolCalls.length, 1);
+    assert.equal(fl.toolCalls[0]!.name, "read_file");
+
+    // 4. Heavy JSON-escaped code payload stays strictly <= 50KB AFTER JSON.stringify encoding
+    const heavyCode = `const s = "quoted \\\\ \\n line";\n`.repeat(1600); // ~51KB raw, ~64KB JSON-escaped
+    const escapedSplit = splitPromptIntoSafeChunks(heavyCode, "sys");
+    assert.equal(escapedSplit.chunks.join(""), heavyCode);
+    for (const c of escapedSplit.chunks) {
+      assert.ok(Buffer.byteLength(JSON.stringify(c), "utf8") <= 46_500);
+    }
   });
 });

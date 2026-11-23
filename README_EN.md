@@ -26,8 +26,8 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
 - **Multi-Account Pool & Per-Credential Proxies**:
   - `quota-aware`, `least-busy`, and `round-robin` scheduling, sticky session affinity (high Bedrock Prompt Cache hit rate), automatic circuit-breaking on quota exhaustion, and failover on 401/429/502/503.
   - Zero-dependency per-account outbound proxy supporting `http://`, `https://`, `socks5://`, `socks5h://` (remote DNS), and common provider shorthands (`host:port`, `user:pass@host:port`, `host:port:user:pass`), with automatic transient retry for residential proxies.
-- **Privacy & Warm Reuse**:
-  - Native `incognito: true` by default (zero AWS cloud chat history). When incognito is turned off, enables `thread_id` warm incremental reuse on multi-turn chats.
+- **Native Incognito Privacy & Dedicated WS Warm Reuse**:
+  - Combines **native `incognito: true` (zero AWS cloud history)** with **per-conversation dedicated WebSocket keepalive & warm incremental reuse** across all protocols (including multi-turn tool calls in Claude Code, Codex CLI, and Witan) for **1.4–3.2s** follow-up latency; 5-tuple session isolation prevents cross-talk, idle disconnects seamlessly fall back to lossless `46.5 KB` chunked replay with zero amnesia, and cloud mode (`INCOGNITO=false`) additionally supports cross-disconnect `thread_id` resume.
 - **Built-in Web Console (`aws-quick-admin`)**:
   - Served at `/dashboard` (EN/ZH, Light/Dark). Includes overview charts, routed-model breakdown, live quota & free-trial countdown, selective quota sync, batch cloud session cleanup, scoped `sk-aq-...` sub-keys (model allowlist, concurrency, quota, expiry), and live request traces.
 

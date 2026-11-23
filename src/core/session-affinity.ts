@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { normalizeSystemPromptForHash } from "../utils/hash.js";
 
 export interface AffinityBindingView {
   conversationKey: string;
@@ -71,14 +72,20 @@ export function deriveConversationAffinityKey(params: {
 
   if (typeof rawBody.user === "string" && rawBody.user.trim()) {
     // Combine `user` + first message anchor so one user's separate chat windows don't collide unnecessarily,
-    // while keeping the same chat window 100% sticky.
-    const anchor = `${rawBody.user.trim()}\0${(systemPrompt || "").slice(0, 512)}\0${(firstUserText || "").trim().slice(0, 1024)}`;
+    // while keeping the same chat window 100% sticky even when clients mutate dynamic system prompts.
+    const trimmedFirst = (firstUserText || "").trim();
+    const sysAnchor = trimmedFirst.length >= 16 ? "" : normalizeSystemPromptForHash(systemPrompt || "").slice(0, 512);
+    const anchor = `${rawBody.user.trim()}\0${sysAnchor}\0${trimmedFirst.slice(0, 1024)}`;
     return shortHash("usr", anchor);
   }
 
   const trimmedFirst = (firstUserText || "").trim();
   if (trimmedFirst) {
-    const anchor = `${(systemPrompt || "").trim().slice(0, 512)}\0${trimmedFirst.slice(0, 1024)}`;
+    // When the first user message is substantive (>= 16 chars), anchor on it alone so dynamic
+    // system prompt edits (timestamps, memory lists, todo states in Witan/Agent clients)
+    // never break account stickiness or warm thread reuse.
+    const sysAnchor = trimmedFirst.length >= 16 ? "" : normalizeSystemPromptForHash(systemPrompt || "").slice(0, 512);
+    const anchor = `${sysAnchor}\0${trimmedFirst.slice(0, 1024)}`;
     return shortHash("anc", anchor);
   }
 

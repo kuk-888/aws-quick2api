@@ -26,7 +26,7 @@ import { buildWebWsConnection } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
 import { listLiveModels, resolveModelSelection } from "../services/model-catalog.js";
 import type { ExecutionModeTag, UsageTracker } from "../services/usage-tracker.js";
-import { extendHashWithAssistantReply, redactSecrets } from "../utils/hash.js";
+import { extendHashWithAssistantTurn, redactSecrets } from "../utils/hash.js";
 import { getProxyAgent } from "../utils/proxy-agent.js";
 import type { UpstreamKeyPool } from "./key-pool.js";
 import {
@@ -296,6 +296,7 @@ export function mapSdkError(err: unknown): GatewayError {
 }
 
 const MAX_WS_PAYLOAD_UTF8_BYTES = 50_000;
+const WS_FRAME_ENVELOPE_MARGIN_BYTES = 3_500;
 const MAX_INLINE_CUSTOM_PROMPT_BYTES = 36_000;
 const DEFAULT_OVERFLOW_COMPACT_TOKENS = 850_000;
 
@@ -380,32 +381,42 @@ export function compactOversizedPrompt(
 }
 
 /**
- * Splits a UTF-8 string into chunks each strictly <= `maxFrameBytes` UTF-8 bytes,
+ * Splits a UTF-8 string into chunks that strictly fit AWS Quick's 50KB single-frame ceiling
+ * (leaving margin for JSON/CBOR envelope, chunk header, and client-tool reminder),
  * preferring newline boundaries and never splitting UTF-16 surrogate pairs.
+ *
+ * Intermediate chunks do NOT carry `custom_prompt` or `attachments`, so they can use the full
+ * ~46.5KB budget; only the final chunk reserves space for `effectiveCustomPrompt` + `attachments`.
  */
+function jsonStringUtf8Bytes(s: string): number {
+  if (!s) return 0;
+  return Buffer.byteLength(JSON.stringify(s), "utf8");
+}
+
 export function splitPromptIntoSafeChunks(
   prompt: string,
   customPrompt: string | null,
   maxFrameBytes = MAX_WS_PAYLOAD_UTF8_BYTES,
 ): { chunks: string[]; effectiveCustomPrompt: string | null } {
-  const customBytes = customPrompt ? Buffer.byteLength(customPrompt, "utf8") : 0;
-  const promptBytes = Buffer.byteLength(prompt, "utf8");
+  const customBytes = customPrompt ? jsonStringUtf8Bytes(customPrompt) : 0;
+  const promptBytes = jsonStringUtf8Bytes(prompt);
+  const safeFinalTotal = Math.max(4_096, maxFrameBytes - WS_FRAME_ENVELOPE_MARGIN_BYTES);
 
-  if (promptBytes + customBytes <= maxFrameBytes) {
+  if (promptBytes + customBytes <= safeFinalTotal) {
     return { chunks: [prompt], effectiveCustomPrompt: customPrompt };
   }
 
   let effectiveCustomPrompt = customPrompt;
   let fullText = prompt;
-  if (customPrompt && customBytes > MAX_INLINE_CUSTOM_PROMPT_BYTES) {
+  if (customPrompt && customBytes > Math.min(MAX_INLINE_CUSTOM_PROMPT_BYTES, Math.max(4_096, safeFinalTotal - 4_096))) {
     // Keep the tail (including any tool-bridge instructions) inside native `custom_prompt`
     // so AWS Quick does not treat system/tool instructions as untrusted user-message prompt injection.
-    const keepBudget = Math.min(MAX_INLINE_CUSTOM_PROMPT_BYTES, Math.max(8_192, maxFrameBytes - 10_000));
+    const keepBudget = Math.min(MAX_INLINE_CUSTOM_PROMPT_BYTES, Math.max(4_096, safeFinalTotal - 6_144));
     let keepStart = customPrompt.length;
     let keptBytes = 0;
     while (keepStart > 0) {
       const prevIdx = keepStart - 1;
-      const chBytes = Buffer.byteLength(customPrompt[prevIdx]!, "utf8");
+      const chBytes = jsonStringUtf8Bytes(customPrompt[prevIdx]!) - 2; // exclude surrounding JSON quotes
       if (keptBytes + chBytes > keepBudget) break;
       keptBytes += chBytes;
       keepStart = prevIdx;
@@ -425,24 +436,35 @@ export function splitPromptIntoSafeChunks(
     }
   }
 
-  const reserved = effectiveCustomPrompt ? Buffer.byteLength(effectiveCustomPrompt, "utf8") : 0;
-  const chunkLimit = Math.max(8_192, maxFrameBytes - reserved - 256);
+  const reserved = effectiveCustomPrompt ? jsonStringUtf8Bytes(effectiveCustomPrompt) : 0;
+  const intermediateLimit = Math.max(8_192, MAX_WS_PAYLOAD_UTF8_BYTES - WS_FRAME_ENVELOPE_MARGIN_BYTES);
+  const rawFinalRoom = safeFinalTotal - reserved;
+  const finalLimit = Math.max(1_024, Math.min(intermediateLimit, rawFinalRoom));
 
   const chunks: string[] = [];
   let offset = 0;
   const len = fullText.length;
 
   while (offset < len) {
-    if (Buffer.byteLength(fullText.slice(offset), "utf8") <= chunkLimit) {
-      chunks.push(fullText.slice(offset));
+    const remainingSlice = fullText.slice(offset);
+    const remainingBytes = jsonStringUtf8Bytes(remainingSlice);
+    if (remainingBytes <= finalLimit) {
+      chunks.push(remainingSlice);
       break;
     }
 
+    // If remaining text fits in an intermediate chunk but not in `finalLimit`, peel off just enough
+    // so the final chunk comfortably fits `finalLimit` (avoiding tiny 1-byte trailing chunks).
+    const targetBytes =
+      remainingBytes <= intermediateLimit
+        ? Math.max(1_024, remainingBytes - Math.floor(finalLimit * 0.8))
+        : intermediateLimit;
+
     let lo = offset + 1;
-    let hi = Math.min(len, offset + chunkLimit);
+    let hi = Math.min(len, offset + targetBytes);
     while (lo < hi) {
       const mid = Math.ceil((lo + hi) / 2);
-      if (Buffer.byteLength(fullText.slice(offset, mid), "utf8") <= chunkLimit) {
+      if (jsonStringUtf8Bytes(fullText.slice(offset, mid)) <= targetBytes) {
         lo = mid;
       } else {
         hi = mid - 1;
@@ -473,7 +495,27 @@ export function splitPromptIntoSafeChunks(
  * AWS Quick bidirectional WebSocket execution engine.
  */
 const WARM_THREAD_TTL_MS = 30 * 60 * 1000;
+const PARKED_WS_IDLE_TTL_MS = 15 * 60 * 1000;
 const MAX_WARM_THREADS = 256;
+const MAX_PARKED_WS = 32;
+
+interface ParkedWsHandle {
+  ws: WebSocket;
+  outpostId: string;
+  pingTimer: NodeJS.Timeout;
+  idleTimer: NodeJS.Timeout;
+  onIdleClose: () => void;
+  onIdleError: () => void;
+  onIdleMessage: () => void;
+}
+
+interface WarmThreadEntry {
+  threadId: string;
+  isIncognito: boolean;
+  expiresAt: number;
+  parkedWs?: ParkedWsHandle;
+  siblingKeys: string[];
+}
 
 export class QuickExecutionEngine {
   private readonly config: GatewayConfig;
@@ -486,60 +528,220 @@ export class QuickExecutionEngine {
   private readonly webSearchEnabled: boolean;
   private readonly sanitizeAwsUiTags: boolean;
   private readonly workingSessionIds = new Map<string, string>();
-  private readonly warmThreads = new Map<string, { threadId: string; expiresAt: number }>();
+  private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
 
   private warmKey(
     scope: string | undefined,
     conversationKey: string | undefined,
     slotId: string,
+    isIncognito: boolean,
     prefixHash: string
   ): string {
-    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${prefixHash}`;
+    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${isIncognito ? "inc" : "cld"}|${prefixHash}`;
+  }
+
+  private detachParkedWs(handle: ParkedWsHandle, closeSocket: boolean): void {
+    clearInterval(handle.pingTimer);
+    clearTimeout(handle.idleTimer);
+    handle.ws.off("close", handle.onIdleClose);
+    handle.ws.off("error", handle.onIdleError);
+    handle.ws.off("message", handle.onIdleMessage);
+    if (closeSocket) {
+      try {
+        handle.ws.close();
+      } catch { }
+    }
+  }
+
+  private removeWarmEntry(entry: WarmThreadEntry, closeSocket: boolean): void {
+    for (const k of entry.siblingKeys) {
+      if (this.warmThreads.get(k) === entry) {
+        this.warmThreads.delete(k);
+      }
+    }
+    if (entry.parkedWs) {
+      const h = entry.parkedWs;
+      entry.parkedWs = undefined;
+      this.detachParkedWs(h, closeSocket);
+    }
+  }
+
+  private countParkedWs(): number {
+    const seen = new Set<WarmThreadEntry>();
+    let n = 0;
+    for (const entry of this.warmThreads.values()) {
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      if (entry.parkedWs && entry.parkedWs.ws.readyState === WebSocket.OPEN) n += 1;
+    }
+    return n;
   }
 
   private lookupWarmThread(
     scope: string | undefined,
     conversationKey: string | undefined,
     slotId: string,
+    isIncognito: boolean,
     prefixHash: string
-  ): string | undefined {
-    const key = this.warmKey(scope, conversationKey, slotId, prefixHash);
+  ): { threadId: string; reusedWs?: WebSocket; reusedOutpostId?: string } | undefined {
+    const key = this.warmKey(scope, conversationKey, slotId, isIncognito, prefixHash);
     const hit = this.warmThreads.get(key);
     if (!hit) return undefined;
+
+    // Atomically consume this entry + any alias keys so concurrent duplicate requests can never share a WS.
+    for (const k of hit.siblingKeys) {
+      if (this.warmThreads.get(k) === hit) this.warmThreads.delete(k);
+    }
+
     if (Date.now() > hit.expiresAt) {
-      this.warmThreads.delete(key);
+      if (hit.parkedWs) {
+        this.detachParkedWs(hit.parkedWs, true);
+        hit.parkedWs = undefined;
+      }
       return undefined;
     }
-    // Consume the previous prefix entry once reused so each turn advances cleanly
-    this.warmThreads.delete(key);
-    return hit.threadId;
+
+    if (hit.parkedWs) {
+      const h = hit.parkedWs;
+      hit.parkedWs = undefined;
+      if (h.ws.readyState === WebSocket.OPEN) {
+        this.detachParkedWs(h, false);
+        return { threadId: hit.threadId, reusedWs: h.ws, reusedOutpostId: h.outpostId };
+      }
+      this.detachParkedWs(h, true);
+    }
+
+    // In incognito mode, AWS Quick only keeps the thread in backend-pod RAM: if the dedicated WS died,
+    // never risk silent amnesia on a different pod — fall back cleanly to full cold replay.
+    if (isIncognito) {
+      return undefined;
+    }
+    // In cloud mode, AWS persists the thread in DB, so reconnecting a fresh WS resumes cleanly.
+    return { threadId: hit.threadId };
   }
 
-  private setWarmThread(
-    scope: string | undefined,
-    conversationKey: string | undefined,
-    slotId: string,
-    prefixHash: string,
-    threadId: string
-  ): void {
+  private setWarmThread(params: {
+    scope: string | undefined;
+    conversationKey: string | undefined;
+    slotId: string;
+    isIncognito: boolean;
+    prefixHashes: readonly string[];
+    threadId: string;
+    ws?: WebSocket;
+    outpostId?: string;
+    encodeFrame?: (frame: Record<string, unknown>) => Uint8Array | string;
+  }): boolean {
+    const { scope, conversationKey, slotId, isIncognito, prefixHashes, threadId, ws, outpostId, encodeFrame } = params;
+    const keys = Array.from(
+      new Set(prefixHashes.filter(Boolean).map((h) => this.warmKey(scope, conversationKey, slotId, isIncognito, h))),
+    );
+    if (keys.length === 0) return false;
+
     const now = Date.now();
     const maxWarm = this.config.maxWarmSessions || MAX_WARM_THREADS;
     const warmTtlMs = this.config.warmSessionTtlMs || WARM_THREAD_TTL_MS;
-    if (this.warmThreads.size >= maxWarm) {
-      for (const [k, v] of this.warmThreads) {
-        if (v.expiresAt <= now) this.warmThreads.delete(k);
-      }
-      while (this.warmThreads.size >= maxWarm) {
-        const oldest = this.warmThreads.keys().next().value;
-        if (!oldest) break;
-        this.warmThreads.delete(oldest);
-      }
+
+    // Evict expired entries first, then oldest entries if over capacity.
+    for (const entry of new Set(this.warmThreads.values())) {
+      if (entry.expiresAt <= now) this.removeWarmEntry(entry, true);
     }
-    this.warmThreads.set(this.warmKey(scope, conversationKey, slotId, prefixHash), {
+    while (this.warmThreads.size >= maxWarm) {
+      const oldestKey = this.warmThreads.keys().next().value;
+      if (!oldestKey) break;
+      const oldestEntry = this.warmThreads.get(oldestKey);
+      if (oldestEntry) this.removeWarmEntry(oldestEntry, true);
+      else this.warmThreads.delete(oldestKey);
+    }
+
+    // Replace any existing entry on these keys cleanly
+    for (const k of keys) {
+      const prev = this.warmThreads.get(k);
+      if (prev) this.removeWarmEntry(prev, true);
+    }
+
+    const entry: WarmThreadEntry = {
       threadId,
+      isIncognito,
       expiresAt: now + warmTtlMs,
-    });
+      siblingKeys: keys,
+    };
+
+    let parkedSocket = false;
+    if (ws && ws.readyState === WebSocket.OPEN && encodeFrame) {
+      // Enforce MAX_PARKED_WS by closing the oldest parked WS (in cloud mode we keep its threadId).
+      while (this.countParkedWs() >= MAX_PARKED_WS) {
+        let evicted = false;
+        for (const existing of new Set(this.warmThreads.values())) {
+          if (existing.parkedWs) {
+            const oldHandle = existing.parkedWs;
+            existing.parkedWs = undefined;
+            this.detachParkedWs(oldHandle, true);
+            if (existing.isIncognito) this.removeWarmEntry(existing, false);
+            evicted = true;
+            break;
+          }
+        }
+        if (!evicted) break;
+      }
+
+      const handleDeadIdleWs = () => {
+        if (!entry.parkedWs) return;
+        const h = entry.parkedWs;
+        entry.parkedWs = undefined;
+        this.detachParkedWs(h, true);
+        if (entry.isIncognito) {
+          this.removeWarmEntry(entry, false);
+        }
+      };
+
+      const onIdleClose = () => handleDeadIdleWs();
+      const onIdleError = () => handleDeadIdleWs();
+      const onIdleMessage = () => {
+        // Ignore unsolicited trailing keepalive/status frames while parked.
+      };
+      const pingTimer = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(encodeFrame({ type: "ping", payload: { timestamp: Date.now() } }));
+          } catch {
+            handleDeadIdleWs();
+          }
+        } else {
+          handleDeadIdleWs();
+        }
+      }, 25_000);
+      pingTimer.unref?.();
+
+      const idleTtl = Math.min(warmTtlMs, PARKED_WS_IDLE_TTL_MS);
+      const idleTimer = setTimeout(() => handleDeadIdleWs(), idleTtl);
+      idleTimer.unref?.();
+
+      ws.on("close", onIdleClose);
+      ws.on("error", onIdleError);
+      ws.on("message", onIdleMessage);
+
+      entry.parkedWs = {
+        ws,
+        outpostId: outpostId || "web0",
+        pingTimer,
+        idleTimer,
+        onIdleClose,
+        onIdleError,
+        onIdleMessage,
+      };
+      parkedSocket = true;
+    }
+
+    // In incognito mode, only retain the warm entry if we actually have a live parked WS.
+    if (isIncognito && !parkedSocket) {
+      return false;
+    }
+
+    for (const k of keys) {
+      this.warmThreads.set(k, entry);
+    }
+    return parkedSocket;
   }
 
   constructor(options: {
@@ -563,17 +765,23 @@ export class QuickExecutionEngine {
   runtimeStats() {
     return {
       parkedToolSessions: 0,
-      warmIncrementalSessions: this.warmThreads.size,
-      warmIdleSessions: 0,
+      warmIncrementalSessions: new Set(this.warmThreads.values()).size,
+      warmIdleSessions: this.countParkedWs(),
       memoryStore: { blobs: 0, totalBytes: 0 },
     };
   }
 
   async sweepStaleAssets(): Promise<void> {
-    // AWS Quick streams over WebSocket without local temp blobs.
+    const now = Date.now();
+    for (const entry of new Set(this.warmThreads.values())) {
+      if (entry.expiresAt <= now) this.removeWarmEntry(entry, true);
+    }
   }
 
   async disposeAll(): Promise<void> {
+    for (const entry of new Set(this.warmThreads.values())) {
+      this.removeWarmEntry(entry, true);
+    }
     stopSharedOutpost();
   }
 
@@ -748,9 +956,14 @@ export class QuickExecutionEngine {
       const lease = keyPool.leaseKey(turn.requestedModel, excluded.size > 0 ? excluded : undefined, turn.conversationKey);
       const isIncognito = keyPool.getSettings().incognitoMode;
       let yieldedOutput = false;
+      let lastExecMode: ExecutionModeTag | undefined;
+      const wrappedMeta: typeof onExecMeta = (meta) => {
+        lastExecMode = meta.execMode;
+        onExecMeta?.(meta);
+      };
 
       try {
-        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, onExecMeta)) {
+        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta)) {
           if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
             yieldedOutput = true;
           }
@@ -760,27 +973,57 @@ export class QuickExecutionEngine {
         return;
       } catch (err) {
         const gwErr = mapSdkError(err);
-        const msg = gwErr.message || "";
+        // Fail-safe: if a warm_incremental thread was evicted/rejected by upstream before yielding any output,
+        // transparently fall back once to a fresh full cold replay on the same account (lookupWarmThread already
+        // evicted the stale entry, so the retry is guaranteed to run cold).
+        if (
+          lastExecMode === "warm_incremental" &&
+          !yieldedOutput &&
+          !turn.signal?.aborted &&
+          gwErr.code !== "content_filter" &&
+          gwErr.code !== "content_filtered"
+        ) {
+          try {
+            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta)) {
+              if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
+                yieldedOutput = true;
+              }
+              yield ev;
+            }
+            lease.markSuccess();
+            return;
+          } catch (fallbackErr) {
+            err = fallbackErr;
+          }
+        }
+        const finalErr = mapSdkError(err);
+        const msg = finalErr.message || "";
         const lower = msg.toLowerCase();
+        const isPayloadOrContextSizeErr =
+          /message.?size|payload.?size|frame.?limit|context.?limit|too.?large|too.?long|max.?length/i.test(lower);
+        const isSessionLifecycleErr =
+          /thread.?expired|session.?expired|conversation.?expired/i.test(lower);
         const isQuotaErr =
-          gwErr.code === "quota_exhausted" ||
-          gwErr.status === 402 ||
-          /quota|usage.?limit|limit.?exceeded|insufficient|exhausted|credits?/i.test(lower);
+          !isPayloadOrContextSizeErr &&
+          (finalErr.code === "quota_exhausted" ||
+            finalErr.status === 402 ||
+            /quota|usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|limit.?exceeded|insufficient.?(?:quota|credits?|balance)|exhausted/i.test(lower));
         const isRateLimitErr =
           !isQuotaErr &&
-          (gwErr.status === 429 || /rate.?limit|too many requests|throttl/i.test(lower));
+          (finalErr.status === 429 || /rate.?limit|too many requests|throttl/i.test(lower));
         const isAuthErr =
-          gwErr.code !== "model_not_available" &&
-          (gwErr.status === 401 ||
-            gwErr.status === 403 ||
-            /unauthorized|invalid.?grant|expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+          finalErr.code !== "model_not_available" &&
+          !isSessionLifecycleErr &&
+          (finalErr.status === 401 ||
+            finalErr.status === 403 ||
+            /unauthorized|invalid.?grant|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
 
         const isProxyOrConnErr =
           !isQuotaErr &&
           !isRateLimitErr &&
           !isAuthErr &&
-          (gwErr.status === 502 ||
-            gwErr.status === 503 ||
+          (finalErr.status === 502 ||
+            finalErr.status === 503 ||
             /proxy connect failed|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower));
 
         if (isQuotaErr) {
@@ -804,7 +1047,7 @@ export class QuickExecutionEngine {
             .some((k) => k.enabled && !excluded.has(k.rawKey));
           if (hasUntriedEnabledKey) continue;
         }
-        throw gwErr;
+        throw finalErr;
       } finally {
         lease.release();
       }
@@ -823,13 +1066,96 @@ export class QuickExecutionEngine {
       usedProxy?: boolean;
     }) => void,
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
-    const warmThreadId =
+    // Resolve model BEFORE consuming any parked warm WS so there is no async vacuum window
+    // where a parked WS has no error/close listeners or leaks if model resolution fails.
+    const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
+
+    const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice);
+    const customPromptParts: string[] = [];
+    if (turn.systemPrompt?.trim()) {
+      customPromptParts.push(
+        sanitizeClientSystemPromptForQuick(turn.systemPrompt.trim(), Boolean(toolBridgePrompt)),
+      );
+    }
+    if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
+    const customPrompt = customPromptParts.length > 0 ? customPromptParts.join("\n\n") : null;
+
+    const warmHit =
       !(isIncognito && this.autoDeleteSession) &&
         turn.priorPrefixHash &&
         turn.incrementalUserText !== undefined
-        ? this.lookupWarmThread(turn.scope, turn.conversationKey, lease.slotId, turn.priorPrefixHash)
+        ? this.lookupWarmThread(turn.scope, turn.conversationKey, lease.slotId, isIncognito, turn.priorPrefixHash)
         : undefined;
-    const isWarmIncremental = Boolean(warmThreadId);
+    let warmThreadId = warmHit?.threadId;
+    let reusedWs = warmHit?.reusedWs;
+    let isWarmIncremental = Boolean(warmThreadId);
+
+    // Keep temporary error/close guards on reusedWs during async image preparation so it can never
+    // emit an unhandled 'error' or leak as a zombie socket if image compression throws.
+    let tempReusedDead = false;
+    const onTempReusedDead = () => {
+      tempReusedDead = true;
+    };
+    if (reusedWs) {
+      reusedWs.on("error", onTempReusedDead);
+      reusedWs.on("close", onTempReusedDead);
+    }
+
+    const buildPromptAndAttachments = async (incremental: boolean) => {
+      const sourceImages = incremental ? (turn.incrementalImages ?? []) : turn.images;
+      const rawPromptText = incremental ? turn.incrementalUserText : turn.fullTranscriptText;
+      const approxTextBytes =
+        jsonStringUtf8Bytes(rawPromptText || "") + jsonStringUtf8Bytes(customPrompt || "");
+      const adaptiveImageBudget = Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
+      const atts = await buildQuickImageAttachments(sourceImages, turn.signal, adaptiveImageBudget);
+      const text = rawPromptText?.trim() || (atts.length > 0 ? "Please analyze the attached image(s)." : "");
+      if (!text) {
+        throw new GatewayError("Empty prompt", 400, "invalid_request_error");
+      }
+      return { promptText: text, attachments: atts };
+    };
+
+    let prompt: string;
+    let attachments: QuickImageAttachment[];
+    try {
+      const built = await buildPromptAndAttachments(isWarmIncremental);
+      prompt = built.promptText;
+      attachments = built.attachments;
+
+      // If our dedicated WS died during async image download/compression:
+      // in incognito mode, NEVER send an incremental prompt to a new random pod (would silently lose memory);
+      // transparently fall back to full cold replay right here!
+      if (reusedWs && (tempReusedDead || reusedWs.readyState !== WebSocket.OPEN)) {
+        reusedWs.off("error", onTempReusedDead);
+        reusedWs.off("close", onTempReusedDead);
+        try {
+          reusedWs.close();
+        } catch { }
+        reusedWs = undefined;
+        if (isIncognito) {
+          warmThreadId = undefined;
+          isWarmIncremental = false;
+          const coldBuilt = await buildPromptAndAttachments(false);
+          prompt = coldBuilt.promptText;
+          attachments = coldBuilt.attachments;
+        }
+      }
+    } catch (prepErr) {
+      if (reusedWs) {
+        reusedWs.off("error", onTempReusedDead);
+        reusedWs.off("close", onTempReusedDead);
+        try {
+          reusedWs.close();
+        } catch { }
+      }
+      throw prepErr;
+    }
+
+    if (reusedWs) {
+      reusedWs.off("error", onTempReusedDead);
+      reusedWs.off("close", onTempReusedDead);
+    }
+
     const execMode: ExecutionModeTag = isWarmIncremental
       ? "warm_incremental"
       : isIncognito
@@ -843,29 +1169,6 @@ export class QuickExecutionEngine {
       execMode,
       usedProxy: Boolean(lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY),
     });
-
-    const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice);
-    const customPromptParts: string[] = [];
-    if (turn.systemPrompt?.trim()) {
-      customPromptParts.push(
-        sanitizeClientSystemPromptForQuick(turn.systemPrompt.trim(), Boolean(toolBridgePrompt)),
-      );
-    }
-    if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
-    const customPrompt = customPromptParts.length > 0 ? customPromptParts.join("\n\n") : null;
-
-    const sourceImages = isWarmIncremental ? (turn.incrementalImages ?? []) : turn.images;
-    const rawPromptText = isWarmIncremental ? turn.incrementalUserText : turn.fullTranscriptText;
-    // Dynamically reserve room for prompt + customPrompt (e.g. 24 tool definitions) so single-turn
-    // multimodal requests stay inside 1 WebSocket frame (~9s) instead of splitting into 2-3 serial chunks (~26s).
-    const approxTextBytes =
-      Buffer.byteLength(rawPromptText || "", "utf8") + Buffer.byteLength(customPrompt || "", "utf8");
-    const adaptiveImageBudget = Math.max(18_000, Math.min(38_000, 44_000 - approxTextBytes));
-    const attachments = await buildQuickImageAttachments(sourceImages, turn.signal, adaptiveImageBudget);
-    let prompt = rawPromptText?.trim() || (attachments.length > 0 ? "Please analyze the attached image(s)." : "");
-    if (!prompt) {
-      throw new GatewayError("Empty prompt", 400, "invalid_request_error");
-    }
 
     // Layer 2: Gateway overflow protection when caller forgets to compact near the 1M token limit.
     const overflowLimit = (() => {
@@ -889,8 +1192,6 @@ export class QuickExecutionEngine {
     const toolFilter = toolBridgePrompt ? new StreamingToolCallFilter() : null;
     const uiTagSanitizer = this.sanitizeAwsUiTags ? new StreamingUiTagSanitizer() : null;
 
-    const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
-
     const cred = parseQuickCredential(lease.apiKey);
     const isWeb = cred.mode === "web" && !!cred.web;
     const encodeFrame = isWeb ? encodeGatewayJsonFrame : encodeCloudInputFrame;
@@ -908,11 +1209,13 @@ export class QuickExecutionEngine {
 
     let ws: WebSocket;
     let actorArn: string | undefined;
-    let outpostId = "web0";
+    let outpostId = warmHit?.reusedOutpostId || "web0";
     const effectiveProxy = lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     const wsAgent = getProxyAgent(effectiveProxy);
 
-    if (isWeb && cred.web) {
+    if (reusedWs && reusedWs.readyState === WebSocket.OPEN) {
+      ws = reusedWs;
+    } else if (isWeb && cred.web) {
       const conn = buildWebWsConnection(cred.web, workingSessionId);
       ws = new WebSocket(conn.url, conn.protocols, {
         headers: conn.headers,
@@ -953,7 +1256,6 @@ export class QuickExecutionEngine {
         outpost.getOutpostId(),
       ]);
       if (!session.jwt || !session.wsHost) {
-        lease.release();
         throw new GatewayError(
           "AWS Quick session unavailable. Please sign in to Amazon Quick.app or import a valid credential.",
           502,
@@ -1043,11 +1345,114 @@ export class QuickExecutionEngine {
     let hasEmittedText = false;
     let assistantOutputText = "";
     let resolvedModelId: string | undefined;
+    let wsParked = false;
     let pingTimer: NodeJS.Timeout | null = null;
     const clearPing = () => {
       if (pingTimer) {
         clearInterval(pingTimer);
         pingTimer = null;
+      }
+    };
+    let postUsageTimer: NodeJS.Timeout | null = null;
+    let handshakeTimer: NodeJS.Timeout | null = null;
+    let chunkAdvanceTimer: NodeJS.Timeout | null = null;
+    const clearPostUsageTimer = () => {
+      if (postUsageTimer) {
+        clearTimeout(postUsageTimer);
+        postUsageTimer = null;
+      }
+    };
+    const clearAuxTimers = () => {
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+      if (chunkAdvanceTimer) {
+        clearTimeout(chunkAdvanceTimer);
+        chunkAdvanceTimer = null;
+      }
+    };
+    const finalizeTurn = (realThreadId: string, allowParkWs = true) => {
+      if (ended) return;
+      clearPing();
+      clearPostUsageTimer();
+      clearAuxTimers();
+      const shouldAutoDelete = isIncognito && this.autoDeleteSession;
+      if (shouldAutoDelete && ws.readyState === WebSocket.OPEN) {
+        try {
+          ws.send(encodeFrame({ type: "session_delete", payload: { session_id: realThreadId } }));
+        } catch { }
+      }
+      let stopReason: "stop" | "tool_calls" = "stop";
+      let emittedToolCalls: Array<{ id: string; name: string }> = [];
+      if (toolFilter) {
+        const { remainingText, toolCalls } = toolFilter.flush();
+        const cleanRem = remainingText && uiTagSanitizer ? uiTagSanitizer.feed(remainingText) : remainingText;
+        if (cleanRem) {
+          hasEmittedText = true;
+          assistantOutputText += cleanRem;
+          push({ type: "text", text: cleanRem });
+        }
+        if (toolCalls.length > 0) {
+          emittedToolCalls = toolCalls.map((tc) => ({ id: tc.id, name: tc.name }));
+          push({ type: "tool_calls", calls: toolCalls });
+          stopReason = "tool_calls";
+        }
+      }
+      if (uiTagSanitizer) {
+        const tailText = uiTagSanitizer.flush();
+        if (tailText) {
+          hasEmittedText = true;
+          assistantOutputText += tailText;
+          push({ type: "text", text: tailText });
+        }
+      }
+      let parkedForReuse = false;
+      if (!shouldAutoDelete && turn.currentInputPrefixHash) {
+        const nextHashes: string[] = [];
+        if (stopReason === "stop" && assistantOutputText.trim().length > 0) {
+          nextHashes.push(extendHashWithAssistantTurn(turn.currentInputPrefixHash, assistantOutputText));
+        } else if (stopReason === "tool_calls" && emittedToolCalls.length > 0) {
+          nextHashes.push(
+            extendHashWithAssistantTurn(turn.currentInputPrefixHash, assistantOutputText, emittedToolCalls),
+          );
+          if (assistantOutputText.trim().length > 0) {
+            nextHashes.push(extendHashWithAssistantTurn(turn.currentInputPrefixHash, "", emittedToolCalls));
+          }
+        }
+        if (nextHashes.length > 0) {
+          // Detach turn-scoped listeners BEFORE parking the live WebSocket so idle frames never trigger this turn.
+          ws.off("message", onWsMessage);
+          ws.off("error", onWsError);
+          ws.off("close", onWsClose);
+          parkedForReuse = this.setWarmThread({
+            scope: turn.scope,
+            conversationKey: turn.conversationKey,
+            slotId: lease.slotId,
+            isIncognito,
+            prefixHashes: nextHashes,
+            threadId: realThreadId,
+            // Never park a WS that finished via post-usage watchdog (late upstream frames could contaminate next turn).
+            ...(allowParkWs ? { ws, outpostId, encodeFrame } : {}),
+          });
+        }
+      }
+      wsParked = parkedForReuse;
+      ended = true;
+      push({ type: "done", stopReason });
+      if (parkedForReuse) {
+        // Keep dedicated WebSocket open & pinged for next turn (mirrors official Quick desktop app).
+      } else if (shouldAutoDelete) {
+        const t = setTimeout(() => {
+          try {
+            ws.close();
+          } catch { }
+        }, 1000);
+        t.unref?.();
+      } else {
+        try {
+          ws.close();
+        } catch { }
       }
     };
 
@@ -1058,7 +1463,7 @@ export class QuickExecutionEngine {
         totalChunks === 1
           ? chunks[idx]!
           : isFinal
-            ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; please answer the user's request directly]\n\n${chunks[idx]!}`
+            ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; reply directly in the user's language without acknowledging or mentioning these context parts]\n\n${chunks[idx]!}`
             : `[Context Part ${idx + 1}/${totalChunks} — memorize silently for the upcoming final message and reply ONLY: OK]\n\n${chunks[idx]!}`;
       const chunkText =
         isFinal && toolBridgePrompt
@@ -1096,27 +1501,8 @@ export class QuickExecutionEngine {
       );
     };
 
-    ws.once("open", () => {
-      ws.send(
-        encodeFrame({
-          type: "session_connect",
-          payload: {
-            ...(actorArn ? { actor_id: actorArn } : {}),
-            surfaceType,
-            outpostId,
-            appVersion,
-            ...DESKTOP_CAPABILITIES,
-          },
-        }),
-      );
-      if (!isWeb) {
-        ws.send(
-          encodeFrame({
-            type: "federate_status",
-            payload: {},
-          }),
-        );
-      }
+    const startTurnPing = () => {
+      clearPing();
       pingTimer = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN && !ended) {
           try {
@@ -1124,13 +1510,9 @@ export class QuickExecutionEngine {
           } catch { }
         }
       }, 25_000);
+    };
 
-      setTimeout(() => {
-        sendChunkMessage(0);
-      }, 200);
-    });
-
-    ws.on("message", (data: Buffer) => {
+    const onWsMessage = (data: Buffer) => {
       recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
       const { messages, consumed } = drainEventStream(recvBuf, 0);
       if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
@@ -1166,7 +1548,8 @@ export class QuickExecutionEngine {
         if (activeChunkIndex < totalChunks - 1) {
           if (evType === "message_complete") {
             advancingChunk = true;
-            setTimeout(() => {
+            chunkAdvanceTimer = setTimeout(() => {
+              chunkAdvanceTimer = null;
               activeChunkIndex += 1;
               advancingChunk = false;
               sendChunkMessage(activeChunkIndex);
@@ -1209,6 +1592,7 @@ export class QuickExecutionEngine {
             }
           }
         } else if (evType === "text_delta") {
+          clearPostUsageTimer();
           const delta = String(payload.delta || "");
           if (delta) {
             const afterTools = toolFilter ? toolFilter.feed(delta) : delta;
@@ -1220,6 +1604,7 @@ export class QuickExecutionEngine {
             }
           }
         } else if (evType === "thinking_delta") {
+          clearPostUsageTimer();
           const delta = String(payload.delta || "");
           if (delta) push({ type: "thinking", text: delta });
         } else if (evType === "turn_usage") {
@@ -1255,74 +1640,40 @@ export class QuickExecutionEngine {
               ...(isIncognito && this.autoDeleteSession ? { sessionDeleted: true } : {}),
             },
           });
-        } else if (evType === "message_complete" || evType === "stream_ended" || evType === "turn_aborted") {
-          clearPing();
-          const realThreadId = String(ev.thread_id || threadId);
-          const shouldAutoDelete = isIncognito && this.autoDeleteSession;
-          if (shouldAutoDelete && ws.readyState === WebSocket.OPEN) {
-            try {
-              ws.send(encodeFrame({ type: "session_delete", payload: { session_id: realThreadId } }));
-            } catch { }
+          // Guard against AWS Quick occasionally omitting `message_complete` after very long outputs (30K+ output tokens).
+          // Only armed once actual output has started and cancelled immediately if any subsequent delta/event arrives.
+          if (hasEmittedText || outputTokens > 0) {
+            clearPostUsageTimer();
+            const usageThreadId = String(ev.thread_id || threadId);
+            postUsageTimer = setTimeout(() => {
+              // Watchdog-triggered completion must NOT park the WS back into warm pool.
+              finalizeTurn(usageThreadId, false);
+            }, 15_000);
           }
-          let stopReason: "stop" | "tool_calls" = "stop";
-          if (toolFilter) {
-            const { remainingText, toolCalls } = toolFilter.flush();
-            const cleanRem = remainingText && uiTagSanitizer ? uiTagSanitizer.feed(remainingText) : remainingText;
-            if (cleanRem) {
-              hasEmittedText = true;
-              assistantOutputText += cleanRem;
-              push({ type: "text", text: cleanRem });
-            }
-            if (toolCalls.length > 0) {
-              push({ type: "tool_calls", calls: toolCalls });
-              stopReason = "tool_calls";
-            }
-          }
-          if (uiTagSanitizer) {
-            const tailText = uiTagSanitizer.flush();
-            if (tailText) {
-              hasEmittedText = true;
-              assistantOutputText += tailText;
-              push({ type: "text", text: tailText });
-            }
-          }
-          if (
-            !shouldAutoDelete &&
-            stopReason === "stop" &&
-            turn.currentInputPrefixHash &&
-            assistantOutputText.trim().length > 0
-          ) {
-            const nextHash = extendHashWithAssistantReply(turn.currentInputPrefixHash, assistantOutputText);
-            this.setWarmThread(turn.scope, turn.conversationKey, lease.slotId, nextHash, realThreadId);
-          }
-          ended = true;
-          push({ type: "done", stopReason });
-          if (shouldAutoDelete) {
-            setTimeout(() => {
-              try {
-                ws.close();
-              } catch { }
-            }, 1000);
-          } else {
-            try {
-              ws.close();
-            } catch { }
-          }
+        } else if (
+          evType === "message_complete" ||
+          evType === "stream_ended" ||
+          evType === "turn_aborted" ||
+          evType === "session_end"
+        ) {
+          finalizeTurn(String(ev.thread_id || threadId));
           return;
         } else if (evType === "session_deleted") {
+          clearPostUsageTimer();
           try {
             ws.close();
           } catch { }
           return;
         } else if (evType === "error" || evType === "guardrail_blocked") {
           clearPing();
+          clearPostUsageTimer();
           ended = true;
           const errCode = String(payload.error_code || "");
           const errText = typeof payload.error === "string" ? payload.error : "";
           let gatewayErr: GatewayError;
           if (evType === "guardrail_blocked" || errCode === "content_filtered") {
             gatewayErr = new GatewayError(
-              "AWS Quick content filter blocked this reply (content_filtered). Rephrase or start a new chat.",
+              "AWS Quick upstream content filter blocked this reply (content_filtered — triggered by AWS Bedrock Guardrail, e.g. sensitive/credential keywords, not a gateway outage). Rephrase or start a new chat. / 上游 AWS Quick 内容安全审核拦截了本次回复（非网关故障，通常因触发密码/密钥等敏感词风控），请调整措辞或新开会话。",
               400,
               "content_filter",
             );
@@ -1348,18 +1699,20 @@ export class QuickExecutionEngine {
           return;
         }
       }
-    });
+    };
 
-    ws.once("error", (err) => {
+    const onWsError = (err: Error) => {
       clearPing();
+      clearPostUsageTimer();
       if (!ended) {
         ended = true;
         push({ type: "__error", error: mapSdkError(err) });
       }
-    });
+    };
 
-    ws.once("close", (code, reason) => {
+    const onWsClose = (code: number, reason: Buffer) => {
       clearPing();
+      clearPostUsageTimer();
       if (!ended) {
         ended = true;
         push({
@@ -1367,7 +1720,44 @@ export class QuickExecutionEngine {
           error: new GatewayError(`WebSocket closed (${code}): ${reason.toString("utf8")}`, 502, "upstream_error"),
         });
       }
-    });
+    };
+
+    ws.on("message", onWsMessage);
+    ws.once("error", onWsError);
+    ws.once("close", onWsClose);
+
+    if (reusedWs && ws === reusedWs && ws.readyState === WebSocket.OPEN) {
+      startTurnPing();
+      sendChunkMessage(0);
+    } else {
+      ws.once("open", () => {
+        ws.send(
+          encodeFrame({
+            type: "session_connect",
+            payload: {
+              ...(actorArn ? { actor_id: actorArn } : {}),
+              surfaceType,
+              outpostId,
+              appVersion,
+              ...DESKTOP_CAPABILITIES,
+            },
+          }),
+        );
+        if (!isWeb) {
+          ws.send(
+            encodeFrame({
+              type: "federate_status",
+              payload: {},
+            }),
+          );
+        }
+        startTurnPing();
+        handshakeTimer = setTimeout(() => {
+          handshakeTimer = null;
+          sendChunkMessage(0);
+        }, 200);
+      });
+    }
 
     try {
       while (true) {
@@ -1384,14 +1774,20 @@ export class QuickExecutionEngine {
       }
     } finally {
       clearPing();
+      clearPostUsageTimer();
+      clearAuxTimers();
       clearTimeout(timer);
       turn.signal?.removeEventListener("abort", onAbort);
-      lease.release();
-      // Close immediately unless a normal incognito+autoDeleteSession turn is awaiting session_deleted (1s max).
-      if (!(ended && isIncognito && this.autoDeleteSession)) {
-        try {
-          ws.close();
-        } catch { }
+      // Note: `lease.release()` is owned exclusively by `executeTurnWithPool` so retries keep accurate inflight counts.
+      if (!wsParked) {
+        ws.off("message", onWsMessage);
+        ws.off("error", onWsError);
+        ws.off("close", onWsClose);
+        if (!(ended && isIncognito && this.autoDeleteSession)) {
+          try {
+            ws.close();
+          } catch { }
+        }
       }
     }
   }

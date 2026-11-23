@@ -203,6 +203,7 @@ export function parseAnthropicMessagesRequest(
     const textChunks: string[] = [];
     const msgImages: NormalizedImage[] = [];
     const toolUseLines: string[] = [];
+    const toolCallRefs: Array<{ id: string; name: string }> = [];
     const toolResultLines: string[] = [];
     const msgToolResults: NormalizedToolResult[] = [];
     const toolImagesByUseId = new Map<string, NormalizedImage[]>();
@@ -223,6 +224,7 @@ export function parseAnthropicMessagesRequest(
         const id = typeof block.id === "string" ? block.id : "";
         const name = typeof block.name === "string" ? block.name : "";
         const inputJson = JSON.stringify(block.input ?? {});
+        if (id || name) toolCallRefs.push({ id, name });
         toolUseLines.push(`${name}(${inputJson}) [id=${id}]`);
       } else if (bType === "tool_result") {
         const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id.trim() : "";
@@ -258,6 +260,7 @@ export function parseAnthropicMessagesRequest(
         text: joinedText,
         images: msgImages,
         hasTools,
+        ...(toolCallRefs.length > 0 ? { toolCalls: toolCallRefs } : {}),
         formattedLine: formattedParts.join("\n\n")
       });
     }

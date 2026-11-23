@@ -269,6 +269,7 @@ export function parseChatCompletionsRequest(
     if (role === "assistant") {
       const hasTools = Array.isArray(rawMsg.tool_calls) && rawMsg.tool_calls.length > 0;
       const parts: string[] = [];
+      const toolCallRefs: Array<{ id: string; name: string }> = [];
       if (text.trim()) parts.push(`[ASSISTANT]:\n${text}`);
       if (hasTools) {
         const callsDesc = (rawMsg.tool_calls as unknown[])
@@ -278,6 +279,7 @@ export function parseChatCompletionsRequest(
             const fn = isRecord(tc.function) ? tc.function : {};
             const name = typeof fn.name === "string" ? fn.name : "";
             const args = typeof fn.arguments === "string" ? fn.arguments : "{}";
+            if (id || name) toolCallRefs.push({ id, name });
             return `${name}(${args}) [id=${id}]`;
           })
           .filter(Boolean);
@@ -289,6 +291,7 @@ export function parseChatCompletionsRequest(
           text: text.trim(),
           images: [],
           hasTools,
+          ...(toolCallRefs.length > 0 ? { toolCalls: toolCallRefs } : {}),
           formattedLine: parts.join("\n\n")
         });
       }
@@ -443,7 +446,8 @@ export function parseResponsesRequest(
         } else {
           outStr = JSON.stringify(item.output ?? "");
         }
-        transcriptLines.push(`[TOOL_RESULT id=${callId}]:\n${outStr}`);
+        const toolResLine = `[TOOL_RESULT id=${callId}]:\n${outStr}`;
+        transcriptLines.push(toolResLine);
         if (callId) {
           trailingToolResults.push({
             toolCallId: callId,
@@ -451,7 +455,7 @@ export function parseResponsesRequest(
             ...(outImages.length ? { images: outImages } : {})
           });
         }
-        items.push({ role: "tool", text: outStr, images: outImages, hasTools: true });
+        items.push({ role: "tool", text: outStr, images: outImages, hasTools: true, formattedLine: toolResLine });
         continue;
       }
       if (itemType === "function_call" || itemType === "custom_tool_call" || itemType === "local_shell_call") {
@@ -475,8 +479,16 @@ export function parseResponsesRequest(
               : typeof item.arguments === "string"
                 ? item.arguments
                 : "{}";
-        transcriptLines.push(`[ASSISTANT_TOOL_CALLS]:\n${name}(${args}) [id=${callId}]`);
-        items.push({ role: "assistant", text: "", images: [], hasTools: true });
+        const toolCallLine = `[ASSISTANT_TOOL_CALLS]:\n${name}(${args}) [id=${callId}]`;
+        transcriptLines.push(toolCallLine);
+        items.push({
+          role: "assistant",
+          text: "",
+          images: [],
+          hasTools: true,
+          toolCalls: [{ id: callId, name }],
+          formattedLine: toolCallLine
+        });
         continue;
       }
       if (itemType !== "message" && !("role" in item)) {
@@ -501,8 +513,9 @@ export function parseResponsesRequest(
         if (text.trim()) transcriptLines.push(`[ASSISTANT]:\n${text}`);
         items.push({ role: "assistant", text, images, hasTools: false });
       } else {
-        transcriptLines.push(`[USER]:\n${text || "[empty]"}`);
-        items.push({ role: "user", text, images, hasTools: false });
+        const userLine = `[USER]:\n${text || "[empty]"}`;
+        transcriptLines.push(userLine);
+        items.push({ role: "user", text, images, hasTools: false, formattedLine: userLine });
         // A user message that follows tool outputs is the same turn's trailing user text
         // (mirrors the Chat Completions path); without this the new text was silently dropped on resume.
         if (trailingToolResults.length > 0) {
