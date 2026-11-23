@@ -835,12 +835,13 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(r2.toolCalls[0]!.name, "run_shell");
     assert.equal(r2.toolCalls[0]!.argsObject.command, "git status");
 
-    // 3. StreamingToolCallFilter ignores <tool_call> inside Markdown code fences but captures real case-insensitive <TOOL_CALL>
-    const f = new StreamingToolCallFilter();
-    const out1 = f.feed("Example:\n```xml\n<tool_call>{\"name\":\"fake\"}</tool_call>\n```\nNow real: ");
+    // 3. StreamingToolCallFilter ignores <tool_call> inside Markdown code fences & undeclared tool names,
+    //    while capturing real declared case-insensitive <TOOL_CALL>
+    const f = new StreamingToolCallFilter(new Set(["read_file"]));
+    const out1 = f.feed("Example:\n```xml\n<tool_call>{\"name\":\"demo\",\"arguments\":{\"x\":1}}</tool_call>\n```\nInline `<tool_call>{\"name\":\"demo\"}</tool_call>` and bare <tool_call>{\"name\":\"demo\"}</tool_call>\nNow real: ");
     const out2 = f.feed("<TOOL_CALL>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.ts\"}}</TOOL_CALL>");
     const fl = f.flush();
-    assert.ok((out1 + out2 + fl.remainingText).includes("<tool_call>{\"name\":\"fake\"}</tool_call>"));
+    assert.ok((out1 + out2 + fl.remainingText).includes("\"name\":\"demo\""));
     assert.equal(fl.toolCalls.length, 1);
     assert.equal(fl.toolCalls[0]!.name, "read_file");
 

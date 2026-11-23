@@ -103,8 +103,8 @@ export function buildToolBridgePrompt(
 
   return [
     "## Client Tool Action Format (API Bridge Mode)",
-    "This session runs through a local API client that executes `<tool_call>` blocks directly on the user's machine and returns real outputs in the next turn.",
-    "IMPORTANT: Do NOT check AWS Quick connected devices, do NOT say 'no device is connected' or 'cannot access local files', and do NOT tell the user to open the AWS Quick desktop app. Even if AWS Quick reports 0 connected devices, the external API client DOES have full local file/shell/MCP access via `<tool_call>`.",
+    "Emitting `<tool_call>` is NOT simulating or printing fake text — it is the real live wire protocol intercepted by the user's local IDE/CLI host, which executes the tool on their machine and returns real outputs in the next turn.",
+    "IMPORTANT: Do NOT check AWS Quick connected devices, do NOT say 'no device is connected', 'no terminal available', 'cannot access local files', or 'can only output text', and do NOT tell the user to open the AWS Quick desktop app. Even if AWS Quick reports 0 connected devices, the external API client DOES have full local file/shell/MCP access via `<tool_call>`.",
     "Do not claim you already executed a tool or fabricate outputs — simply emit the `<tool_call>` block(s) and stop so the client executes them and sends back the real result.",
     "Available client tools (JSON):",
     serialized,
@@ -231,9 +231,15 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
   return null;
 }
 
-function buildNormalizedToolCall(parsed: Record<string, unknown>): NormalizedToolCall | null {
+function buildNormalizedToolCall(
+  parsed: Record<string, unknown>,
+  allowedToolNames?: ReadonlySet<string>,
+): NormalizedToolCall | null {
   const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
   if (!name) return null;
+  if (allowedToolNames && allowedToolNames.size > 0 && !allowedToolNames.has(name)) {
+    return null;
+  }
   const rawArgs = parsed.arguments ?? parsed.input ?? {};
   const argsObject: Record<string, unknown> =
     typeof rawArgs === "string"
@@ -253,8 +259,13 @@ function buildNormalizedToolCall(parsed: Record<string, unknown>): NormalizedToo
  * Parse `<tool_call>{...}</tool_call>` blocks from model output text,
  * with automatic recovery for minor JSON malformations (trailing commas,
  * unescaped literal newlines in string values) and unclosed trailing `<tool_call>` tags.
+ * When `allowedToolNames` is provided, undeclared tool names (e.g. documentation examples)
+ * are preserved as plain text instead of being emitted as real tool calls.
  */
-export function parseToolCallsFromText(text: string): {
+export function parseToolCallsFromText(
+  text: string,
+  allowedToolNames?: ReadonlySet<string>,
+): {
   cleanText: string;
   toolCalls: NormalizedToolCall[];
 } {
@@ -270,11 +281,11 @@ export function parseToolCallsFromText(text: string): {
     lastIdx = start + match[0].length;
 
     const parsed = tryParseJsonObject(rawBlock);
-    const tc = parsed ? buildNormalizedToolCall(parsed) : null;
+    const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
     if (tc) {
       toolCalls.push(tc);
     } else {
-      // Unrecoverable malformed JSON inside <tool_call>: preserve raw block as text so nothing is silently lost.
+      // Unrecoverable malformed JSON or undeclared tool name: preserve raw block as text so nothing is silently lost.
       textParts.push(match[0]);
     }
   }
@@ -284,7 +295,7 @@ export function parseToolCallsFromText(text: string): {
   if (unclosedMatch) {
     const beforeUnclosed = tail.slice(0, unclosedMatch.index);
     const parsed = tryParseJsonObject(unclosedMatch[1] ?? "");
-    const tc = parsed ? buildNormalizedToolCall(parsed) : null;
+    const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
     if (tc) {
       textParts.push(beforeUnclosed);
       toolCalls.push(tc);
@@ -306,11 +317,16 @@ export function parseToolCallsFromText(text: string): {
  * Zero buffering overhead when a response never emits `<tool_call`.
  */
 export class StreamingToolCallFilter {
+  private readonly allowedToolNames?: ReadonlySet<string>;
   private pending = "";
   private capturing = false;
   private captured = "";
   private inCodeFence = false;
   private fenceLinePrefix = "";
+
+  constructor(allowedToolNames?: ReadonlySet<string>) {
+    this.allowedToolNames = allowedToolNames;
+  }
 
   feed(delta: string): string {
     if (!delta) return "";
@@ -322,16 +338,16 @@ export class StreamingToolCallFilter {
     const lower = combined.toLowerCase();
     const openLower = TOOL_CALL_OPEN.toLowerCase();
 
-    // Scan combined while tracking triple-backtick Markdown code fences so `<tool_call>` inside
-    // documentation/code examples is never mistaken for a real tool invocation.
+    // Scan combined while tracking triple-backtick Markdown code fences and inline backticks
+    // so `<tool_call>` inside documentation/code examples is never mistaken for a real tool invocation.
     let searchFrom = 0;
     while (searchFrom < combined.length) {
       const idx = lower.indexOf(openLower, searchFrom);
       if (idx === -1) break;
-      // Advance fence state up to `idx`
       const prefix = combined.slice(searchFrom, idx);
       this.advanceFenceState(prefix);
-      if (!this.inCodeFence) {
+      const isInlineCode = idx > 0 && combined[idx - 1] === "`";
+      if (!this.inCodeFence && !isInlineCode) {
         const before = combined.slice(0, idx);
         this.capturing = true;
         this.captured = combined.slice(idx);
@@ -372,7 +388,7 @@ export class StreamingToolCallFilter {
       this.pending = "";
       return { remainingText: rem, toolCalls: [] };
     }
-    const { cleanText, toolCalls } = parseToolCallsFromText(this.captured);
+    const { cleanText, toolCalls } = parseToolCallsFromText(this.captured, this.allowedToolNames);
     this.captured = "";
     this.capturing = false;
     return { remainingText: cleanText, toolCalls };

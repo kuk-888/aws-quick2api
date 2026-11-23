@@ -1189,7 +1189,12 @@ export class QuickExecutionEngine {
           : initialCompact.prompt;
       }
     }
-    const toolFilter = toolBridgePrompt ? new StreamingToolCallFilter() : null;
+    const allowedToolNames = new Set<string>();
+    for (const t of turn.tools) {
+      if (t.name) allowedToolNames.add(t.name);
+      if (t.wireName) allowedToolNames.add(t.wireName);
+    }
+    const toolFilter = toolBridgePrompt ? new StreamingToolCallFilter(allowedToolNames) : null;
     const uiTagSanitizer = this.sanitizeAwsUiTags ? new StreamingUiTagSanitizer() : null;
 
     const cred = parseQuickCredential(lease.apiKey);
@@ -1465,10 +1470,7 @@ export class QuickExecutionEngine {
           : isFinal
             ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; reply directly in the user's language without acknowledging or mentioning these context parts]\n\n${chunks[idx]!}`
             : `[Context Part ${idx + 1}/${totalChunks} — memorize silently for the upcoming final message and reply ONLY: OK]\n\n${chunks[idx]!}`;
-      const chunkText =
-        isFinal && toolBridgePrompt
-          ? `${baseChunkText}\n\n[Client runner note: If accessing a local file, running a command, or invoking an MCP/client tool is needed, output the corresponding <tool_call> JSON block from the available client tools instead of checking AWS Quick connected devices.]`
-          : baseChunkText;
+      const chunkText = baseChunkText;
       ws.send(
         encodeFrame({
           type: "user_message",
