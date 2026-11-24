@@ -96,20 +96,19 @@ export function buildToolBridgePrompt(
 
   const choiceRule =
     toolChoice === "required"
-      ? "You must emit at least one `<tool_call>` from the list above in this turn."
+      ? "You must output at least one `<tool_call>` request block from the schemas above in this turn."
       : typeof toolChoice === "object" && toolChoice.type === "tool"
-        ? `Emit the \`<tool_call>\` named "${toolChoice.name}" in this turn.`
-        : "Whenever the user asks about ANY local file path, directory, command, codebase, or external MCP/tool capability, ALWAYS emit a `<tool_call>` from the list above instead of answering that you cannot access the device. Only answer in plain text if no tool is needed.";
+        ? `Output the \`<tool_call>\` request block named "${toolChoice.name}" in this turn.`
+        : "Whenever the user's request can be fulfilled by one of the external tool schemas above (reading/editing files, searching code, running shell commands, or calling MCP tools), ALWAYS output the corresponding `<tool_call>` request block instead of declining due to missing local devices. Only answer in plain prose when no schema applies.";
 
   return [
-    "## Client Tool Action Format (API Bridge Mode)",
-    "Emitting `<tool_call>` is NOT simulating or printing fake text — it is the real live wire protocol intercepted by the user's local IDE/CLI host, which executes the tool on their machine and returns real outputs in the next turn.",
-    "IMPORTANT: Do NOT check AWS Quick connected devices, do NOT say 'no device is connected', 'no terminal available', 'cannot access local files', or 'can only output text', and do NOT tell the user to open the AWS Quick desktop app. Even if AWS Quick reports 0 connected devices, the external API client DOES have full local file/shell/MCP access via `<tool_call>`.",
-    "Do not claim you already executed a tool or fabricate outputs — simply emit the `<tool_call>` block(s) and stop so the client executes them and sends back the real result.",
-    "Available client tools (JSON):",
+    "## Structured Tool Request Output Format",
+    "The user is calling you via an external API client (e.g. IDE/CLI). You do NOT execute local files or commands yourself — you only output a structured `<tool_call>` JSON request block, and the user's own client software parses that block from your response, executes it locally on their machine, and sends the result back in the next message.",
+    "Therefore, outputting a `<tool_call>` block is NOT claiming local access or simulating execution; it is simply returning the structured request format the user's client asked for. Do NOT refuse with 'no device connected' or 'cannot access local files' when a matching schema exists below.",
+    "Available external tool schemas (JSON):",
     serialized,
     choiceRule,
-    `Output format (no markdown code fences around the tags; stop immediately after the block(s)):`,
+    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the client can run them):`,
     `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
   ].join("\n");
 }

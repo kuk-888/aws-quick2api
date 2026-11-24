@@ -498,6 +498,60 @@ const WARM_THREAD_TTL_MS = 30 * 60 * 1000;
 const PARKED_WS_IDLE_TTL_MS = 15 * 60 * 1000;
 const MAX_WARM_THREADS = 256;
 const MAX_PARKED_WS = 32;
+// AWS Quick enforces a hard ceiling of 5 active WebSocket connections per account.
+// Keep at most 2 parked idle sockets per account so concurrent requests never hit LimitExceededException.
+export const MAX_PARKED_WS_PER_SLOT = 2;
+
+export function classifyUpstreamError(finalErr: GatewayError): {
+  isConnLimitErr: boolean;
+  isPayloadOrContextSizeErr: boolean;
+  isSessionLifecycleErr: boolean;
+  isQuotaErr: boolean;
+  isRateLimitErr: boolean;
+  isAuthErr: boolean;
+  isProxyOrConnErr: boolean;
+} {
+  const msg = finalErr.message || "";
+  const lower = msg.toLowerCase();
+  const isConnLimitErr =
+    /too.?many.?active.?connections|maximum.?allowed|connection.?limit|limitexceededexception/i.test(lower);
+  const isPayloadOrContextSizeErr =
+    /message.?size|payload.?size|frame.?limit|context.?limit|too.?large|too.?long|max.?length/i.test(lower);
+  const isSessionLifecycleErr =
+    /thread.?expired|session.?expired|conversation.?expired/i.test(lower);
+  const isQuotaErr =
+    !isPayloadOrContextSizeErr &&
+    !isConnLimitErr &&
+    (finalErr.code === "quota_exhausted" ||
+      finalErr.status === 402 ||
+      /quota|usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|limit.?exceeded|insufficient.?(?:quota|credits?|balance)|exhausted/i.test(lower));
+  const isRateLimitErr =
+    !isQuotaErr &&
+    (isConnLimitErr || finalErr.status === 429 || /rate.?limit|too many requests|throttl/i.test(lower));
+  const isAuthErr =
+    finalErr.code !== "model_not_available" &&
+    !isSessionLifecycleErr &&
+    (finalErr.status === 401 ||
+      finalErr.status === 403 ||
+      /unauthorized|invalid.?grant|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+  const isProxyOrConnErr =
+    !isQuotaErr &&
+    !isRateLimitErr &&
+    !isAuthErr &&
+    (finalErr.status === 502 ||
+      finalErr.status === 503 ||
+      /proxy connect failed|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower));
+
+  return {
+    isConnLimitErr,
+    isPayloadOrContextSizeErr,
+    isSessionLifecycleErr,
+    isQuotaErr,
+    isRateLimitErr,
+    isAuthErr,
+    isProxyOrConnErr,
+  };
+}
 
 interface ParkedWsHandle {
   ws: WebSocket;
@@ -510,6 +564,7 @@ interface ParkedWsHandle {
 }
 
 interface WarmThreadEntry {
+  slotId: string;
   threadId: string;
   isIncognito: boolean;
   expiresAt: number;
@@ -529,6 +584,7 @@ export class QuickExecutionEngine {
   private readonly sanitizeAwsUiTags: boolean;
   private readonly workingSessionIds = new Map<string, string>();
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
+  private readonly activeWsBySlot = new Map<string, number>();
   private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
 
   private warmKey(
@@ -576,6 +632,33 @@ export class QuickExecutionEngine {
       if (entry.parkedWs && entry.parkedWs.ws.readyState === WebSocket.OPEN) n += 1;
     }
     return n;
+  }
+
+  private countParkedWsForSlot(slotId: string): number {
+    const seen = new Set<WarmThreadEntry>();
+    let n = 0;
+    for (const entry of this.warmThreads.values()) {
+      if (seen.has(entry)) continue;
+      seen.add(entry);
+      if (entry.slotId === slotId && entry.parkedWs && entry.parkedWs.ws.readyState === WebSocket.OPEN) {
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  private evictParkedWsForSlot(slotId: string, maxEvict = 1): number {
+    let evicted = 0;
+    for (const existing of new Set(this.warmThreads.values())) {
+      if (evicted >= maxEvict) break;
+      if (existing.slotId !== slotId || !existing.parkedWs) continue;
+      const oldHandle = existing.parkedWs;
+      existing.parkedWs = undefined;
+      this.detachParkedWs(oldHandle, true);
+      if (existing.isIncognito) this.removeWarmEntry(existing, false);
+      evicted += 1;
+    }
+    return evicted;
   }
 
   private lookupWarmThread(
@@ -661,6 +744,7 @@ export class QuickExecutionEngine {
     }
 
     const entry: WarmThreadEntry = {
+      slotId,
       threadId,
       isIncognito,
       expiresAt: now + warmTtlMs,
@@ -669,7 +753,11 @@ export class QuickExecutionEngine {
 
     let parkedSocket = false;
     if (ws && ws.readyState === WebSocket.OPEN && encodeFrame) {
-      // Enforce MAX_PARKED_WS by closing the oldest parked WS (in cloud mode we keep its threadId).
+      // Enforce per-account cap first (AWS Quick hard limit: 5 active WS connections per account).
+      while (this.countParkedWsForSlot(slotId) >= MAX_PARKED_WS_PER_SLOT) {
+        if (this.evictParkedWsForSlot(slotId, 1) === 0) break;
+      }
+      // Enforce global MAX_PARKED_WS by closing the oldest parked WS (in cloud mode we keep its threadId).
       while (this.countParkedWs() >= MAX_PARKED_WS) {
         let evicted = false;
         for (const existing of new Set(this.warmThreads.values())) {
@@ -998,33 +1086,18 @@ export class QuickExecutionEngine {
         }
         const finalErr = mapSdkError(err);
         const msg = finalErr.message || "";
-        const lower = msg.toLowerCase();
-        const isPayloadOrContextSizeErr =
-          /message.?size|payload.?size|frame.?limit|context.?limit|too.?large|too.?long|max.?length/i.test(lower);
-        const isSessionLifecycleErr =
-          /thread.?expired|session.?expired|conversation.?expired/i.test(lower);
-        const isQuotaErr =
-          !isPayloadOrContextSizeErr &&
-          (finalErr.code === "quota_exhausted" ||
-            finalErr.status === 402 ||
-            /quota|usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|limit.?exceeded|insufficient.?(?:quota|credits?|balance)|exhausted/i.test(lower));
-        const isRateLimitErr =
-          !isQuotaErr &&
-          (finalErr.status === 429 || /rate.?limit|too many requests|throttl/i.test(lower));
-        const isAuthErr =
-          finalErr.code !== "model_not_available" &&
-          !isSessionLifecycleErr &&
-          (finalErr.status === 401 ||
-            finalErr.status === 403 ||
-            /unauthorized|invalid.?grant|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+        const {
+          isConnLimitErr,
+          isQuotaErr,
+          isRateLimitErr,
+          isAuthErr,
+          isProxyOrConnErr,
+        } = classifyUpstreamError(finalErr);
 
-        const isProxyOrConnErr =
-          !isQuotaErr &&
-          !isRateLimitErr &&
-          !isAuthErr &&
-          (finalErr.status === 502 ||
-            finalErr.status === 503 ||
-            /proxy connect failed|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower));
+        if (isConnLimitErr) {
+          // Immediately free all parked idle WebSockets on this account so subsequent turns succeed.
+          this.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY);
+        }
 
         if (isQuotaErr) {
           keyPool.reportQuotaExhausted(lease.apiKey, turn.requestedModel, msg);
@@ -1220,78 +1293,88 @@ export class QuickExecutionEngine {
 
     if (reusedWs && reusedWs.readyState === WebSocket.OPEN) {
       ws = reusedWs;
-    } else if (isWeb && cred.web) {
-      const conn = buildWebWsConnection(cred.web, workingSessionId);
-      ws = new WebSocket(conn.url, conn.protocols, {
-        headers: conn.headers,
-        ...(wsAgent ? { agent: wsAgent } : {}),
-      });
-    } else if (cred.mode === "oauth" && cred.oauth) {
-      const { accessToken } = await resolveOAuthAccessToken(cred.oauth, false, lease.proxyUrl);
-      outpostId = deriveStableOutpostId(cred.oauth.clientId);
-      const wsUrl =
-        `wss://${cred.oauth.wsHost}/streaming/quickwork-chat-bidirectional-stream` +
-        `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
-        `&token=${encodeURIComponent(accessToken)}` +
-        `&outpostId=${encodeURIComponent(outpostId)}` +
-        `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
-        `&channel=prod`;
-      ws = new WebSocket(wsUrl, {
-        headers: {
-          "User-Agent": QUICK_DESKTOP_USER_AGENT,
-          Authorization: `Bearer ${accessToken}`,
-          "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
-          "X-Surface-Type": SURFACE_TYPE,
-          "X-Outpost-Id": outpostId,
-          "X-Agent-Service-Type": "UNIFIED_QUICK",
-          "X-Working-Session-Id": workingSessionId,
-        },
-        ...(wsAgent ? { agent: wsAgent } : {}),
-      });
     } else {
-      const outpost = await getSharedOutpost();
-      if (cred.mode === "token" && cred.jwt) {
-        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+      // Proactively evict parked idle WS on this account if active + parked approaches AWS's 5-connection ceiling.
+      const activeForSlot = this.activeWsBySlot.get(lease.slotId) || 0;
+      const parkedForSlot = this.countParkedWsForSlot(lease.slotId);
+      if (activeForSlot + parkedForSlot >= 4) {
+        this.evictParkedWsForSlot(lease.slotId, activeForSlot + parkedForSlot - 3);
+      }
+
+      if (isWeb && cred.web) {
+        const conn = buildWebWsConnection(cred.web, workingSessionId);
+        ws = new WebSocket(conn.url, conn.protocols, {
+          headers: conn.headers,
+          ...(wsAgent ? { agent: wsAgent } : {}),
+        });
+      } else if (cred.mode === "oauth" && cred.oauth) {
+        const { accessToken } = await resolveOAuthAccessToken(cred.oauth, false, lease.proxyUrl);
+        outpostId = deriveStableOutpostId(cred.oauth.clientId);
+        const wsUrl =
+          `wss://${cred.oauth.wsHost}/streaming/quickwork-chat-bidirectional-stream` +
+          `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
+          `&token=${encodeURIComponent(accessToken)}` +
+          `&outpostId=${encodeURIComponent(outpostId)}` +
+          `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
+          `&channel=prod`;
+        ws = new WebSocket(wsUrl, {
+          headers: {
+            "User-Agent": QUICK_DESKTOP_USER_AGENT,
+            Authorization: `Bearer ${accessToken}`,
+            "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+            "X-Surface-Type": SURFACE_TYPE,
+            "X-Outpost-Id": outpostId,
+            "X-Agent-Service-Type": "UNIFIED_QUICK",
+            "X-Working-Session-Id": workingSessionId,
+          },
+          ...(wsAgent ? { agent: wsAgent } : {}),
+        });
       } else {
-        outpost.setImportedToken(null);
+        const outpost = await getSharedOutpost();
+        if (cred.mode === "token" && cred.jwt) {
+          outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+        } else {
+          outpost.setImportedToken(null);
+        }
+
+        const [session, oid] = await Promise.all([
+          outpost.getSncsSession(),
+          outpost.getOutpostId(),
+        ]);
+        if (!session.jwt || !session.wsHost) {
+          throw new GatewayError(
+            "AWS Quick session unavailable. Please sign in to Amazon Quick.app or import a valid credential.",
+            502,
+            "upstream_auth_error",
+          );
+        }
+        actorArn = session.actorArn;
+        outpostId = oid;
+
+        const replayContext = `v1;setup;${crypto.randomBytes(32).toString("base64url")}`;
+        const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
+        const wsUrl =
+          `wss://${session.wsHost}${wsPath}` +
+          `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
+          `&token=${encodeURIComponent(session.jwt)}` +
+          `&outpostId=${encodeURIComponent(outpostId)}` +
+          `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
+          `&replayContext=${encodeURIComponent(replayContext)}` +
+          `&channel=prod`;
+
+        ws = new WebSocket(wsUrl, {
+          headers: {
+            Authorization: `Bearer ${session.jwt}`,
+            "X-Surface-Type": SURFACE_TYPE,
+            "X-Outpost-Id": outpostId,
+            "X-Agent-Service-Type": "UNIFIED_QUICK",
+            "X-Working-Session-Id": workingSessionId,
+          },
+          ...(wsAgent ? { agent: wsAgent } : {}),
+        });
       }
-
-      const [session, oid] = await Promise.all([
-        outpost.getSncsSession(),
-        outpost.getOutpostId(),
-      ]);
-      if (!session.jwt || !session.wsHost) {
-        throw new GatewayError(
-          "AWS Quick session unavailable. Please sign in to Amazon Quick.app or import a valid credential.",
-          502,
-          "upstream_auth_error",
-        );
-      }
-      actorArn = session.actorArn;
-      outpostId = oid;
-
-      const replayContext = `v1;setup;${crypto.randomBytes(32).toString("base64url")}`;
-      const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
-      const wsUrl =
-        `wss://${session.wsHost}${wsPath}` +
-        `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
-        `&token=${encodeURIComponent(session.jwt)}` +
-        `&outpostId=${encodeURIComponent(outpostId)}` +
-        `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
-        `&replayContext=${encodeURIComponent(replayContext)}` +
-        `&channel=prod`;
-
-      ws = new WebSocket(wsUrl, {
-        headers: {
-          Authorization: `Bearer ${session.jwt}`,
-          "X-Surface-Type": SURFACE_TYPE,
-          "X-Outpost-Id": outpostId,
-          "X-Agent-Service-Type": "UNIFIED_QUICK",
-          "X-Working-Session-Id": workingSessionId,
-        },
-        ...(wsAgent ? { agent: wsAgent } : {}),
-      });
     }
+    this.activeWsBySlot.set(lease.slotId, (this.activeWsBySlot.get(lease.slotId) || 0) + 1);
 
     const queue: Array<GatewayStreamEvent | { type: "__error"; error: Error }> = [];
     let notify: (() => void) | null = null;
@@ -1470,7 +1553,10 @@ export class QuickExecutionEngine {
           : isFinal
             ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; reply directly in the user's language without acknowledging or mentioning these context parts]\n\n${chunks[idx]!}`
             : `[Context Part ${idx + 1}/${totalChunks} — memorize silently for the upcoming final message and reply ONLY: OK]\n\n${chunks[idx]!}`;
-      const chunkText = baseChunkText;
+      const chunkText =
+        isFinal && toolBridgePrompt && selection.agentMode === "fast"
+          ? `${baseChunkText}\n\n[Client runner note: If accessing a local file, running a command, or invoking an MCP/client tool is needed, output the corresponding <tool_call> JSON block from the available client tools instead of checking AWS Quick connected devices.]`
+          : baseChunkText;
       ws.send(
         encodeFrame({
           type: "user_message",
@@ -1775,6 +1861,9 @@ export class QuickExecutionEngine {
         if (ended) return;
       }
     } finally {
+      const nextActive = (this.activeWsBySlot.get(lease.slotId) || 1) - 1;
+      if (nextActive <= 0) this.activeWsBySlot.delete(lease.slotId);
+      else this.activeWsBySlot.set(lease.slotId, nextActive);
       clearPing();
       clearPostUsageTimer();
       clearAuxTimers();

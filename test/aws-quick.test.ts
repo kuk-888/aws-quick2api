@@ -21,7 +21,15 @@ import {
 } from "../src/aws-quick/oauth-client.js";
 import { parseQuickCredential } from "../src/aws-quick/outpost-singleton.js";
 import { parseWebCurlOrCredential, serializeWebCredential } from "../src/aws-quick/web-client.js";
-import { buildQuickImageAttachments, compactOversizedPrompt, estimatePromptTokens, splitPromptIntoSafeChunks } from "../src/core/engine.js";
+import {
+  buildQuickImageAttachments,
+  classifyUpstreamError,
+  compactOversizedPrompt,
+  estimatePromptTokens,
+  MAX_PARKED_WS_PER_SLOT,
+  splitPromptIntoSafeChunks,
+} from "../src/core/engine.js";
+import { GatewayError } from "../src/core/types.js";
 import { UpstreamKeyPool } from "../src/core/key-pool.js";
 import {
   buildToolBridgePrompt,
@@ -852,5 +860,28 @@ describe("Credential parser & ClientKeyStore", () => {
     for (const c of escapedSplit.chunks) {
       assert.ok(Buffer.byteLength(JSON.stringify(c), "utf8") <= 46_500);
     }
+  });
+
+  it("classifies AWS Quick LimitExceededException (Too many active connections) as transient rate/conn limit, never quota exhaustion", () => {
+    assert.ok(MAX_PARKED_WS_PER_SLOT >= 1 && MAX_PARKED_WS_PER_SLOT <= 3);
+
+    const connLimit = classifyUpstreamError(
+      new GatewayError(
+        `AWS Quick error: [LimitExceededException] {"Message":"Too many active connections. Maximum allowed: 5"}`,
+        502,
+        "upstream_error",
+      ),
+    );
+    assert.equal(connLimit.isConnLimitErr, true);
+    assert.equal(connLimit.isQuotaErr, false);
+    assert.equal(connLimit.isRateLimitErr, true);
+    assert.equal(connLimit.isAuthErr, false);
+
+    // Real quota exhaustion must still be detected as isQuotaErr
+    const realQuota = classifyUpstreamError(
+      new GatewayError("Monthly usage limit exceeded / insufficient quota", 402, "quota_exhausted"),
+    );
+    assert.equal(realQuota.isConnLimitErr, false);
+    assert.equal(realQuota.isQuotaErr, true);
   });
 });
