@@ -39,9 +39,11 @@ function extractContentParts(content: unknown): { text: string; images: Normaliz
     } else if (pType === "input_image") {
       const urlVal = typeof part.image_url === "string"
         ? part.image_url
-        : typeof part.url === "string"
-          ? part.url
-          : "";
+        : isRecord(part.image_url) && typeof part.image_url.url === "string"
+          ? part.image_url.url
+          : typeof part.url === "string"
+            ? part.url
+            : "";
       const parsed = parseDataUrlOrRemoteImage(urlVal);
       if (parsed) images.push(parsed);
     }
@@ -261,7 +263,7 @@ export function parseChatCompletionsRequest(
         text,
         images,
         hasTools: true,
-        formattedLine: `[TOOL_RESULT${meta ? ` ${meta}` : ""}]:\n${text || "[empty]"}`
+        formattedLine: `[TOOL_RESULT${meta ? ` ${meta}` : ""}]:\n${text || (images.length ? "[Image]" : "[empty]")}`
       });
       continue;
     }
@@ -278,7 +280,12 @@ export function parseChatCompletionsRequest(
             const id = typeof tc.id === "string" ? tc.id : "";
             const fn = isRecord(tc.function) ? tc.function : {};
             const name = typeof fn.name === "string" ? fn.name : "";
-            const args = typeof fn.arguments === "string" ? fn.arguments : "{}";
+            const args =
+              typeof fn.arguments === "string"
+                ? fn.arguments
+                : fn.arguments && typeof fn.arguments === "object"
+                  ? JSON.stringify(fn.arguments)
+                  : "{}";
             if (id || name) toolCallRefs.push({ id, name });
             return `${name}(${args}) [id=${id}]`;
           })
@@ -329,10 +336,11 @@ export function parseChatCompletionsRequest(
   const trailingImages: NormalizedImage[] = [];
   let idx = body.messages.length - 1;
 
-  if (idx >= 1 && isRecord(body.messages[idx]) && body.messages[idx].role === "user") {
+  const roleOf = (m: unknown): string => (isRecord(m) && typeof m.role === "string" ? m.role.toLowerCase() : "");
+  if (idx >= 1 && roleOf(body.messages[idx]) === "user") {
     const prev = body.messages[idx - 1];
-    if (isRecord(prev) && prev.role === "tool") {
-      const trailing = extractContentParts(body.messages[idx].content);
+    if (roleOf(prev) === "tool") {
+      const trailing = extractContentParts((body.messages[idx] as Record<string, unknown>).content);
       trailingUserText = trailing.text;
       if (trailing.images.length) trailingImages.push(...trailing.images);
       idx -= 1;
@@ -341,7 +349,7 @@ export function parseChatCompletionsRequest(
 
   while (idx >= 0) {
     const m = body.messages[idx];
-    if (!isRecord(m) || m.role !== "tool") break;
+    if (!isRecord(m) || roleOf(m) !== "tool") break;
     const callId = typeof m.tool_call_id === "string" ? m.tool_call_id.trim() : "";
     if (callId) {
       const parts = extractContentParts(m.content);
@@ -531,8 +539,17 @@ export function parseResponsesRequest(
     throw new GatewayError("`input` must be a string or array.", 400, "invalid_request_error", "input");
   }
 
+  if (items.length === 0 && systemParts.length > 0) {
+    const lastSys = systemParts.pop()!;
+    items.push({ role: "user", text: lastSys, images: [], hasTools: false, formattedLine: lastSys });
+    transcriptLines.push(lastSys);
+  }
+
   const systemJoined = systemParts.join("\n\n");
-  const fullTranscriptText = transcriptLines.join("\n\n");
+  const fullTranscriptText =
+    items.length === 1 && items[0].role === "user"
+      ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
+      : transcriptLines.join("\n\n");
   const toolSig = (toolChoice === "none" ? [] : tools).map((t) => t.name).join(",");
   const prefixHashes = computeDialogPrefixHashes({
     systemPrompt: systemJoined,
@@ -643,6 +660,7 @@ export const openAiChatAdapter: ProtocolAdapter = {
     };
 
     let sentRole = false;
+    let sentDone = false;
 
     for await (const ev of events) {
       if (!sentRole && (ev.type === "thinking" || ev.type === "text" || ev.type === "tool_calls")) {
@@ -665,6 +683,7 @@ export const openAiChatAdapter: ProtocolAdapter = {
       } else if (ev.type === "usage") {
         lastMetrics = ev.metrics;
       } else if (ev.type === "done") {
+        sentDone = true;
         if (!sentRole) {
           sentRole = true;
           yield makeChunk({ role: "assistant", content: "" });
@@ -672,6 +691,10 @@ export const openAiChatAdapter: ProtocolAdapter = {
         yield makeChunk({}, ev.stopReason);
         if (lastMetrics && turn.includeStreamUsage) yield makeChunk({}, null, formatOpenAiUsageObject(lastMetrics));
       }
+    }
+    if (!sentDone) {
+      if (!sentRole) yield makeChunk({ role: "assistant", content: "" });
+      yield makeChunk({}, "stop");
     }
     yield "data: [DONE]\n\n";
   },

@@ -533,7 +533,7 @@ export function classifyUpstreamError(finalErr: GatewayError): {
     !isSessionLifecycleErr &&
     (finalErr.status === 401 ||
       finalErr.status === 403 ||
-      /unauthorized|invalid.?grant|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+      /unauthorized|invalid.?grant|invalid refresh token|oidc refresh_token failed \(400\)|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
   const isProxyOrConnErr =
     !isQuotaErr &&
     !isRateLimitErr &&
@@ -1534,19 +1534,21 @@ export class QuickExecutionEngine {
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     const excluded = new Set<string>();
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 5);
-    const totalWaitDeadline = Date.now() + 6_000;
+    let remainingWaitBudgetMs = 6_000;
     let retriedSameSlotConnLimit = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const waitStartedAt = Date.now();
       const lease = await keyPool.leaseKeyWithWait(
         turn.requestedModel,
         excluded.size > 0 ? excluded : undefined,
         turn.conversationKey,
         {
           signal: turn.signal,
-          maxWaitMs: Math.max(0, Math.min(4_000, totalWaitDeadline - Date.now())),
+          maxWaitMs: Math.max(0, Math.min(4_000, remainingWaitBudgetMs)),
         },
       );
+      remainingWaitBudgetMs = Math.max(0, remainingWaitBudgetMs - (Date.now() - waitStartedAt));
       const poolSettings = keyPool.getSettings();
       const isIncognito = poolSettings.incognitoMode;
       const shouldAutoEnsure =
@@ -1608,15 +1610,21 @@ export class QuickExecutionEngine {
         return;
       } catch (err) {
         const gwErr = mapSdkError(err);
+        const preClass = classifyUpstreamError(gwErr);
         // Fail-safe: if a warm_incremental thread was evicted/rejected by upstream before yielding any output,
         // transparently fall back once to a fresh full cold replay on the same account (lookupWarmThread already
         // evicted the stale entry, so the retry is guaranteed to run cold).
+        // Skip same-slot cold retry for quota/conn-limit/rate-limit/auth errors so failover happens immediately.
         if (
           lastExecMode === "warm_incremental" &&
           !yieldedOutput &&
           !turn.signal?.aborted &&
           gwErr.code !== "content_filter" &&
-          gwErr.code !== "content_filtered"
+          gwErr.code !== "content_filtered" &&
+          !preClass.isQuotaErr &&
+          !preClass.isConnLimitErr &&
+          !preClass.isRateLimitErr &&
+          !preClass.isAuthErr
         ) {
           try {
             for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId, keyPool)) {
@@ -1709,14 +1717,21 @@ export class QuickExecutionEngine {
     // where a parked WS has no error/close listeners or leaks if model resolution fails.
     const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
 
+    const hasCustomAgent = Boolean(chatAgentId);
     const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice, {
-      compactForCustomAgent: Boolean(chatAgentId),
+      compactForCustomAgent: hasCustomAgent,
+      preferClientToolsOverWorkspace: selection.agentMode === "fast",
     });
     const customPromptParts: string[] = [];
     if (turn.systemPrompt?.trim()) {
-      customPromptParts.push(
-        sanitizeClientSystemPromptForQuick(turn.systemPrompt.trim(), Boolean(toolBridgePrompt)),
-      );
+      // Pure passthrough for plain chat (no tools) AND Custom Agent sessions (A/B verified:
+      // custom agents already avoid AWS Quick's default persona clash without altering client prompts).
+      // Only sanitize third-party CLI identity lines when falling back to the default agent with tools.
+      const sysText =
+        !hasCustomAgent && Boolean(toolBridgePrompt)
+          ? sanitizeClientSystemPromptForQuick(turn.systemPrompt.trim(), true)
+          : turn.systemPrompt.trim();
+      customPromptParts.push(sysText);
     }
     if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
     const customPrompt = customPromptParts.length > 0 ? customPromptParts.join("\n\n") : null;
@@ -2079,12 +2094,46 @@ export class QuickExecutionEngine {
 
     let pendingRoutedThinking: string | null = null;
     let sawRealThinking = false;
+    let pendingTurnUsage: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+      resolvedModel?: string;
+    } | null = null;
     const flushPendingRoutedThinking = () => {
       if (pendingRoutedThinking) {
         const text = pendingRoutedThinking;
         pendingRoutedThinking = null;
         push({ type: "thinking", text });
       }
+    };
+    const flushPendingTurnUsage = () => {
+      if (!pendingTurnUsage) return;
+      const u = pendingTurnUsage;
+      pendingTurnUsage = null;
+      this.usageTracker.recordTurn({
+        apiKey: lease.apiKey,
+        modelId: u.resolvedModel ? `${selection.model} (${u.resolvedModel})` : selection.model,
+        mode: execMode,
+        metrics: {
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
+          cacheReadTokens: u.cacheReadTokens,
+          cacheWriteTokens: u.cacheWriteTokens,
+        },
+      });
+      push({
+        type: "usage",
+        metrics: {
+          inputTokens: u.inputTokens,
+          outputTokens: u.outputTokens,
+          cacheReadTokens: u.cacheReadTokens,
+          cacheWriteTokens: u.cacheWriteTokens,
+          ...(u.resolvedModel ? { resolvedModel: u.resolvedModel } : {}),
+          ...(isIncognito && this.autoDeleteSession ? { sessionDeleted: true } : {}),
+        },
+      });
     };
 
     const emitGuardedText = (chunk: string): boolean => {
@@ -2107,6 +2156,7 @@ export class QuickExecutionEngine {
         hasEmittedText = true;
         assistantOutputText += flushed;
         push({ type: "text", text: flushed });
+        flushPendingTurnUsage();
         return true;
       }
       flushPendingRoutedThinking();
@@ -2125,6 +2175,7 @@ export class QuickExecutionEngine {
         if (!sawRealThinking && isPseudo200UsageLimitText(usageLimitPrefixBuf)) {
           usageLimitPrefixBuf = "";
           pendingRoutedThinking = null;
+          pendingTurnUsage = null;
           abortPseudo200QuotaLimit();
           return;
         }
@@ -2135,8 +2186,11 @@ export class QuickExecutionEngine {
         hasEmittedText = true;
         assistantOutputText += flushed;
         push({ type: "text", text: flushed });
+        flushPendingTurnUsage();
       } else {
+        usageLimitChecked = true;
         flushPendingRoutedThinking();
+        flushPendingTurnUsage();
       }
       const shouldAutoDelete = isIncognito && this.autoDeleteSession;
       if (shouldAutoDelete && ws.readyState === WebSocket.OPEN) {
@@ -2225,12 +2279,9 @@ export class QuickExecutionEngine {
         totalChunks === 1
           ? chunks[idx]!
           : isFinal
-            ? `[Context Part ${idx + 1}/${totalChunks} — all context has now been provided; reply directly in the user's language without acknowledging or mentioning these context parts]\n\n${chunks[idx]!}`
-            : `[Context Part ${idx + 1}/${totalChunks} — memorize silently for the upcoming final message and reply ONLY: OK]\n\n${chunks[idx]!}`;
-      const chunkText =
-        isFinal && toolBridgePrompt && selection.agentMode === "fast"
-          ? `${baseChunkText}\n\n[Client runner note: If accessing a local file, running a command, or invoking an MCP/client tool is needed, output the corresponding <tool_call> JSON block from the available client tools instead of checking AWS Quick connected devices.]`
-          : baseChunkText;
+            ? `[Part ${idx + 1}/${totalChunks} — final part of the message; please respond directly to the full message above.]\n\n${chunks[idx]!}`
+            : `[Part ${idx + 1}/${totalChunks} — more parts follow; please acknowledge briefly with OK.]\n\n${chunks[idx]!}`;
+      const chunkText = baseChunkText;
       ws.send(
         encodeFrame({
           type: "user_message",
@@ -2387,6 +2438,7 @@ export class QuickExecutionEngine {
             sawRealThinking = true;
             flushPendingRoutedThinking();
             push({ type: "thinking", text: delta });
+            flushPendingTurnUsage();
           }
         } else if (evType === "turn_usage") {
           const inputTokens = Number(payload.input_tokens || 0);
@@ -2400,23 +2452,16 @@ export class QuickExecutionEngine {
               emitOrDeferRoutedThinking(served);
             }
           }
-          this.usageTracker.recordTurn({
-            apiKey: lease.apiKey,
-            modelId: resolvedModelId ? `${selection.model} (${resolvedModelId})` : selection.model,
-            mode: execMode,
-            metrics: { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens },
-          });
-          push({
-            type: "usage",
-            metrics: {
-              inputTokens,
-              outputTokens,
-              cacheReadTokens,
-              cacheWriteTokens,
-              ...(resolvedModelId ? { resolvedModel: resolvedModelId } : {}),
-              ...(isIncognito && this.autoDeleteSession ? { sessionDeleted: true } : {}),
-            },
-          });
+          pendingTurnUsage = {
+            inputTokens,
+            outputTokens,
+            cacheReadTokens,
+            cacheWriteTokens,
+            ...(resolvedModelId ? { resolvedModel: resolvedModelId } : {}),
+          };
+          if (usageLimitChecked) {
+            flushPendingTurnUsage();
+          }
           // Guard against AWS Quick occasionally omitting `message_complete` after very long outputs (30K+ output tokens).
           // Only armed once actual output has started and cancelled immediately if any subsequent delta/event arrives.
           if (hasEmittedText || usageLimitPrefixBuf.length > 0 || outputTokens > 0) {
@@ -2449,8 +2494,17 @@ export class QuickExecutionEngine {
           const errText = typeof payload.error === "string" ? payload.error : "";
           let gatewayErr: GatewayError;
           if (evType === "guardrail_blocked" || errCode === "content_filtered") {
+            const rawDetail = [
+              errCode && errCode !== "content_filtered" ? errCode : "",
+              typeof payload.reason === "string" ? payload.reason.trim() : "",
+              errText.trim(),
+            ]
+              .filter(Boolean)
+              .join(" | ")
+              .slice(0, 180);
+            const detailSuffix = rawDetail ? ` [upstream: ${rawDetail}]` : "";
             gatewayErr = new GatewayError(
-              "AWS Quick upstream content filter blocked this reply (content_filtered — triggered by AWS Bedrock Guardrail, e.g. sensitive/credential keywords, not a gateway outage). Rephrase or start a new chat. / 上游 AWS Quick 内容安全审核拦截了本次回复（非网关故障，通常因触发密码/密钥等敏感词风控），请调整措辞或新开会话。",
+              `AWS Quick upstream content filter blocked this reply (content_filtered${detailSuffix}). Rephrase or start a new chat. / 上游 AWS Quick 内容安全审核拦截了本次回复${detailSuffix}，请调整措辞或新开会话。`,
               400,
               "content_filter",
             );

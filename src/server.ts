@@ -510,6 +510,12 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           tokenRemainingSec: rep.tokenRemainingSec,
           syncError: rep.status === "error" ? (rep.error || "Sync failed") : null,
         });
+        if (
+          rep.status === "error" &&
+          /invalid_grant|invalid refresh token|oidc refresh_token failed \(400\)/i.test(rep.error || "")
+        ) {
+          keyPool.reportAuthFailure(rawKey, "OAuth token revoked (invalid_grant) — please re-authorize");
+        }
         const detectedEmail = rep.identity?.userEmail;
         if (detectedEmail && detectedEmail.includes("@")) {
           const slot = keyPool.allManagedKeys().find((m) => m.rawKey === rawKey);
@@ -523,8 +529,11 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     return reports;
   };
 
-  // Upstream quota is only ever fetched on an explicit admin action (console "sync" button, adding a key,
-  // re-check). No timer and no startup sync: repeated automatic calls risk tripping upstream abuse controls.
+  // Upstream quota is fetched on explicit admin action AND as a single debounced one-shot probe
+  // when an account trips runtime quota exhaustion (so 5h burst trips immediately learn AWS's exact resume_in_minutes).
+  keyPool.setOnQuotaExhausted((slotId) => {
+    void syncKeyQuotas({ includeDisabled: true, forceRefresh: true, slotIds: [slotId] }).catch(() => undefined);
+  });
 
   const activeByClientKey = new Map<string, number>();
   const server = http.createServer({ maxHeaderSize: 16_384 }, async (req, res) => {
@@ -753,7 +762,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             (turn.tools.length > 0 ? Buffer.byteLength(JSON.stringify(turn.tools), "utf8") : 0);
           const flushEarly =
             keyPool.enabledKeyCount() > 0 &&
-            (approxPayloadBytes > SSE_EARLY_FLUSH_BYTES || turn.tools.length > 0);
+            (approxPayloadBytes > SSE_EARLY_FLUSH_BYTES ||
+              (protocolEntry.tag === "anthropic-messages" && turn.tools.length > 0));
           await pipeSseStream(
             res,
             protocolAdapter.streamSse(events, turn),

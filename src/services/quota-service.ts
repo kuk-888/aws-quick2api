@@ -167,11 +167,18 @@ async function fetchSingleAwsQuickQuota(
     const sessLimit = Number(usage.session?.limit ?? 100);
     const sessPct = sessLimit > 0 ? Math.min(100, Math.round((sessUsed / sessLimit) * 1000) / 10) : 0;
     const rawSessResumeMin = usage.session?.resume_in_minutes;
+    const rawSessResetsAt = typeof usage.session?.resets_at === "number" && Number.isFinite(usage.session.resets_at)
+      ? usage.session.resets_at * 1000
+      : Number.NaN;
     const sessResumeMin =
       typeof rawSessResumeMin === "number" && Number.isFinite(rawSessResumeMin) && rawSessResumeMin > 0
         ? Math.ceil(rawSessResumeMin)
-        : null;
-    const sessResumeAt = sessResumeMin ? new Date(now + sessResumeMin * 60_000).toISOString() : undefined;
+        : Number.isFinite(rawSessResetsAt) && rawSessResetsAt > now
+          ? Math.max(1, Math.ceil((rawSessResetsAt - now) / 60_000))
+          : null;
+    const sessResumeAt = sessResumeMin
+      ? new Date(Number.isFinite(rawSessResetsAt) && rawSessResetsAt > now && !(typeof rawSessResumeMin === "number" && rawSessResumeMin > 0) ? rawSessResetsAt : now + sessResumeMin * 60_000).toISOString()
+      : undefined;
 
     const monUsed = Number(usage.monthly?.used ?? 0);
     const monLimit = Number(usage.monthly?.limit ?? 600);
