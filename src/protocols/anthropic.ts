@@ -69,6 +69,16 @@ function assertSupportedBlockType(bType: string): void {
   );
 }
 
+function formatToolReferenceBlock(block: Record<string, unknown>): string {
+  const refName =
+    typeof block.tool_name === "string" && block.tool_name.trim()
+      ? block.tool_name.trim()
+      : typeof block.name === "string" && block.name.trim()
+        ? block.name.trim()
+        : "";
+  return refName ? `[TOOL_REFERENCE: ${refName}]` : "";
+}
+
 function flattenToolResultContent(content: unknown): { text: string; images: NormalizedImage[] } {
   if (typeof content === "string") return { text: content, images: [] };
   if (!Array.isArray(content)) return { text: "", images: [] };
@@ -85,7 +95,10 @@ function flattenToolResultContent(content: unknown): { text: string; images: Nor
       const img = parseAnthropicImageBlock(b);
       if (img) images.push(img);
     } else if (b.type === "document") texts.push(documentBlockToText(b));
-    else assertSupportedBlockType(typeof b.type === "string" ? b.type : "");
+    else if (b.type === "tool_reference") {
+      const refText = formatToolReferenceBlock(b);
+      if (refText) texts.push(refText);
+    } else assertSupportedBlockType(typeof b.type === "string" ? b.type : "");
   }
   return { text: texts.join("\n"), images };
 }
@@ -239,6 +252,9 @@ export function parseAnthropicMessagesRequest(
         }
       } else if (bType === "document") {
         textChunks.push(documentBlockToText(block));
+      } else if (bType === "tool_reference") {
+        const refText = formatToolReferenceBlock(block);
+        if (refText) textChunks.push(refText);
       } else {
         assertSupportedBlockType(bType);
       }
@@ -273,9 +289,18 @@ export function parseAnthropicMessagesRequest(
     }
   });
 
-  const fullTranscriptText = items.length === 1 && items[0].role === "user" && !items[0].hasTools
+  const lastItem = items[items.length - 1];
+  const hasAssistantPrefill = Boolean(
+    lastItem && lastItem.role === "assistant" && !lastItem.hasTools && lastItem.text.trim().length > 0
+  );
+
+  const baseTranscriptText = items.length === 1 && items[0].role === "user" && !items[0].hasTools
     ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
     : items.map((it) => it.formattedLine).join("\n\n");
+
+  const fullTranscriptText = hasAssistantPrefill
+    ? `${baseTranscriptText}\n\n[CONTINUE_ASSISTANT_PREFILL]: Continue seamlessly immediately after the exact assistant prefix above without repeating the prefix or adding preamble.`
+    : baseTranscriptText;
 
   const toolSig = (toolChoice === "none" ? [] : tools).map((t) => t.name).join(",");
   const prefixHashes = computeDialogPrefixHashes({

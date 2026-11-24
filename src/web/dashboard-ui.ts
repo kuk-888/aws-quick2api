@@ -2699,10 +2699,79 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (!subParts.length && !hasQuota && !realEmail) subParts.push(tr("等待同步账号信息", "Pending sync"));
         const planStr = shortPlan(q.membershipType);
         const resetStr = q.daysRemainingInCycle != null ? (q.daysRemainingInCycle + tr("天重置", "d reset")) : "";
-        const trialStr = q.trialDaysRemaining != null ? (tr("试用剩 ", "Trial ") + q.trialDaysRemaining + tr(" 天", "d")) : "";
-        const sessPct = q.sessionPool && q.sessionPool.usedPercent != null ? (q.sessionPool.usedPercent + "%") : "";
-        const monthlyLine = [cleanMonthlyText(q.apiDisplayMessage), resetStr].filter(Boolean).join(" · ");
-        const subQuotaLine = [sessPct ? (tr("短时窗口 ", "Burst ") + sessPct) : "", trialStr].filter(Boolean).join(" · ");
+        const trialStr = q.trialDaysRemaining != null ? (tr("试用 ", "Trial ") + q.trialDaysRemaining + tr("天", "d")) : "";
+        const rawMonthlyUsed = q.premiumApiPool && q.premiumApiPool.usedPercent != null ? Number(q.premiumApiPool.usedPercent) : null;
+        const monthlyUsedNum = rawMonthlyUsed != null && Number.isFinite(rawMonthlyUsed) ? rawMonthlyUsed : null;
+        const monthlyBarColor = monthlyUsedNum == null ? "var(--ok)" : monthlyUsedNum >= 90 ? "var(--err)" : monthlyUsedNum >= 75 ? "var(--warn)" : "var(--ok)";
+        const monthlyDetail = [cleanMonthlyText(q.apiDisplayMessage), resetStr].filter(Boolean).join(" · ");
+        const sessUsedNum = q.sessionPool && q.sessionPool.usedPercent != null ? Number(q.sessionPool.usedPercent) : null;
+        const sessPct = sessUsedNum != null && Number.isFinite(sessUsedNum) ? (Math.round(sessUsedNum) + "%") : "";
+        const sessBarColor = sessUsedNum == null ? "var(--ok)" : sessUsedNum >= 95 ? "var(--err)" : sessUsedNum >= 80 ? "var(--warn)" : "var(--ok)";
+        const fmtHmDur = (mins) => {
+          const m = Math.max(1, Math.round(mins));
+          const h = Math.floor(m / 60);
+          const rem = m % 60;
+          if (h > 0 && rem > 0) return h + "h " + rem + "m";
+          if (h > 0) return h + "h";
+          return rem + "m";
+        };
+        const fmtClockHm = (isoOrMs) => {
+          const d = new Date(isoOrMs);
+          if (Number.isNaN(d.getTime())) return "";
+          return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+        };
+        const sessResumeAtMs = q.sessionPool && q.sessionPool.resumeAt ? Date.parse(q.sessionPool.resumeAt) : NaN;
+        const sessRemainMin = Number.isFinite(sessResumeAtMs)
+          ? Math.max(0, Math.ceil((sessResumeAtMs - Date.now()) / 60000))
+          : (q.sessionPool && typeof q.sessionPool.resumeInMinutes === "number" && q.sessionPool.resumeInMinutes > 0
+              ? Math.ceil(q.sessionPool.resumeInMinutes)
+              : 0);
+        const sessResumeClock = sessRemainMin > 0
+          ? fmtClockHm(Number.isFinite(sessResumeAtMs) ? sessResumeAtMs : (Date.now() + sessRemainMin * 60000))
+          : "";
+        const sessResumeShort = sessRemainMin > 0
+          ? (fmtHmDur(sessRemainMin) + tr("后", "") + (sessResumeClock ? (" · " + sessResumeClock) : ""))
+          : "";
+        const sessResumeTitle = sessRemainMin > 0
+          ? [tr("预计 ", "Resumes ~") + (sessResumeClock || "") + tr(" 恢复（约 ", " (in ") + fmtHmDur(sessRemainMin) + tr(" 后）", ")"), trialStr].filter(Boolean).join(" · ")
+          : trialStr;
+        const compactQuotaHtml =
+          '<div style="min-width:175px;max-width:215px;">' +
+            '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
+              '<span style="font-weight:600;color:' + (monthlyUsedNum != null && monthlyUsedNum >= 90 ? 'var(--err)' : 'var(--fg)') + ';white-space:nowrap;">' + esc(tr("月度 ", "Monthly ") + (monthlyUsedNum != null ? monthlyUsedNum.toFixed(1) + "%" : "—")) + '</span>' +
+              (monthlyDetail ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(monthlyDetail) + '">' + esc(monthlyDetail) + '</span>' : '') +
+            '</div>' +
+            '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
+              '<div style="height:100%;width:' + Math.max(0, Math.min(100, monthlyUsedNum || 0)) + '%;background:' + monthlyBarColor + ';border-radius:999px;"></div>' +
+            '</div>' +
+            (sessUsedNum != null && Number.isFinite(sessUsedNum)
+              ? '<div style="margin-top:6px;">' +
+                  '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
+                    '<span style="color:' + (sessUsedNum >= 80 ? sessBarColor : 'var(--fg-muted)') + ';font-weight:' + (sessUsedNum >= 80 ? '600' : '500') + ';white-space:nowrap;">' + esc(tr("短时 ", "5h Burst ") + sessPct) + '</span>' +
+                    (sessResumeShort
+                      ? '<span style="font-size:10px;color:' + (sessUsedNum >= 95 ? 'var(--err)' : 'var(--warn)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(sessResumeTitle) + '">' + esc(sessResumeShort) + '</span>'
+                      : (trialStr ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;">' + esc(trialStr) + '</span>' : '')) +
+                  '</div>' +
+                  '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
+                    '<div style="height:100%;width:' + Math.max(0, Math.min(100, sessUsedNum)) + '%;background:' + sessBarColor + ';border-radius:999px;"></div>' +
+                  '</div>' +
+                '</div>'
+              : (trialStr ? '<div style="font-size:10px;color:var(--fg-muted);margin-top:4px;">' + esc(trialStr) + '</div>' : '')) +
+          '</div>';
+        const shortAgentId = s.chatAgentId
+          ? (s.chatAgentId.length > 16 ? (s.chatAgentId.slice(0, 8) + "…" + s.chatAgentId.slice(-4)) : s.chatAgentId)
+          : "";
+        const formatShortDisableReason = (reason, kind, autoRecoverAt) => {
+          const r = String(reason || "");
+          const recMs = autoRecoverAt ? Date.parse(autoRecoverAt) : NaN;
+          const isShortRecover = Number.isFinite(recMs) && recMs > Date.now() && (recMs - Date.now()) <= 24 * 3600 * 1000;
+          const recClock = isShortRecover ? fmtClockHm(recMs) : "";
+          if (/Monthly 10h pool/i.test(r)) return tr("月度 10h 额度已满", "Monthly 10h pool exhausted");
+          if (/Session burst pool/i.test(r)) return recClock ? tr("短时已满 · " + recClock + " 自动恢复", "5h full · auto " + recClock) : tr("短时窗口已满 · 待恢复", "5h burst exhausted · waiting");
+          if (/usage limit|quota[_ ]exhausted/i.test(r) || kind === "quota") return recClock ? tr("限额熔断 · " + recClock + " 自动恢复", "Limit tripped · auto " + recClock) : tr("触发限额熔断 · 待恢复", "Usage limit tripped · waiting");
+          if (kind === "auth" || /auth/i.test(r)) return tr("认证失效 · 请重新授权", "Auth expired · re-authorize");
+          return r.length > 28 ? (r.slice(0, 28) + "…") : r;
+        };
         const addedTitle = s.addedAt ? new Date(s.addedAt).toLocaleString() : "";
         const isSyncing = busySyncIds.has(s.slotId);
         const isClearing = busyClearIds.has(s.slotId);
@@ -2716,36 +2785,31 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               renderAuthTag(s) +
               (planStr ? '<span class="tag">' + esc(planStr) + '</span>' : '') +
             '</div>' +
-            (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:3px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
+            (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
             (s.maskedProxy ? '<div class="mono" style="font-size:10.5px;color:var(--ok);margin-top:2px;">Proxy: ' + esc(s.maskedProxy) + '</div>' : '') +
-            (s.chatAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--accent);margin-top:2px;">Agent: ' + esc(s.chatAgentId) + '</div>' : '') +
+            (shortAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Agent: ' + esc(s.chatAgentId) + '">Agent: ' + esc(shortAgentId) + '</div>' : '') +
           '</td>' +
           '<td>' + (isSyncing
             ? '<div style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--fg-muted);"><span class="inline-spin"></span><span>' + esc(tr("正在同步额度...", "Syncing quota...")) + '</span></div>'
             : hasQuota
-            ? renderQuotaCell(q.premiumApiPool) +
-              (monthlyLine ? '<div style="font-size:11px;color:var(--fg-muted);margin-top:3px;">' + esc(monthlyLine) + '</div>' : '') +
-              (subQuotaLine ? '<div style="font-size:10.5px;color:var(--fg-muted);margin-top:1px;">' + esc(subQuotaLine) + '</div>' : '') +
-              (s.lastSyncError ? '<div style="font-size:10.5px;color:var(--err);margin-top:2px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(tr("最近同步失败: ", "Sync failed: ") + s.lastSyncError) + '</div>' : '')
+            ? compactQuotaHtml +
+              (s.lastSyncError ? '<div style="font-size:10.5px;color:var(--err);margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(tr("最近同步失败: ", "Sync failed: ") + s.lastSyncError) + '</div>' : '')
             : s.lastSyncError
               ? '<div style="font-size:11.5px;color:var(--err);font-weight:500;">' + esc(tr("同步失败", "Sync failed")) + '</div><div style="font-size:10.5px;color:var(--err);margin-top:2px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(s.lastSyncError) + '</div>'
               : '<div style="font-size:11.5px;color:var(--fg-muted);">' + esc(tr("未同步", "Not synced")) + '</div><div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("点击右上角同步额度", "Click Sync Quota")) + '</div>') +
           '</td>' +
-          '<td title="' + esc(addedTitle) + '">' +
+          '<td title="' + esc(addedTitle) + '" style="white-space:nowrap;">' +
             '<div style="font-size:12px;font-weight:500;">' + esc(fmtRelTime(s.addedAt)) + '</div>' +
             '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(fmtShortDate(s.addedAt)) + '</div>' +
           '</td>' +
-          '<td class="run-cell" style="font-size:11.5px;">' +
-            '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">' +
-              renderStatusDot(s) +
-              '<span style="color:var(--fg-muted);">' + esc(tr('调度 ', 'Req ')) + fmt(s.totalSelected) + ' · 429: ' + fmt(s.rateLimitHits) + '</span>' +
-            '</div>' +
-            '<div style="font-size:11px;color:var(--fg-muted);margin-top:4px;">' +
+          '<td class="run-cell" style="font-size:11.5px;min-width:155px;max-width:200px;">' +
+            '<div>' + renderStatusDot(s) + '</div>' +
+            '<div style="font-size:11px;color:var(--fg-muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(tr('调度 ', 'Req ') + fmt(s.totalSelected) + ' · 429: ' + fmt(s.rateLimitHits) + ' · ' + tr('会话 ', 'Sess ') + (typeof s.cloudSessionCount === 'number' ? s.cloudSessionCount : '—')) + '">' +
               (isClearing
-                ? '<span style="display:inline-flex;align-items:center;gap:5px;"><span class="inline-spin"></span>' + esc(tr('正在清理会话...', 'Clearing sessions...')) + '</span>'
-                : esc(tr('云端会话: ', 'Cloud: ')) + (typeof s.cloudSessionCount === 'number' ? (s.cloudSessionCount + tr(' 条', '')) : '—')) +
+                ? '<span style="display:inline-flex;align-items:center;gap:5px;"><span class="inline-spin"></span>' + esc(tr('清理会话中...', 'Clearing...')) + '</span>'
+                : esc(tr('调度 ', 'Req ') + fmt(s.totalSelected) + ' · 429: ' + fmt(s.rateLimitHits) + ' · ' + tr('会话 ', 'Sess ') + (typeof s.cloudSessionCount === 'number' ? s.cloudSessionCount : '—'))) +
             '</div>' +
-            (s.autoDisabledReason ? '<div style="color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;">' + esc(s.autoDisabledReason) + '</div>' : '') +
+            (s.autoDisabledReason ? '<div style="font-size:10.5px;color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(s.autoDisabledReason) + '">' + esc(formatShortDisableReason(s.autoDisabledReason, s.autoDisabledKind, s.autoRecoverAt)) + '</div>' : '') +
           '</td>' +
           '<td class="ops-cell"><div class="ops-stack">' +
             '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '">' + esc(tr('日志', 'Logs')) + '</button>' +

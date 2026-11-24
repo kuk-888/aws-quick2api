@@ -78,6 +78,7 @@ interface InternalKeySlot {
   autoPoolExhausted: boolean;
   activeInflight: number;
   cooldownUntil: number;
+  connLimitCooldownUntil: number;
   consecutiveRateLimits: number;
   selected: number;
   affinityHits: number;
@@ -171,16 +172,28 @@ export function isQuotaOrBillingExhaustedError(err: GatewayError): boolean {
 
 function getRemainingPercentForPool(quota: QuickPlanQuotaView | undefined, pool: "auto" | "api"): number | null {
   if (!quota) return null;
-  const target = pool === "auto"
-    ? quota.sessionPool.remainingPercent
-    : quota.premiumApiPool.remainingPercent;
+  const sessionRem = quota.sessionPool.remainingPercent;
+  const apiRem = quota.premiumApiPool.remainingPercent;
+  // Both auto and api requests consume the account's 5-hour short-term burst window.
+  // Scoring by the tighter of (monthly remaining, short-term burst remaining) prevents
+  // routing traffic onto an account whose monthly balance is high but burst window is ~95%+.
+  if (sessionRem !== null && apiRem !== null) {
+    return Math.min(sessionRem, apiRem);
+  }
+  const target = pool === "auto" ? sessionRem : apiRem;
   if (target !== null) return target;
   return quota.overallIncludedPlan.remainingPercent;
 }
 
+export const DEFAULT_MAX_INFLIGHT_PER_SLOT = 4;
+export const DEFAULT_CONN_LIMIT_COOLDOWN_MS = 2_500;
+export const DEFAULT_CONCURRENCY_WAIT_MS = 4_000;
+
 export class UpstreamKeyPool {
   private readonly slots: InternalKeySlot[] = [];
+  private readonly slotWaiters: Array<{ wake: () => void; canUse: (slot?: InternalKeySlot) => boolean }> = [];
   private readonly baseCooldownMs: number;
+  private readonly maxInflightPerSlot: number;
   private readonly envFilePath?: string;
   private readonly identityFilePath?: string;
   private readonly savedIdentities: Record<string, { userEmail?: string; displayName?: string }> = Object.create(null);
@@ -212,8 +225,11 @@ export class UpstreamKeyPool {
     | "incognitoMode"
     | "envFilePath"
     | "dataDir"
-  > & Partial<Pick<GatewayConfig, "chatAgentId" | "keyChatAgentIds" | "autoEnsureCodingAgent" | "customAgentPrompt">>) {
+  > & Partial<Pick<GatewayConfig, "chatAgentId" | "keyChatAgentIds" | "autoEnsureCodingAgent" | "customAgentPrompt">> & {
+    maxInflightPerSlot?: number;
+  }) {
     this.baseCooldownMs = config.keyCooldownMs;
+    this.maxInflightPerSlot = Math.max(1, config.maxInflightPerSlot ?? DEFAULT_MAX_INFLIGHT_PER_SLOT);
     this.lbStrategy = config.lbStrategy;
     this.sessionAffinityEnabled = config.sessionAffinityEnabled;
     this.sessionAffinityTtlMs = config.sessionAffinityTtlMs;
@@ -303,6 +319,7 @@ export class UpstreamKeyPool {
       autoPoolExhausted: false,
       activeInflight: 0,
       cooldownUntil: 0,
+      connLimitCooldownUntil: 0,
       consecutiveRateLimits: 0,
       selected: 0,
       affinityHits: 0,
@@ -451,6 +468,10 @@ export class UpstreamKeyPool {
     return this.slots.filter((s) => s.enabled).length;
   }
 
+  activeInflightForSlot(slotId: string): number {
+    return this.slots.find((s) => s.slotId === slotId)?.activeInflight ?? 0;
+  }
+
   private reviveCycleResetAccounts(): void {
     const now = Date.now();
     let changed = false;
@@ -469,10 +490,15 @@ export class UpstreamKeyPool {
     if (changed) this.persist();
   }
 
-  private isSlotEligibleForPool(slot: InternalKeySlot, _targetPool: "auto" | "api", now: number): boolean {
+  private isSlotPoolExhausted(slot: InternalKeySlot, targetPool: "auto" | "api"): boolean {
+    const flagged = targetPool === "auto" ? slot.autoPoolExhausted : slot.apiPoolExhausted;
+    return flagged && !slot.quota?.onDemandSpend.enabled;
+  }
+
+  private isSlotEligibleForPool(slot: InternalKeySlot, targetPool: "auto" | "api", now: number): boolean {
     if (!slot.enabled) return false;
     if (slot.cooldownUntil > now) return false;
-    if (slot.autoPoolExhausted || slot.apiPoolExhausted) return false;
+    if (this.isSlotPoolExhausted(slot, targetPool)) return false;
     return true;
   }
 
@@ -507,8 +533,23 @@ export class UpstreamKeyPool {
         if (released) return;
         released = true;
         if (slot && slot.activeInflight > 0) slot.activeInflight -= 1;
+        this.notifySlotAvailable(slot);
       }
     };
+  }
+
+  private notifySlotAvailable(releasedSlot?: InternalKeySlot, maxWake = 1): void {
+    let woken = 0;
+    for (let i = 0; i < this.slotWaiters.length && woken < maxWake; ) {
+      const w = this.slotWaiters[i]!;
+      if (w.canUse(releasedSlot)) {
+        this.slotWaiters.splice(i, 1);
+        w.wake();
+        woken += 1;
+      } else {
+        i += 1;
+      }
+    }
   }
 
   /**
@@ -543,6 +584,116 @@ export class UpstreamKeyPool {
     return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
   }
 
+  /**
+   * Async concurrency-aware lease: prefers accounts below `maxInflightPerSlot` (4, leaving 1 WS
+   * headroom below AWS Quick's 5-connection hard limit). If every usable account is currently full,
+   * performs a bounded soft-wait (default 4s, bounded queue) for a slot to free up instead of firing
+   * a doomed 5th/6th WebSocket that triggers LimitExceededException / ThrottlingException.
+   */
+  async leaseKeyWithWait(
+    requestedModel = "auto",
+    excludeKeys?: ReadonlySet<string>,
+    conversationKey?: string,
+    opts?: { maxWaitMs?: number; signal?: AbortSignal },
+  ): Promise<KeyLease> {
+    this.reviveCycleResetAccounts();
+    if (this.slots.length === 0) {
+      throw new GatewayError("All upstream AWS Quick accounts are currently disabled or unconfigured.", 503, "no_enabled_keys");
+    }
+
+    const maxWaitMs = Math.max(0, opts?.maxWaitMs ?? DEFAULT_CONCURRENCY_WAIT_MS);
+    const deadline = Date.now() + maxWaitMs;
+    const targetPool = classifyModelQuotaPool(requestedModel);
+    let hasWaited = false;
+
+    while (true) {
+      if (opts?.signal?.aborted) {
+        throw new GatewayError("Request aborted while waiting for an upstream slot.", 499, "client_aborted");
+      }
+      const now = Date.now();
+      for (const s of this.slots) {
+        if (s.cooldownUntil > 0 && s.cooldownUntil <= now) s.cooldownUntil = 0;
+        if (s.connLimitCooldownUntil > 0 && s.connLimitCooldownUntil <= now) s.connLimitCooldownUntil = 0;
+      }
+      const enabledSlots = this.slots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
+      if (enabledSlots.length === 0) {
+        throw new GatewayError("No enabled upstream AWS Quick credentials available.", 503, "no_enabled_keys");
+      }
+      const usableSlots = enabledSlots.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
+      if (usableSlots.length === 0) {
+        throw new GatewayError(
+          `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
+          429,
+          "quota_exhausted",
+        );
+      }
+
+      const hasCapacity = usableSlots.some(
+        (s) => s.cooldownUntil === 0 && s.activeInflight < this.maxInflightPerSlot,
+      );
+      if (hasCapacity) {
+        return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
+      }
+
+      // If no account has inflight capacity (or all are briefly cooling down), check wait budget.
+      const remainingMs = deadline - Date.now();
+      const maxQueue = Math.max(4, usableSlots.length * this.maxInflightPerSlot);
+      if (remainingMs <= 0 || (!hasWaited && this.slotWaiters.length >= maxQueue)) {
+        // Only fall through to pickFromPool if all accounts are in long cooldown AND at least one
+        // has inflight headroom (< maxInflightPerSlot); pickFromPool also enforces < maxInflightPerSlot.
+        const anyBelowCap = usableSlots.some((s) => s.activeInflight < this.maxInflightPerSlot);
+        if (anyBelowCap && remainingMs <= 0 && usableSlots.every((s) => s.cooldownUntil > Date.now())) {
+          return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
+        }
+        throw new GatewayError(
+          "All upstream AWS Quick accounts are currently at concurrency capacity. Please retry in a few seconds.",
+          429,
+          "rate_limit_exceeded",
+        );
+      }
+
+      // Wait until a compatible lease is released, a short cooldown expires, or the wait budget runs out.
+      const soonestCooldownMs = usableSlots.reduce((min, s) => {
+        if (s.cooldownUntil > now && s.activeInflight < this.maxInflightPerSlot) {
+          return Math.min(min, s.cooldownUntil - now);
+        }
+        return min;
+      }, remainingMs);
+      const stepWaitMs = Math.max(25, Math.min(remainingMs, soonestCooldownMs));
+
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const entry = {
+          wake: () => finish(),
+          canUse: (releasedSlot?: InternalKeySlot) => {
+            if (!releasedSlot) return true;
+            if (!releasedSlot.enabled || excludeKeys?.has(releasedSlot.rawKey)) return false;
+            return !this.isSlotPoolExhausted(releasedSlot, targetPool);
+          },
+        };
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          opts?.signal?.removeEventListener("abort", onAbort);
+          const idx = this.slotWaiters.indexOf(entry);
+          if (idx >= 0) this.slotWaiters.splice(idx, 1);
+          resolve();
+        };
+        const onAbort = () => finish();
+        const timer = setTimeout(finish, stepWaitMs);
+        timer.unref?.();
+        if (hasWaited) {
+          this.slotWaiters.unshift(entry);
+        } else {
+          this.slotWaiters.push(entry);
+        }
+        hasWaited = true;
+        opts?.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
+  }
+
   private pickFromPool(
     requestedModel: string,
     excludeKeys?: ReadonlySet<string>,
@@ -554,18 +705,57 @@ export class UpstreamKeyPool {
     // Clear expired cooldowns
     for (const s of this.slots) {
       if (s.cooldownUntil > 0 && s.cooldownUntil <= now) s.cooldownUntil = 0;
+      if (s.connLimitCooldownUntil > 0 && s.connLimitCooldownUntil <= now) s.connLimitCooldownUntil = 0;
     }
 
     // Step 1: Check CPA-style Sticky Session Affinity first!
+    // Elastic concurrency & brief conn-limit guard: if the sticky account is at maxInflightPerSlot
+    // or in a brief 2.5s conn-limit backoff, borrow an idle account for this turn WITHOUT evicting
+    // the sticky binding so subsequent turns still benefit from warm_incremental.
     if (this.sessionAffinityEnabled && conversationKey) {
       const stickyRawKey = this.affinityTable.lookup(conversationKey, this.sessionAffinityTtlMs);
       if (stickyRawKey && !excludeKeys?.has(stickyRawKey)) {
         const stickySlot = this.slots.find((s) => s.rawKey === stickyRawKey);
+        const onlyBriefConnBackoff =
+          stickySlot !== undefined &&
+          stickySlot.enabled &&
+          !this.isSlotPoolExhausted(stickySlot, targetPool) &&
+          stickySlot.cooldownUntil > now &&
+          stickySlot.connLimitCooldownUntil >= stickySlot.cooldownUntil;
+
         if (stickySlot && this.isSlotEligibleForPool(stickySlot, targetPool, now)) {
+          if (stickySlot.activeInflight < this.maxInflightPerSlot) {
+            return this.leaseSpecificKey(stickySlot.rawKey, true);
+          }
+          const spareCandidates = this.slots.filter(
+            (s) =>
+              s !== stickySlot &&
+              !excludeKeys?.has(s.rawKey) &&
+              this.isSlotEligibleForPool(s, targetPool, now) &&
+              s.activeInflight < this.maxInflightPerSlot,
+          );
+          if (spareCandidates.length > 0) {
+            const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
+            return this.leaseSpecificKey(borrowed.rawKey, false);
+          }
           return this.leaseSpecificKey(stickySlot.rawKey, true);
+        } else if (onlyBriefConnBackoff && stickySlot) {
+          const spareCandidates = this.slots.filter(
+            (s) =>
+              s !== stickySlot &&
+              !excludeKeys?.has(s.rawKey) &&
+              this.isSlotEligibleForPool(s, targetPool, now) &&
+              s.activeInflight < this.maxInflightPerSlot,
+          );
+          if (spareCandidates.length > 0) {
+            const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
+            return this.leaseSpecificKey(borrowed.rawKey, false);
+          }
+          // Fall through without evicting sticky affinity
+        } else {
+          // Bound account is exhausted, in long rate-limit cooldown, or disabled -> break affinity cleanly!
+          this.affinityTable.evictConversation(conversationKey);
         }
-        // Bound account is exhausted, cooling down, or disabled -> break affinity so we rebind cleanly to B!
-        this.affinityTable.evictConversation(conversationKey);
       }
     }
 
@@ -576,18 +766,14 @@ export class UpstreamKeyPool {
 
     let candidates = enabledSlots.filter((s) => s.cooldownUntil === 0);
     // All enabled accounts in transient 429 cooldown -> still run the exhaustion check below,
-    // then pick the one whose cooldown expires soonest.
+    // then pick the one whose cooldown expires soonest (strictly respecting maxInflightPerSlot).
     const allCoolingDown = candidates.length === 0;
     if (allCoolingDown) {
       candidates = [...enabledSlots].sort((a, b) => a.cooldownUntil - b.cooldownUntil);
     }
 
     // Filter out accounts whose target pool is exhausted without allowed fallback
-    const nonExhausted = candidates.filter((s) => {
-      const flagged = targetPool === "auto" ? s.autoPoolExhausted : s.apiPoolExhausted;
-      if (flagged && !s.quota?.onDemandSpend.enabled) return false;
-      return true;
-    });
+    const nonExhausted = candidates.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
     if (nonExhausted.length > 0) {
       candidates = nonExhausted;
     } else if (!candidates.some((s) => s.quota?.onDemandSpend.enabled)) {
@@ -599,28 +785,46 @@ export class UpstreamKeyPool {
     }
 
     if (allCoolingDown) {
-      return this.bindAndLease(candidates[0]!, conversationKey);
+      const belowCap = candidates.filter((s) => s.activeInflight < this.maxInflightPerSlot);
+      if (belowCap.length === 0) {
+        throw new GatewayError(
+          "All upstream AWS Quick accounts are currently at concurrency capacity. Please retry in a few seconds.",
+          429,
+          "rate_limit_exceeded",
+        );
+      }
+      return this.bindAndLease(belowCap[0]!, conversationKey);
     }
 
+    const underCap = candidates.filter((s) => s.activeInflight < this.maxInflightPerSlot);
+    if (underCap.length > 0) {
+      candidates = underCap;
+    }
+
+    const picked = this.pickBestCandidate(candidates, targetPool);
+    return this.bindAndLease(picked, conversationKey);
+  }
+
+  private pickBestCandidate(candidates: InternalKeySlot[], targetPool: "auto" | "api"): InternalKeySlot {
     if (this.lbStrategy === "round-robin") {
-      const picked = this.nextRoundRobin(candidates);
-      return this.bindAndLease(picked, conversationKey);
+      return this.nextRoundRobin(candidates);
     }
 
+    let pool = candidates;
     if (this.lbStrategy === "quota-aware") {
-      const withIncluded = candidates.filter((s) => {
+      const withIncluded = pool.filter((s) => {
         const rem = getRemainingPercentForPool(s.quota, targetPool);
         const flagged = targetPool === "auto" ? s.autoPoolExhausted : s.apiPoolExhausted;
         return !flagged && (rem === null || rem > 0);
       });
-      if (withIncluded.length > 0) candidates = withIncluded;
+      if (withIncluded.length > 0) pool = withIncluded;
     }
 
     const n = this.slots.length;
     const startIdx = this.rrIndex;
     this.rrIndex = (this.rrIndex + 1) % Math.max(1, n);
 
-    candidates.sort((a, b) => {
+    const sorted = [...pool].sort((a, b) => {
       if (a.activeInflight !== b.activeInflight) return a.activeInflight - b.activeInflight;
       if (this.lbStrategy === "quota-aware") {
         const remA = getRemainingPercentForPool(a.quota, targetPool);
@@ -634,7 +838,7 @@ export class UpstreamKeyPool {
       return idxA - idxB;
     });
 
-    return this.bindAndLease(candidates[0]!, conversationKey);
+    return sorted[0]!;
   }
 
   private bindAndLease(slot: InternalKeySlot, conversationKey?: string): KeyLease {
@@ -663,6 +867,20 @@ export class UpstreamKeyPool {
   }
 
   /**
+   * Brief non-escalating backoff for AWS Quick's per-account 5-WS concurrency ceiling
+   * (`LimitExceededException: Too many active connections. Maximum allowed: 5`).
+   * Does NOT escalate exponential cooldown (60s-300s) and does NOT evict sticky affinity.
+   */
+  reportConnLimit(rawKey: string, backoffMs = DEFAULT_CONN_LIMIT_COOLDOWN_MS): void {
+    const slot = this.slots.find((s) => s.rawKey === rawKey);
+    if (!slot) return;
+    slot.rateLimits += 1;
+    const until = Date.now() + Math.max(500, backoffMs);
+    if (until > slot.connLimitCooldownUntil) slot.connLimitCooldownUntil = until;
+    if (until > slot.cooldownUntil) slot.cooldownUntil = until;
+  }
+
+  /**
    * CPA-style exponential backoff cooldown for transient 429 burst errors (30s -> 60s -> 120s -> max 300s).
    */
   reportRateLimit(rawKey: string): void {
@@ -681,32 +899,24 @@ export class UpstreamKeyPool {
    * Evicts sticky sessions from Account A so they seamlessly rebind to Account B,
    * marks the affected pool exhausted, and auto-disables Account A if configured!
    */
-  reportQuotaExhausted(rawKey: string, requestedModel: string, reasonDetail?: string): void {
+  reportQuotaExhausted(rawKey: string, _requestedModel: string, reasonDetail?: string): void {
     const slot = this.slots.find((s) => s.rawKey === rawKey);
     if (!slot) return;
     slot.quotaExhaustedHits += 1;
     this.affinityTable.evictAllForKey(rawKey);
 
-    const pool = classifyModelQuotaPool(requestedModel);
-    if (pool === "auto") {
-      slot.autoPoolExhausted = true;
-    } else {
-      slot.apiPoolExhausted = true;
-    }
+    // On AWS Quick, hitting the 5h burst window or monthly 10h pool blocks ALL models on the account.
+    // Mark both pools exhausted and auto-disable immediately regardless of stale cached quota telemetry.
+    slot.autoPoolExhausted = true;
+    slot.apiPoolExhausted = true;
 
     if (this.autoDisableExhaustedKeys) {
-      const autoStillHasBalance = pool === "api"
-        && !slot.autoPoolExhausted
-        && (slot.quota?.sessionPool.remainingPercent ?? 0) > 0;
-
-      if (!autoStillHasBalance) {
-        slot.enabled = false;
-        slot.autoDisabledKind = "quota";
-        slot.autoDisabledReason = reasonDetail
-          ? `Auto-disabled (quota exhausted): ${redactSecrets(reasonDetail).slice(0, 60)}`
-          : "Auto-disabled: quota exhausted";
-        this.persist();
-      }
+      slot.enabled = false;
+      slot.autoDisabledKind = "quota";
+      slot.autoDisabledReason = reasonDetail
+        ? `Auto-disabled (quota exhausted): ${redactSecrets(reasonDetail).slice(0, 60)}`
+        : "Auto-disabled: quota exhausted";
+      this.persist();
     }
   }
 
@@ -764,18 +974,29 @@ export class UpstreamKeyPool {
     slot.quota = quota;
     slot.quotaUpdatedAt = new Date().toISOString();
 
+    const now = Date.now();
     const prevResetMs = slot.autoResetAtMs;
-    if (quota.billingCycleEnd) {
-      const endMs = Date.parse(quota.billingCycleEnd);
-      if (Number.isFinite(endMs)) slot.autoResetAtMs = endMs;
-    }
-
     const autoRem = quota.sessionPool.remainingPercent;
     const apiRem = quota.premiumApiPool.remainingPercent;
 
     slot.autoPoolExhausted = autoRem !== null && autoRem <= 0;
     slot.apiPoolExhausted = apiRem !== null && apiRem <= 0;
     const exhausted = slot.autoPoolExhausted || slot.apiPoolExhausted;
+
+    const billingEndMs = quota.billingCycleEnd ? Date.parse(quota.billingCycleEnd) : Number.NaN;
+    const rawSessionResumeMs = quota.sessionPool.resumeAt
+      ? Date.parse(quota.sessionPool.resumeAt)
+      : typeof quota.sessionPool.resumeInMinutes === "number" && quota.sessionPool.resumeInMinutes > 0
+        ? now + Math.ceil(quota.sessionPool.resumeInMinutes) * 60_000
+        : Number.NaN;
+
+    // If ONLY the 5h session burst pool is exhausted (monthly 10h pool still has quota),
+    // schedule auto-recovery using AWS Quick's exact `resume_in_minutes` instead of waiting for next month!
+    if (slot.autoPoolExhausted && !slot.apiPoolExhausted && Number.isFinite(rawSessionResumeMs) && rawSessionResumeMs > now) {
+      slot.autoResetAtMs = rawSessionResumeMs;
+    } else if (Number.isFinite(billingEndMs)) {
+      slot.autoResetAtMs = billingEndMs;
+    }
 
     // Proactive auto-disable if either Session burst pool or Monthly 10h pool hits 0%.
     if (this.autoDisableExhaustedKeys && slot.enabled && exhausted) {
@@ -795,9 +1016,12 @@ export class UpstreamKeyPool {
         slot.enabled = true;
         slot.autoDisabledReason = undefined;
         slot.autoDisabledKind = undefined;
+        slot.autoResetAtMs = undefined;
         slot.cooldownUntil = 0;
+        slot.connLimitCooldownUntil = 0;
         slot.consecutiveRateLimits = 0;
         this.persist();
+        this.notifySlotAvailable(slot, this.maxInflightPerSlot);
         return;
       }
       if (slot.autoResetAtMs !== prevResetMs) this.persist();
@@ -821,8 +1045,10 @@ export class UpstreamKeyPool {
       slot.apiPoolExhausted = false;
       slot.autoPoolExhausted = false;
       slot.cooldownUntil = 0;
+      slot.connLimitCooldownUntil = 0;
       slot.consecutiveRateLimits = 0;
       this.persist();
+      this.notifySlotAvailable(slot, this.maxInflightPerSlot);
     }
   }
 
@@ -848,10 +1074,12 @@ export class UpstreamKeyPool {
         existing.autoDisabledKind = undefined;
         existing.autoDisabledReason = undefined;
         existing.cooldownUntil = 0;
+        existing.connLimitCooldownUntil = 0;
         if (label?.trim()) existing.label = label.trim();
         if (proxyUrl !== undefined) existing.proxyUrl = validProxy;
         if (chatAgentId !== undefined) existing.chatAgentId = validChatAgentId;
         this.persist();
+        if (enabled) this.notifySlotAvailable(existing, this.maxInflightPerSlot);
         return this.toSlotStatus(existing, this.affinityTable.countBySlot());
       }
     } else if (!normalized || normalized.length < 4 || /[\r\n]/.test(normalized)) {
@@ -866,6 +1094,7 @@ export class UpstreamKeyPool {
     if (proxyUrl !== undefined) slot.proxyUrl = validProxy;
     if (chatAgentId !== undefined) slot.chatAgentId = validChatAgentId;
     this.persist();
+    if (enabled) this.notifySlotAvailable(slot, this.maxInflightPerSlot);
     return this.toSlotStatus(slot, this.affinityTable.countBySlot());
   }
 
@@ -878,6 +1107,7 @@ export class UpstreamKeyPool {
 
     if (patch.clearCooldown) {
       slot.cooldownUntil = 0;
+      slot.connLimitCooldownUntil = 0;
       slot.consecutiveRateLimits = 0;
     }
     if (patch.label !== undefined) {
@@ -897,7 +1127,10 @@ export class UpstreamKeyPool {
       slot.enabled = patch.enabled;
       if (patch.enabled) {
         slot.cooldownUntil = 0;
+        slot.connLimitCooldownUntil = 0;
         slot.consecutiveRateLimits = 0;
+        slot.apiPoolExhausted = false;
+        slot.autoPoolExhausted = false;
         slot.autoDisabledReason = undefined;
         slot.autoDisabledKind = undefined;
       } else {
@@ -907,6 +1140,9 @@ export class UpstreamKeyPool {
       }
     }
     this.persist();
+    if (slot.enabled && (patch.enabled === true || patch.clearCooldown)) {
+      this.notifySlotAvailable(slot, this.maxInflightPerSlot);
+    }
     return this.toSlotStatus(slot, this.affinityTable.countBySlot());
   }
 

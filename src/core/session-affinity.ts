@@ -63,10 +63,22 @@ export function deriveConversationAffinityKey(params: {
 
   if (rawBody.metadata && typeof rawBody.metadata === "object" && !Array.isArray(rawBody.metadata)) {
     const meta = rawBody.metadata as Record<string, unknown>;
-    for (const k of ["session_id", "conversation_id", "user_id"]) {
+    for (const k of ["session_id", "conversation_id"]) {
       if (typeof meta[k] === "string" && (meta[k] as string).trim()) {
         return shortHash("meta", (meta[k] as string).trim());
       }
+    }
+    if (typeof meta.user_id === "string" && meta.user_id.trim()) {
+      // Combine `metadata.user_id` with the first user turn anchor (stripping Claude Code
+      // `<system-reminder>` wrappers and omitting volatile systemPrompt) so multi-turn chats
+      // keep 100% warm_incremental stickiness while separate windows and parallel subagents rotate.
+      const rawFirst = (firstUserText || "").trim();
+      const strippedFirst = rawFirst.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+      const effectiveFirst = strippedFirst || rawFirst;
+      if (effectiveFirst) {
+        return shortHash("meta", `${meta.user_id.trim()}\0${effectiveFirst.slice(0, 1024)}`);
+      }
+      return shortHash("meta", meta.user_id.trim());
     }
   }
 

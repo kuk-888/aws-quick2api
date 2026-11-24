@@ -11,12 +11,20 @@ function trimText(text: string, maxLen: number): string {
   return `${clean.slice(0, Math.max(0, maxLen - 1)).trimEnd()}…`;
 }
 
-function compactJsonSchema(node: unknown, maxDescLen: number, depth = 0): unknown {
+function compactJsonSchema(
+  node: unknown,
+  maxDescLen: number,
+  depth = 0,
+  requiredOnlyDescLen = 0,
+): unknown {
   if (depth > 8 || node === null || typeof node !== "object") return node;
   if (Array.isArray(node)) {
-    return node.map((item) => compactJsonSchema(item, maxDescLen, depth + 1));
+    return node.map((item) => compactJsonSchema(item, maxDescLen, depth + 1, requiredOnlyDescLen));
   }
   const obj = node as Record<string, unknown>;
+  const requiredSet = new Set(
+    Array.isArray(obj.required) ? obj.required.filter((r): r is string => typeof r === "string") : [],
+  );
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (k === "$schema" || k === "$id" || k === "title" || k === "examples" || k === "default") continue;
@@ -27,12 +35,18 @@ function compactJsonSchema(node: unknown, maxDescLen: number, depth = 0): unknow
     if (k === "properties" && v && typeof v === "object" && !Array.isArray(v)) {
       const props: Record<string, unknown> = {};
       for (const [pk, pv] of Object.entries(v as Record<string, unknown>)) {
-        props[pk] = compactJsonSchema(pv, maxDescLen, depth + 1);
+        const childDescLen =
+          maxDescLen > 0
+            ? maxDescLen
+            : requiredOnlyDescLen > 0 && requiredSet.has(pk)
+              ? requiredOnlyDescLen
+              : 0;
+        props[pk] = compactJsonSchema(pv, childDescLen, depth + 1, requiredOnlyDescLen);
       }
       out[k] = props;
       continue;
     }
-    out[k] = compactJsonSchema(v, maxDescLen, depth + 1);
+    out[k] = compactJsonSchema(v, maxDescLen, depth + 1, requiredOnlyDescLen);
   }
   return out;
 }
@@ -86,7 +100,17 @@ export function buildToolBridgePrompt(
     }));
     serialized = JSON.stringify(compactSpecs);
   }
-  if (Buffer.byteLength(serialized, "utf8") > 24_000) {
+  if (Buffer.byteLength(serialized, "utf8") > 28_000) {
+    // Tier 3: preserve concise descriptions on required parameters so complex MCP tools stay callable.
+    const requiredOnlySpecs = tools.map((t) => ({
+      name: t.name,
+      ...(t.description ? { description: trimText(t.description, 100) } : {}),
+      parameters: compactJsonSchema(t.inputSchema, 0, 0, 48),
+    }));
+    serialized = JSON.stringify(requiredOnlySpecs);
+  }
+  if (Buffer.byteLength(serialized, "utf8") > 36_000) {
+    // Tier 4 (extreme 40+ MCP tools): strip all parameter descriptions to stay safely under frame budget.
     const minimalSpecs = tools.map((t) => ({
       name: t.name,
       ...(t.description ? { description: trimText(t.description, 80) } : {}),

@@ -553,6 +553,28 @@ export function classifyUpstreamError(finalErr: GatewayError): {
   };
 }
 
+const PSEUDO_200_USAGE_LIMIT_PHRASES = [
+  "you've reached your usage limit. check your profile for details.",
+  "you have reached your usage limit. check your profile for details.",
+] as const;
+
+function normalizeUsageLimitProbe(text: string): string {
+  return text.trimStart().toLowerCase().replace(/[\u2018\u2019]/g, "'").replace(/\s+/g, " ");
+}
+
+export function isPseudo200UsageLimitText(text: string): boolean {
+  const norm = normalizeUsageLimitProbe(text).trimEnd();
+  if (!norm || norm.length > 140) return false;
+  return /^you(?:'ve| have) reached your usage limit\.\s*check your profile for details\.?$/i.test(norm);
+}
+
+export function isPseudo200UsageLimitPrefix(text: string): boolean {
+  const norm = normalizeUsageLimitProbe(text);
+  if (!norm) return true;
+  if (norm.length > 80) return false;
+  return PSEUDO_200_USAGE_LIMIT_PHRASES.some((phrase) => phrase.startsWith(norm));
+}
+
 interface ParkedWsHandle {
   ws: WebSocket;
   outpostId: string;
@@ -603,7 +625,7 @@ export class QuickExecutionEngine {
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly activeWsBySlot = new Map<string, number>();
   private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
-  private readonly autoEnsureFailedSlots = new Map<string, number>();
+  private readonly autoEnsureFailedSlots = new Map<string, { failedAt: number; count: number }>();
   private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
 
   private warmKey(
@@ -774,7 +796,11 @@ export class QuickExecutionEngine {
     };
 
     let parkedSocket = false;
-    if (ws && ws.readyState === WebSocket.OPEN && encodeFrame) {
+    // Only park the live WS for reuse when the account has headroom below AWS's 5-WS hard limit.
+    // Note: `activeWsBySlot` still includes the current finishing WS until `finally` decrements it.
+    const activeOnSlot = this.activeWsBySlot.get(slotId) || 0;
+    const allowParkUnderLoad = activeOnSlot + this.countParkedWsForSlot(slotId) <= 4;
+    if (ws && ws.readyState === WebSocket.OPEN && encodeFrame && allowParkUnderLoad) {
       // Enforce per-account cap first (AWS Quick hard limit: 5 active WS connections per account).
       while (this.countParkedWsForSlot(slotId) >= MAX_PARKED_WS_PER_SLOT) {
         if (this.evictParkedWsForSlot(slotId, 1) === 0) break;
@@ -1480,14 +1506,18 @@ export class QuickExecutionEngine {
         this.autoEnsureFailedSlots.delete(slotId);
         return created.agentId;
       } catch {
-        this.autoEnsureFailedSlots.set(slotId, Date.now());
+        const prev = this.autoEnsureFailedSlots.get(slotId);
+        this.autoEnsureFailedSlots.set(slotId, { failedAt: Date.now(), count: (prev?.count || 0) + 1 });
         return undefined;
-      } finally {
-        this.ensuringAgentBySlot.delete(slotId);
       }
     })();
 
     this.ensuringAgentBySlot.set(slotId, work);
+    void work.finally(() => {
+      if (this.ensuringAgentBySlot.get(slotId) === work) {
+        this.ensuringAgentBySlot.delete(slotId);
+      }
+    });
     return work;
   }
 
@@ -1504,10 +1534,19 @@ export class QuickExecutionEngine {
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     const excluded = new Set<string>();
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 5);
+    const totalWaitDeadline = Date.now() + 6_000;
     let retriedSameSlotConnLimit = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const lease = keyPool.leaseKey(turn.requestedModel, excluded.size > 0 ? excluded : undefined, turn.conversationKey);
+      const lease = await keyPool.leaseKeyWithWait(
+        turn.requestedModel,
+        excluded.size > 0 ? excluded : undefined,
+        turn.conversationKey,
+        {
+          signal: turn.signal,
+          maxWaitMs: Math.max(0, Math.min(4_000, totalWaitDeadline - Date.now())),
+        },
+      );
       const poolSettings = keyPool.getSettings();
       const isIncognito = poolSettings.incognitoMode;
       const shouldAutoEnsure =
@@ -1515,22 +1554,6 @@ export class QuickExecutionEngine {
           ? poolSettings.autoEnsureCodingAgent
           : this.autoEnsureCodingAgent;
       let effectiveChatAgentId = (lease.chatAgentId || poolSettings.chatAgentId || "").trim() || undefined;
-      if (
-        !effectiveChatAgentId &&
-        shouldAutoEnsure &&
-        !turn.rawBody?.__internalSummary &&
-        !turn.signal?.aborted
-      ) {
-        const failedAt = this.autoEnsureFailedSlots.get(lease.slotId);
-        if (!failedAt || Date.now() - failedAt > 10 * 60 * 1000) {
-          effectiveChatAgentId = await this.ensureCodingAgentForKey(
-            lease.apiKey,
-            lease.slotId,
-            keyPool,
-            lease.proxyUrl,
-          ).catch(() => undefined);
-        }
-      }
       let yieldedOutput = false;
       let lastExecMode: ExecutionModeTag | undefined;
       const wrappedMeta: typeof onExecMeta = (meta) => {
@@ -1539,7 +1562,43 @@ export class QuickExecutionEngine {
       };
 
       try {
-        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId)) {
+        if (
+          !effectiveChatAgentId &&
+          shouldAutoEnsure &&
+          !turn.rawBody?.__internalSummary &&
+          !turn.signal?.aborted
+        ) {
+          const failRec = this.autoEnsureFailedSlots.get(lease.slotId);
+          // Exponential backoff on persistent failures: 30s -> 2m -> 10m -> 30m
+          const backoffMs = failRec
+            ? [30_000, 120_000, 600_000, 1_800_000][Math.min(failRec.count - 1, 3)]!
+            : 0;
+          if (!failRec || Date.now() - failRec.failedAt > backoffMs) {
+            const ensurePromise = this.ensureCodingAgentForKey(
+              lease.apiKey,
+              lease.slotId,
+              keyPool,
+              lease.proxyUrl,
+            ).catch(() => undefined);
+            if (turn.signal) {
+              effectiveChatAgentId = await new Promise<string | undefined>((resolve) => {
+                if (turn.signal!.aborted) return resolve(undefined);
+                const onAbort = () => resolve(undefined);
+                turn.signal!.addEventListener("abort", onAbort, { once: true });
+                ensurePromise.then((val) => {
+                  turn.signal!.removeEventListener("abort", onAbort);
+                  resolve(val);
+                });
+              });
+            } else {
+              effectiveChatAgentId = await ensurePromise;
+            }
+          }
+        }
+        if (turn.signal?.aborted) {
+          throw new GatewayError("Request aborted before starting upstream turn.", 499, "client_aborted");
+        }
+        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId, keyPool)) {
           if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
             yieldedOutput = true;
           }
@@ -1560,7 +1619,7 @@ export class QuickExecutionEngine {
           gwErr.code !== "content_filtered"
         ) {
           try {
-            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId)) {
+            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId, keyPool)) {
               if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
                 yieldedOutput = true;
               }
@@ -1604,6 +1663,8 @@ export class QuickExecutionEngine {
 
         if (isQuotaErr) {
           keyPool.reportQuotaExhausted(lease.apiKey, turn.requestedModel, msg);
+        } else if (isConnLimitErr) {
+          keyPool.reportConnLimit(lease.apiKey);
         } else if (isRateLimitErr || isProxyOrConnErr) {
           keyPool.reportRateLimit(lease.apiKey);
         } else if (isAuthErr) {
@@ -1613,7 +1674,7 @@ export class QuickExecutionEngine {
         const canFailover =
           !yieldedOutput &&
           !turn.signal?.aborted &&
-          (isQuotaErr || isRateLimitErr || isAuthErr || isProxyOrConnErr) &&
+          (isQuotaErr || isConnLimitErr || isRateLimitErr || isAuthErr || isProxyOrConnErr) &&
           attempt + 1 < maxAttempts;
 
         if (canFailover) {
@@ -1642,6 +1703,7 @@ export class QuickExecutionEngine {
       usedProxy?: boolean;
     }) => void,
     chatAgentId?: string,
+    keyPool?: UpstreamKeyPool,
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     // Resolve model BEFORE consuming any parked warm WS so there is no async vacuum window
     // where a parked WS has no error/close listeners or leaks if model resolution fails.
@@ -1800,15 +1862,41 @@ export class QuickExecutionEngine {
     if (reusedWs && reusedWs.readyState === WebSocket.OPEN) {
       ws = reusedWs;
     } else {
-      // Proactively evict parked idle WS on this account if active + parked approaches AWS's 5-connection ceiling.
-      const activeForSlot = this.activeWsBySlot.get(lease.slotId) || 0;
-      const parkedForSlot = this.countParkedWsForSlot(lease.slotId);
-      if (activeForSlot + parkedForSlot >= 4) {
-        this.evictParkedWsForSlot(lease.slotId, activeForSlot + parkedForSlot - 3);
-      }
+      // Helper: run right BEFORE `new WebSocket(...)` (after all async token/session awaits) so
+      // `active + parked` stays <= 4, with a brief 150ms pause only when sockets were evicted.
+      const ensureHeadroomBeforeDial = async () => {
+        if (turn.signal?.aborted) {
+          throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
+        }
+        const activeForSlot = Math.max(
+          this.activeWsBySlot.get(lease.slotId) || 0,
+          keyPool ? keyPool.activeInflightForSlot(lease.slotId) : 0,
+        );
+        const parkedForSlot = this.countParkedWsForSlot(lease.slotId);
+        const overflow = activeForSlot + parkedForSlot - 4;
+        if (overflow > 0) {
+          const evicted = this.evictParkedWsForSlot(lease.slotId, overflow);
+          if (evicted > 0 && !turn.signal?.aborted) {
+            await new Promise<void>((resolve) => {
+              const onAbort = () => { clearTimeout(t); resolve(); };
+              const t = setTimeout(() => {
+                turn.signal?.removeEventListener("abort", onAbort);
+                resolve();
+              }, 150);
+              t.unref?.();
+              turn.signal?.addEventListener("abort", onAbort, { once: true });
+              if (turn.signal?.aborted) onAbort();
+            });
+          }
+        }
+        if (turn.signal?.aborted) {
+          throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
+        }
+      };
 
       if (isWeb && cred.web) {
         const conn = buildWebWsConnection(cred.web, workingSessionId);
+        await ensureHeadroomBeforeDial();
         ws = new WebSocket(conn.url, conn.protocols, {
           headers: conn.headers,
           ...(wsAgent ? { agent: wsAgent } : {}),
@@ -1823,6 +1911,7 @@ export class QuickExecutionEngine {
           `&outpostId=${encodeURIComponent(outpostId)}` +
           `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
           `&channel=prod`;
+        await ensureHeadroomBeforeDial();
         ws = new WebSocket(wsUrl, {
           headers: {
             "User-Agent": QUICK_DESKTOP_USER_AGENT,
@@ -1868,6 +1957,7 @@ export class QuickExecutionEngine {
           `&replayContext=${encodeURIComponent(replayContext)}` +
           `&channel=prod`;
 
+        await ensureHeadroomBeforeDial();
         ws = new WebSocket(wsUrl, {
           headers: {
             Authorization: `Bearer ${session.jwt}`,
@@ -1933,11 +2023,14 @@ export class QuickExecutionEngine {
       }
     };
     turn.signal?.addEventListener("abort", onAbort, { once: true });
+    if (turn.signal?.aborted) onAbort();
 
     let recvBuf = Buffer.alloc(0);
     let emittedRoutedModel = false;
     let hasEmittedText = false;
     let assistantOutputText = "";
+    let usageLimitPrefixBuf = "";
+    let usageLimitChecked = false;
     let resolvedModelId: string | undefined;
     let wsParked = false;
     let pingTimer: NodeJS.Timeout | null = null;
@@ -1966,11 +2059,85 @@ export class QuickExecutionEngine {
         chunkAdvanceTimer = null;
       }
     };
+    const abortPseudo200QuotaLimit = () => {
+      clearPing();
+      clearPostUsageTimer();
+      clearAuxTimers();
+      ended = true;
+      push({
+        type: "__error",
+        error: new GatewayError(
+          "AWS Quick account reached its usage limit (quota_exhausted).",
+          402,
+          "quota_exhausted",
+        ),
+      });
+      try {
+        ws.close();
+      } catch { }
+    };
+
+    let pendingRoutedThinking: string | null = null;
+    let sawRealThinking = false;
+    const flushPendingRoutedThinking = () => {
+      if (pendingRoutedThinking) {
+        const text = pendingRoutedThinking;
+        pendingRoutedThinking = null;
+        push({ type: "thinking", text });
+      }
+    };
+
+    const emitGuardedText = (chunk: string): boolean => {
+      if (!chunk) return true;
+      if (!usageLimitChecked) {
+        usageLimitPrefixBuf += chunk;
+        // Keep buffering while the text could still be the exact AWS Quick pseudo-200 usage-limit reply.
+        // Final verdict is deferred to `finalizeTurn` so normal replies that merely quote the error
+        // sentence and continue explaining it are never falsely tripped mid-stream.
+        if (
+          usageLimitPrefixBuf.length <= 160 &&
+          (isPseudo200UsageLimitPrefix(usageLimitPrefixBuf) || isPseudo200UsageLimitText(usageLimitPrefixBuf))
+        ) {
+          return true;
+        }
+        usageLimitChecked = true;
+        flushPendingRoutedThinking();
+        const flushed = usageLimitPrefixBuf;
+        usageLimitPrefixBuf = "";
+        hasEmittedText = true;
+        assistantOutputText += flushed;
+        push({ type: "text", text: flushed });
+        return true;
+      }
+      flushPendingRoutedThinking();
+      hasEmittedText = true;
+      assistantOutputText += chunk;
+      push({ type: "text", text: chunk });
+      return true;
+    };
+
     const finalizeTurn = (realThreadId: string, allowParkWs = true) => {
       if (ended) return;
       clearPing();
       clearPostUsageTimer();
       clearAuxTimers();
+      if (usageLimitPrefixBuf) {
+        if (!sawRealThinking && isPseudo200UsageLimitText(usageLimitPrefixBuf)) {
+          usageLimitPrefixBuf = "";
+          pendingRoutedThinking = null;
+          abortPseudo200QuotaLimit();
+          return;
+        }
+        usageLimitChecked = true;
+        flushPendingRoutedThinking();
+        const flushed = usageLimitPrefixBuf;
+        usageLimitPrefixBuf = "";
+        hasEmittedText = true;
+        assistantOutputText += flushed;
+        push({ type: "text", text: flushed });
+      } else {
+        flushPendingRoutedThinking();
+      }
       const shouldAutoDelete = isIncognito && this.autoDeleteSession;
       if (shouldAutoDelete && ws.readyState === WebSocket.OPEN) {
         try {
@@ -2138,7 +2305,7 @@ export class QuickExecutionEngine {
         const payload = (ev.payload && typeof ev.payload === "object" ? ev.payload : {}) as Record<string, unknown>;
 
         // Intermediate context chunks (for >46.5KB prompts): advance on message_complete,
-        // with an 8s post-turn_usage fallback in case AWS omits message_complete on a chunk.
+        // with a 15s post-turn_usage fallback (matching per-chunk outer budget) if AWS omits message_complete.
         const advanceIntermediateChunk = () => {
           if (advancingChunk || ended || activeChunkIndex >= totalChunks - 1) return;
           clearPostUsageTimer();
@@ -2159,7 +2326,7 @@ export class QuickExecutionEngine {
             continue;
           } else if (evType === "turn_usage") {
             clearPostUsageTimer();
-            postUsageTimer = setTimeout(() => advanceIntermediateChunk(), 8_000);
+            postUsageTimer = setTimeout(() => advanceIntermediateChunk(), 15_000);
             continue;
           } else if (evType === "error" || evType === "guardrail_blocked") {
             // Fall through to normal error handling below
@@ -2172,6 +2339,15 @@ export class QuickExecutionEngine {
           this.showRoutedModelInThinking &&
           !emittedRoutedModel &&
           !(turn.stream && this.suppressLateRoutedThinkingInStream && hasEmittedText);
+        const emitOrDeferRoutedThinking = (modelName: string) => {
+          emittedRoutedModel = true;
+          const line = `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort} · routed=${modelName}\n`;
+          if (!usageLimitChecked) {
+            pendingRoutedThinking = line;
+          } else {
+            push({ type: "thinking", text: line });
+          }
+        };
 
         if (evType === "connected" && cred.mode === "oauth" && cred.oauth) {
           const u = payload.user as Record<string, unknown> | undefined;
@@ -2190,11 +2366,7 @@ export class QuickExecutionEngine {
           if (routed) {
             resolvedModelId = routed;
             if (canEmitRoutedThinking()) {
-              emittedRoutedModel = true;
-              push({
-                type: "thinking",
-                text: `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort} · routed=${routed}\n`,
-              });
+              emitOrDeferRoutedThinking(routed);
             }
           }
         } else if (evType === "text_delta") {
@@ -2204,15 +2376,18 @@ export class QuickExecutionEngine {
             const afterTools = toolFilter ? toolFilter.feed(delta) : delta;
             const emitText = afterTools && uiTagSanitizer ? uiTagSanitizer.feed(afterTools) : afterTools;
             if (emitText) {
-              hasEmittedText = true;
-              assistantOutputText += emitText;
-              push({ type: "text", text: emitText });
+              if (!emitGuardedText(emitText)) return;
             }
           }
         } else if (evType === "thinking_delta") {
           clearPostUsageTimer();
           const delta = String(payload.delta || "");
-          if (delta) push({ type: "thinking", text: delta });
+          if (delta) {
+            usageLimitChecked = true;
+            sawRealThinking = true;
+            flushPendingRoutedThinking();
+            push({ type: "thinking", text: delta });
+          }
         } else if (evType === "turn_usage") {
           const inputTokens = Number(payload.input_tokens || 0);
           const outputTokens = Number(payload.output_tokens || 0);
@@ -2222,11 +2397,7 @@ export class QuickExecutionEngine {
           if (served) {
             resolvedModelId = served;
             if (canEmitRoutedThinking()) {
-              emittedRoutedModel = true;
-              push({
-                type: "thinking",
-                text: `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort} · routed=${served}\n`,
-              });
+              emitOrDeferRoutedThinking(served);
             }
           }
           this.usageTracker.recordTurn({
@@ -2248,7 +2419,7 @@ export class QuickExecutionEngine {
           });
           // Guard against AWS Quick occasionally omitting `message_complete` after very long outputs (30K+ output tokens).
           // Only armed once actual output has started and cancelled immediately if any subsequent delta/event arrives.
-          if (hasEmittedText || outputTokens > 0) {
+          if (hasEmittedText || usageLimitPrefixBuf.length > 0 || outputTokens > 0) {
             clearPostUsageTimer();
             const usageThreadId = String(ev.thread_id || threadId);
             postUsageTimer = setTimeout(() => {

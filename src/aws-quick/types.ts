@@ -38,6 +38,7 @@ export interface QuickQuotaUsage {
     percent: number;
     label?: string;
     resets_at?: number | string | null;
+    resume_in_minutes?: number | null;
   };
   monthly?: {
     used: number;
@@ -45,6 +46,7 @@ export interface QuickQuotaUsage {
     percent?: number;
     label?: string;
     resets_at?: number | string | null;
+    resume_in_minutes?: number | null;
   };
   subscription?: {
     subscription_type?: string;

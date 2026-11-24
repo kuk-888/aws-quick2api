@@ -18,10 +18,14 @@ export interface QuickPlanQuotaView {
   trialDaysRemaining?: number;
   autoDisplayMessage?: string;
   apiDisplayMessage?: string;
-  /** AWS Quick Session usage pool */
+  /** AWS Quick Session usage pool (5h rolling burst window) */
   sessionPool: {
     usedPercent: number | null;
     remainingPercent: number | null;
+    /** Minutes until AWS Quick restores usable session burst capacity (null/undefined when not throttled). */
+    resumeInMinutes?: number | null;
+    /** Estimated ISO timestamp when session burst capacity resumes (`now + resumeInMinutes * 60s`). */
+    resumeAt?: string;
   };
   /** AWS Quick Monthly usage pool (minutes) */
   premiumApiPool: {
@@ -162,6 +166,12 @@ async function fetchSingleAwsQuickQuota(
     const sessUsed = Number(usage.session?.used ?? 0);
     const sessLimit = Number(usage.session?.limit ?? 100);
     const sessPct = sessLimit > 0 ? Math.min(100, Math.round((sessUsed / sessLimit) * 1000) / 10) : 0;
+    const rawSessResumeMin = usage.session?.resume_in_minutes;
+    const sessResumeMin =
+      typeof rawSessResumeMin === "number" && Number.isFinite(rawSessResumeMin) && rawSessResumeMin > 0
+        ? Math.ceil(rawSessResumeMin)
+        : null;
+    const sessResumeAt = sessResumeMin ? new Date(now + sessResumeMin * 60_000).toISOString() : undefined;
 
     const monUsed = Number(usage.monthly?.used ?? 0);
     const monLimit = Number(usage.monthly?.limit ?? 600);
@@ -205,6 +215,8 @@ async function fetchSingleAwsQuickQuota(
         sessionPool: {
           usedPercent: sessPct,
           remainingPercent: Math.max(0, Math.round((100 - sessPct) * 10) / 10),
+          ...(sessResumeMin !== null ? { resumeInMinutes: sessResumeMin } : {}),
+          ...(sessResumeAt ? { resumeAt: sessResumeAt } : {}),
         },
         premiumApiPool: {
           usedPercent: monPct,

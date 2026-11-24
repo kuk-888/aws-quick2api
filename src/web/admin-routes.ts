@@ -435,6 +435,26 @@ export async function tryHandleWebAdminRoute(
     return true;
   }
 
+  const scheduleEagerEnsureAgents = (slotIds: string[]): void => {
+    if (!keyPool.getSettings().autoEnsureCodingAgent || slotIds.length === 0) return;
+    const managedMap = new Map(keyPool.allManagedKeys().map((k) => [k.slotId, k]));
+    const queue = Array.from(new Set(slotIds))
+      .map((id) => managedMap.get(id))
+      .filter((m): m is NonNullable<typeof m> => Boolean(m && m.enabled && !m.chatAgentId));
+    if (queue.length === 0) return;
+    const maxConc = 3;
+    let cursor = 0;
+    const runNext = async (): Promise<void> => {
+      while (cursor < queue.length) {
+        const target = queue[cursor++]!;
+        await engine.ensureCodingAgentForKey(target.rawKey, target.slotId, keyPool, target.proxyUrl).catch(() => undefined);
+      }
+    };
+    for (let i = 0; i < Math.min(maxConc, queue.length); i += 1) {
+      void runNext();
+    }
+  };
+
   if (route === "/v1/admin/keys" && req.method === "POST") {
     const body = await readJsonBody(req, config.maxBodyBytes);
     if (!isRecord(body) || typeof body.apiKey !== "string") {
@@ -447,6 +467,7 @@ export async function tryHandleWebAdminRoute(
     const slot = keyPool.addKey(body.apiKey, enabled, label, proxyUrl, chatAgentId);
     if (enabled) {
       await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
+      scheduleEagerEnsureAgents([slot.slotId]);
     }
     sendJson(res, 200, { ok: true, slot, keyPool: keyPool.statusSnapshot() });
     return true;
@@ -486,21 +507,24 @@ export async function tryHandleWebAdminRoute(
       throw new GatewayError("`credentials` array required.", 400, "invalid_request_error");
     }
     let imported = 0;
+    const importedSlotIds: string[] = [];
     for (const item of rawList) {
       if (!isRecord(item) || typeof item.apiKey !== "string" || !item.apiKey.trim()) continue;
-      keyPool.addKey(
+      const added = keyPool.addKey(
         item.apiKey,
         item.enabled !== false,
         typeof item.label === "string" ? item.label : undefined,
         typeof item.proxyUrl === "string" ? item.proxyUrl : undefined,
         typeof item.chatAgentId === "string" ? item.chatAgentId : undefined,
       );
+      if (added.enabled && !added.chatAgentId) importedSlotIds.push(added.slotId);
       imported += 1;
     }
     if (imported === 0) {
       throw new GatewayError("No valid credentials found in JSON payload.", 400, "invalid_request_error");
     }
     await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
+    scheduleEagerEnsureAgents(importedSlotIds);
     sendJson(res, 200, { ok: true, imported, keyPool: keyPool.statusSnapshot() });
     return true;
   }
@@ -541,8 +565,9 @@ export async function tryHandleWebAdminRoute(
         try {
           const nextNum = keyPool.allManagedKeys().length + 1;
           const autoLabel = oauthCred.email || (oauthCred.accountId ? `AWS #${oauthCred.accountId.slice(-4)}` : `Account #${nextNum}`);
-          keyPool.addKey(serializeOAuthCredential(oauthCred), true, autoLabel);
+          const added = keyPool.addKey(serializeOAuthCredential(oauthCred), true, autoLabel);
           void ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
+          scheduleEagerEnsureAgents([added.slotId]);
         } catch {}
       },
     });
@@ -575,7 +600,7 @@ export async function tryHandleWebAdminRoute(
         try {
           const nextNum = keyPool.allManagedKeys().length + 1;
           const autoLabel = oauthCred.email || (oauthCred.accountId ? `AWS #${oauthCred.accountId.slice(-4)}` : `Account #${nextNum}`);
-          keyPool.addKey(
+          const added = keyPool.addKey(
             serializeOAuthCredential(oauthCred),
             true,
             label || autoLabel,
@@ -583,6 +608,7 @@ export async function tryHandleWebAdminRoute(
             chatAgentId,
           );
           void ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
+          scheduleEagerEnsureAgents([added.slotId]);
         } catch {}
       },
     });
@@ -616,6 +642,7 @@ export async function tryHandleWebAdminRoute(
       chatAgentId,
     );
     await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
+    scheduleEagerEnsureAgents([slot.slotId]);
     sendJson(res, 200, { ok: true, slot, keyPool: keyPool.statusSnapshot() });
     return true;
   }

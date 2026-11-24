@@ -26,6 +26,8 @@ import {
   classifyUpstreamError,
   compactOversizedPrompt,
   estimatePromptTokens,
+  isPseudo200UsageLimitPrefix,
+  isPseudo200UsageLimitText,
   MAX_PARKED_WS_PER_SLOT,
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
@@ -884,6 +886,14 @@ describe("Credential parser & ClientKeyStore", () => {
     );
     assert.equal(realQuota.isConnLimitErr, false);
     assert.equal(realQuota.isQuotaErr, true);
+
+    // Pseudo-200 usage-limit reply detection (zero-delay for non-"You" text; catches ASCII & curly apostrophe)
+    assert.equal(isPseudo200UsageLimitPrefix("好的，我来帮你"), false);
+    assert.equal(isPseudo200UsageLimitPrefix("You can run npm test"), false);
+    assert.equal(isPseudo200UsageLimitPrefix("You’ve reached"), true);
+    assert.equal(isPseudo200UsageLimitText("You’ve reached your usage limit. Check your profile for details."), true);
+    assert.equal(isPseudo200UsageLimitText("You've reached your usage limit. Check your profile for details."), true);
+    assert.equal(isPseudo200UsageLimitText("You can reach your usage limit if you run too many jobs."), false);
   });
 
   it("validates, persists, and resolves global + per-account chat_agent_id overrides", async () => {
@@ -961,14 +971,328 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.ok(!compactPrompt.includes("bypassing any device-access"));
       assert.ok(fallbackPrompt.includes("bypassing any device-access"));
 
-      // Dashboard HTML still renders valid JS with the new customAgentPrompt & editChatAgent controls
+      // Dashboard HTML still renders valid JS with the new customAgentPrompt, editChatAgent, and 5h burst bar
       const html = renderDashboardHtml("/dashboard", "testnonce");
       assert.ok(html.includes("cfgCustomAgentPrompt"));
       assert.ok(html.includes("cfgAutoEnsureCodingAgent"));
       assert.ok(html.includes("modalChatAgentInput"));
       assert.ok(html.includes("editChatAgent"));
+      assert.ok(html.includes("5h Burst "));
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("enforces per-slot concurrency cap with bounded soft-wait, brief conn-limit backoff, elastic sticky affinity, and burst-aware quota scoring", async () => {
+    const cfg = loadConfigFromEnv({
+      QUICK_TOKENS: "ws.example.com|tok_slot_a,ws.example.com|tok_slot_b",
+      KEY_COOLDOWN_MS: "30000",
+      LB_STRATEGY: "quota-aware",
+    });
+
+    // 1) Bounded soft-wait & strict maxInflightPerSlot <= 4 on a single account
+    const singlePool = new UpstreamKeyPool({
+      ...cfg,
+      quickTokens: ["ws.example.com|tok_only"],
+      disabledQuickTokens: [],
+      maxInflightPerSlot: 4,
+    });
+
+    let active = 0;
+    let peak = 0;
+    const worker = async () => {
+      const lease = await singlePool.leaseKeyWithWait("claude-sonnet-4-6", undefined, undefined, { maxWaitMs: 500 });
+      active += 1;
+      if (active > peak) peak = active;
+      await new Promise((r) => setTimeout(r, 40));
+      active -= 1;
+      lease.release();
+      return lease.slotId;
+    };
+    // 8 concurrent callers on 1 slot (cap 4): first 4 run immediately, next 4 wake on release & succeed
+    const results = await Promise.all(Array.from({ length: 8 }, () => worker()));
+    assert.equal(results.length, 8);
+    assert.equal(peak, 4);
+
+    // When all 4 slots are held and maxWaitMs expires, fast-fail with 429 rate_limit_exceeded
+    const held = [
+      singlePool.leaseKey("claude-sonnet-4-6"),
+      singlePool.leaseKey("claude-sonnet-4-6"),
+      singlePool.leaseKey("claude-sonnet-4-6"),
+      singlePool.leaseKey("claude-sonnet-4-6"),
+    ];
+    await assert.rejects(
+      () => singlePool.leaseKeyWithWait("claude-sonnet-4-6", undefined, undefined, { maxWaitMs: 35 }),
+      (err: unknown) => err instanceof GatewayError && err.status === 429 && err.code === "rate_limit_exceeded",
+    );
+    for (const l of held) l.release();
+
+    // 2) reportConnLimit uses brief non-escalating backoff (~2.5s) and preserves sticky affinity
+    const multiPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 4 });
+    const kA = "ws.example.com|tok_slot_a";
+    const kB = "ws.example.com|tok_slot_b";
+    const stickyInitial = multiPool.leaseKey("quick-smart", undefined, "conv-sticky-1");
+    stickyInitial.release();
+    for (let i = 0; i < 5; i += 1) {
+      multiPool.reportConnLimit(stickyInitial.apiKey, 1_500);
+    }
+    const snapAfterConnLimit = multiPool.statusSnapshot().find((s) => s.slotId === stickyInitial.slotId)!;
+    assert.ok(snapAfterConnLimit.cooldownRemainingMs > 0 && snapAfterConnLimit.cooldownRemainingMs <= 1_600);
+    assert.equal(snapAfterConnLimit.stickySessions, 1);
+
+    // 3) Elastic sticky affinity: when sticky account reaches maxInflight (4), burst borrows idle account B
+    const elasticPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 4 });
+    const l1 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    const l2 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    const l3 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    const l4 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    assert.equal(l1.apiKey, l2.apiKey);
+    assert.equal(l1.apiKey, l3.apiKey);
+    assert.equal(l1.apiKey, l4.apiKey);
+    const l5 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    assert.notEqual(l5.apiKey, l1.apiKey); // borrowed idle account!
+    assert.equal(l5.viaAffinity, false);
+    for (const l of [l1, l2, l3, l4, l5]) l.release();
+
+    // 4) quota-aware considers tighter of (monthly, 5h short-term burst) even for api/claude-* models
+    const burstPool = new UpstreamKeyPool({ ...cfg, lbStrategy: "quota-aware", maxInflightPerSlot: 4 });
+    const makeQuota = (monthlyRem: number, burstRem: number) => ({
+      membershipType: "FREE_TRIAL",
+      daysRemainingInCycle: 7,
+      trialDaysRemaining: 28,
+      overallIncludedPlan: { usedPercent: 100 - monthlyRem, remainingPercent: monthlyRem, allowanceUsd: null },
+      sessionPool: { usedPercent: 100 - burstRem, remainingPercent: burstRem },
+      premiumApiPool: { usedPercent: 100 - monthlyRem, remainingPercent: monthlyRem },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    // Account A: 80% monthly left, but only 5% burst left (95% used!)
+    // Account B: 50% monthly left, 80% burst left (20% used) -> should win for claude-sonnet-4-6!
+    burstPool.updateSlotQuotaCache(kA, undefined, makeQuota(80, 5));
+    burstPool.updateSlotQuotaCache(kB, undefined, makeQuota(50, 80));
+    const picked = burstPool.leaseKey("claude-sonnet-4-6");
+    assert.equal(picked.apiKey, kB);
+    picked.release();
+
+    // 5) metadata.user_id is scoped per conversation (firstUserText) so separate windows & subagents rotate
+    const { deriveConversationAffinityKey } = await import("../src/core/session-affinity.js");
+    const convA1 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_abc_account__session_111" } },
+      firstUserText: "Help me refactor the auth middleware in server.ts",
+    });
+    const convA2 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_abc_account__session_111" } },
+      firstUserText: "Help me refactor the auth middleware in server.ts",
+    });
+    const convSubagent = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_abc_account__session_111" } },
+      firstUserText: "Explore src/core/key-pool.ts and summarize its methods",
+    });
+    assert.equal(convA1, convA2);
+    assert.notEqual(convA1, convSubagent);
+
+    // 6) [P1-3] metadata.user_id ignores volatile systemPrompt on short prompts and strips <system-reminder>
+    const shortSys1 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_short_1" } },
+      systemPrompt: "Active file: a.ts\nTools: Read",
+      firstUserText: "<system-reminder>Dynamic date 12:00</system-reminder>\n继续",
+    });
+    const shortSys2 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_short_1" } },
+      systemPrompt: "Active file: b.ts\nTools: Read, Bash",
+      firstUserText: "<system-reminder>Dynamic date 12:05</system-reminder>\n继续",
+    });
+    assert.equal(shortSys1, shortSys2);
+
+    // 7) [P1-2] reportConnLimit preserves sticky affinity even when a turn arrives during the brief cooldown
+    const connStickyPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 4 });
+    const cs1 = connStickyPool.leaseKey("quick-smart", undefined, "conv-conn-sticky");
+    cs1.release();
+    connStickyPool.reportConnLimit(cs1.apiKey, 1_500);
+    const duringBackoff = connStickyPool.leaseKey("quick-smart", undefined, "conv-conn-sticky");
+    assert.notEqual(duringBackoff.apiKey, cs1.apiKey);
+    duringBackoff.release();
+    const csSnap = connStickyPool.statusSnapshot().find((s) => s.slotId === cs1.slotId)!;
+    assert.equal(csSnap.stickySessions, 1);
+
+    // 8) [P0-5] reportQuotaExhausted on claude-* (api pool) auto-disables even if stale cached sessionPool > 0%
+    const { computeKeySlotId } = await import("../src/core/key-pool.js");
+    const stalePool = new UpstreamKeyPool({ ...cfg, autoDisableExhaustedKeys: true });
+    stalePool.updateSlotQuotaCache(kA, undefined, makeQuota(60, 40));
+    stalePool.reportQuotaExhausted(kA, "claude-sonnet-4-6", "AWS Quick account reached its usage limit");
+    const staleSnapA = stalePool.statusSnapshot().find((s) => s.slotId === computeKeySlotId(kA))!;
+    assert.equal(staleSnapA.enabled, false);
+    assert.equal(staleSnapA.autoDisabledKind, "quota");
+
+    // 9) [P0-3] allCoolingDown fallback never overflows a full slot
+    const fullCoolPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 2 });
+    const fc1 = fullCoolPool.leaseSpecificKey(kA);
+    const fc2 = fullCoolPool.leaseSpecificKey(kA);
+    fullCoolPool.reportConnLimit(kA, 2_000);
+    fullCoolPool.reportRateLimit(kB);
+    const fcPicked = await fullCoolPool.leaseKeyWithWait("quick-smart", undefined, undefined, { maxWaitMs: 30 });
+    assert.equal(fcPicked.apiKey, kB);
+    fcPicked.release();
+    fc1.release();
+    fc2.release();
+
+    // 10) [P1-1] notifySlotAvailable wakes a compatible waiter even if head waiter excludes the released slot
+    const wakePool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 1 });
+    const wA = wakePool.leaseSpecificKey(kA);
+    const wB = wakePool.leaseSpecificKey(kB);
+    const startMs = Date.now();
+    const headExcludesA = wakePool.leaseKeyWithWait("quick-smart", new Set([kA]), undefined, { maxWaitMs: 250 })
+      .catch(() => null);
+    const tailAcceptsA = wakePool.leaseKeyWithWait("quick-smart", undefined, undefined, { maxWaitMs: 500 });
+    setTimeout(() => wA.release(), 30);
+    const tailLease = await tailAcceptsA;
+    assert.equal(tailLease.apiKey, kA);
+    assert.ok(Date.now() - startMs < 200);
+    tailLease.release();
+    wB.release();
+    await headExcludesA;
+  });
+
+  it("handles Claude Code tool_reference blocks, assistant prefill, and required-param schema compaction", async () => {
+    const { parseAnthropicMessagesRequest } = await import("../src/protocols/anthropic.js");
+    const { buildToolBridgePrompt } = await import("../src/core/tool-bridge.js");
+
+    // 1) tool_reference inside tool_result (Claude Code ToolSearch deferred MCP tools) must NOT throw 400
+    const refTurn = parseAnthropicMessagesRequest({
+      model: "quick-smart",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Start the preview server" },
+        {
+          role: "assistant",
+          content: [{ type: "tool_use", id: "toolu_1", name: "ToolSearch", input: { query: "preview" } }],
+        },
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_1",
+              content: [
+                { type: "tool_reference", tool_name: "mcp__Claude_Preview__preview_start" },
+                { type: "text", text: "Loaded preview tool." },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    assert.ok(refTurn.fullTranscriptText.includes("[TOOL_REFERENCE: mcp__Claude_Preview__preview_start]"));
+    assert.ok(refTurn.trailingToolResults[0]?.content.includes("[TOOL_REFERENCE: mcp__Claude_Preview__preview_start]"));
+
+    // 2) Trailing assistant prefill appends continuation cue without entering warm prefix cache
+    const prefillTurn = parseAnthropicMessagesRequest({
+      model: "quick-fast",
+      max_tokens: 64,
+      messages: [
+        { role: "user", content: "Is `python3 -m http.server` safe? Reply inside <block>yes|no</block>." },
+        { role: "assistant", content: "<block>" },
+      ],
+    });
+    assert.ok(prefillTurn.fullTranscriptText.includes("[CONTINUE_ASSISTANT_PREFILL]"));
+    assert.equal(prefillTurn.priorPrefixHash, undefined);
+
+    // Normal user-ending turn must NOT get the prefill cue
+    const normalTurn = parseAnthropicMessagesRequest({
+      model: "quick-fast",
+      max_tokens: 64,
+      messages: [{ role: "user", content: "Hello" }],
+    });
+    assert.ok(!normalTurn.fullTranscriptText.includes("[CONTINUE_ASSISTANT_PREFILL]"));
+
+    // 3) Tier-3 schema compaction (>28 KB after Tier-2, <=36 KB): keeps required param desc, strips optional param desc
+    const bigTools = Array.from({ length: 65 }, (_, idx) => ({
+      name: `mcp_preview_tool_${idx}`,
+      description: `Detailed preview tool #${idx} description `.repeat(8),
+      inputSchema: {
+        type: "object",
+        properties: {
+          server_name: { type: "string", description: `REQ_MARKER_${idx}: preview server name in launch.json` },
+          extra_opt: { type: "string", description: `OPT_MARKER_${idx}: optional verbose setting `.repeat(6) },
+        },
+        required: ["server_name"],
+      },
+    }));
+    const bridged = buildToolBridgePrompt(bigTools, "auto", { compactForCustomAgent: true });
+    assert.ok(bridged.includes("REQ_MARKER_0"), "required parameter description should be preserved in Tier 3");
+    assert.ok(!bridged.includes("OPT_MARKER_0"), "optional parameter description should be stripped in Tier 3");
+  });
+
+  it("uses session.resume_in_minutes for 5h burst auto-recovery without prematurely reviving monthly-exhausted accounts", async () => {
+    const { computeKeySlotId } = await import("../src/core/key-pool.js");
+    const kBurst = "quick-oauth:eyJhY2Nlc3NUb2tlbiI6InRlc3QtYnVyc3QifQ==";
+    const kMonthly = "quick-oauth:eyJhY2Nlc3NUb2tlbiI6InRlc3QtbW9udGhseSJ9";
+    const pool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: `${kBurst},${kMonthly}`,
+        AUTO_DISABLE_EXHAUSTED_KEYS: "true",
+      }),
+    });
+
+    const nextMonthIso = new Date(Date.now() + 15 * 86_400_000).toISOString();
+    const shortResumeIso = new Date(Date.now() + 60).toISOString();
+
+    // 1) Only 5h burst exhausted (monthly 50% left) -> auto-disables with short resumeAt (~60ms), NOT nextMonth
+    pool.updateSlotQuotaCache(kBurst, undefined, {
+      membershipType: "QUICK_LITE_FREE_TRIAL",
+      billingCycleEnd: nextMonthIso,
+      daysRemainingInCycle: 15,
+      sessionPool: { usedPercent: 100, remainingPercent: 0, resumeInMinutes: 1, resumeAt: shortResumeIso },
+      premiumApiPool: { usedPercent: 50, remainingPercent: 50 },
+      overallIncludedPlan: { usedPercent: 50, remainingPercent: 50, allowanceUsd: null },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    const snapBurst = pool.statusSnapshot().find((s) => s.slotId === computeKeySlotId(kBurst))!;
+    assert.equal(snapBurst.enabled, false);
+    assert.equal(snapBurst.autoDisabledKind, "quota");
+    assert.equal(snapBurst.autoRecoverAt, shortResumeIso);
+
+    // 2) Monthly 100% exhausted even with short session resume -> MUST wait for billingCycleEnd (nextMonth)
+    pool.updateSlotQuotaCache(kMonthly, undefined, {
+      membershipType: "QUICK_LITE_FREE_TRIAL",
+      billingCycleEnd: nextMonthIso,
+      daysRemainingInCycle: 15,
+      sessionPool: { usedPercent: 100, remainingPercent: 0, resumeInMinutes: 1, resumeAt: shortResumeIso },
+      premiumApiPool: { usedPercent: 100, remainingPercent: 0 },
+      overallIncludedPlan: { usedPercent: 100, remainingPercent: 0, allowanceUsd: null },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    const snapMonthly = pool.statusSnapshot().find((s) => s.slotId === computeKeySlotId(kMonthly))!;
+    assert.equal(snapMonthly.enabled, false);
+    assert.equal(snapMonthly.autoRecoverAt, nextMonthIso);
+
+    // 3) Wait 80ms -> kBurst auto-recovers on its own, while kMonthly remains disabled!
+    await new Promise((r) => setTimeout(r, 80));
+    const snapAfter = pool.statusSnapshot();
+    const afterBurst = snapAfter.find((s) => s.slotId === computeKeySlotId(kBurst))!;
+    const afterMonthly = snapAfter.find((s) => s.slotId === computeKeySlotId(kMonthly))!;
+    assert.equal(afterBurst.enabled, true);
+    assert.equal(afterBurst.autoDisabledKind, undefined);
+    assert.equal(afterBurst.autoRecoverAt, undefined);
+    assert.equal(afterMonthly.enabled, false);
+
+    // 4) Stale past resumeAt while still exhausted must NOT thrash-revive (falls back to billingCycleEnd)
+    const pastIso = new Date(Date.now() - 5_000).toISOString();
+    pool.updateSlotQuotaCache(kBurst, undefined, {
+      membershipType: "QUICK_LITE_FREE_TRIAL",
+      billingCycleEnd: nextMonthIso,
+      daysRemainingInCycle: 15,
+      sessionPool: { usedPercent: 100, remainingPercent: 0, resumeInMinutes: 0, resumeAt: pastIso },
+      premiumApiPool: { usedPercent: 40, remainingPercent: 60 },
+      overallIncludedPlan: { usedPercent: 40, remainingPercent: 60, allowanceUsd: null },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    const snapStale = pool.statusSnapshot().find((s) => s.slotId === computeKeySlotId(kBurst))!;
+    assert.equal(snapStale.enabled, false);
+    assert.equal(snapStale.autoRecoverAt, nextMonthIso);
   });
 });
