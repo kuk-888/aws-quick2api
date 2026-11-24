@@ -51,7 +51,7 @@ export interface GatewayServerInstance {
 }
 
 const SSE_KEEPALIVE_INTERVAL_MS = 10_000;
-const SSE_EARLY_FLUSH_BYTES = 50_000;
+const SSE_EARLY_FLUSH_BYTES = 16_384;
 
 const SECURITY_HEADERS: Record<string, string> = {
   "x-frame-options": "DENY",
@@ -222,7 +222,7 @@ async function pipeSseStream(
   chunks: AsyncIterable<string>,
   onErrorChunk: (err: GatewayError) => string,
   extraHeaders: Record<string, string> = {},
-  opts: { flushEarly?: boolean } = {}
+  opts: { flushEarly?: boolean; postStartKeepAliveFrame?: string } = {}
 ): Promise<void> {
   const iterator = chunks[Symbol.asyncIterator]();
   const commitHeaders = () => {
@@ -238,12 +238,17 @@ async function pipeSseStream(
     res.flushHeaders();
   };
 
+  let firstFrameSent = false;
   let keepAlive: ReturnType<typeof setInterval> | null = null;
   const startKeepAlive = () => {
     if (keepAlive) return;
     keepAlive = setInterval(() => {
       if (!res.writableEnded && !res.destroyed) {
-        res.write(": keepalive\n\n");
+        const frame =
+          firstFrameSent && opts.postStartKeepAliveFrame
+            ? opts.postStartKeepAliveFrame
+            : ": keepalive\n\n";
+        res.write(frame);
       }
     }, SSE_KEEPALIVE_INTERVAL_MS);
     keepAlive.unref?.();
@@ -305,6 +310,7 @@ async function pipeSseStream(
         await iterator.return?.().catch(() => undefined);
         break;
       }
+      firstFrameSent = true;
       step = await iterator.next();
     }
   } catch (err) {
@@ -751,7 +757,12 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             protocolAdapter.streamSse(events, turn),
             (err) => protocolAdapter.formatSseErrorFrame(err),
             ignoredParamsHeader(turn.rawBody),
-            { flushEarly }
+            {
+              flushEarly,
+              ...(protocolEntry.tag === "anthropic-messages"
+                ? { postStartKeepAliveFrame: 'event: ping\ndata: {"type":"ping"}\n\n' }
+                : {}),
+            }
           );
         } else {
           const json = await protocolAdapter.collectJson(events, turn);

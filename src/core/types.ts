@@ -131,6 +131,14 @@ export interface GatewayConfig {
   keyLabels: Record<string, string>;
   /** Optional per-credential HTTP/HTTPS proxy URLs keyed by slotId (`KEY_PROXIES`). */
   keyProxies: Record<string, string>;
+  /** Optional global default AWS Quick custom agent ID (`CHAT_AGENT_ID`) to bypass default built-in prompt/device checks. */
+  chatAgentId?: string;
+  /** Automatically discover or create & bind a minimal coding agent per account (`AUTO_ENSURE_CODING_AGENT`, default true). */
+  autoEnsureCodingAgent?: boolean;
+  /** Optional default instructions template used when auto-creating custom agents (`CUSTOM_AGENT_PROMPT`). */
+  customAgentPrompt?: string;
+  /** Optional per-credential AWS Quick custom agent IDs keyed by slotId (`KEY_CHAT_AGENT_IDS`). */
+  keyChatAgentIds?: Record<string, string>;
   /** Optional per-credential import timestamps (epoch ms) keyed by slotId (`KEY_ADDED_AT`). */
   keyAddedAt?: Record<string, number>;
   /** Persisted auto-disable state per slot (`KEY_AUTO_DISABLED`), so recovery survives restarts. */

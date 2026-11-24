@@ -20,9 +20,13 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
   - **2-step OAuth PKCE wizard** in the Web Console (universal multi-cell tenant discovery, 90-day auto-refresh, automatic email & display name extraction).
   - **Web Cookie import** (`Copy as cURL` from `quick.aws.com`), batch JSON backup/restore, and optional macOS `local-outpost` reuse.
 - **Large Context & Streaming Resilience**:
-  - Automatic `≤50 KB` UTF-8 chunking for large prompts, plus early `HTTP 200` + `: keepalive` SSE heartbeats to prevent reverse-proxy/Cloudflare `524` timeouts.
+  - Automatic `≤46.5 KB` JSON-escaped UTF-8 chunking with an 8s post-`turn_usage` intermediate-chunk watchdog; early `HTTP 200` + `: keepalive` SSE heartbeats (and standard Anthropic `event: ping` after `message_start`) above 16 KB or with tools to prevent reverse-proxy/Cloudflare `524` timeouts.
   - Optional gateway safety-net compaction above `850K` tokens (`AUTO_COMPACT_OVERFLOW_TOKENS`, zero-touch below threshold so client Prompt Cache stays intact).
   - Streaming sanitizer converts AWS Quick's proprietary `<decision>` / `<decisions>` / `<artifact>` UI XML into plain Markdown while leaving fenced code blocks untouched.
+- **Auto-Managed Custom Agent & Clean Tool Bridge**:
+  - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Quick2API Bridge` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
+  - When a custom agent is active, tool bridging switches to ultra-clean minimal JSON schemas (no verbose anti-refusal boilerplate; zero `user_message` suffix injection on Opus/Sonnet), reliably powering local files, `.env`, shell, MCP, Skills, and Codex `apply_patch`.
+  - Under **Routing & Strategy**, hot-update `AUTO_ENSURE_CODING_AGENT` and the global default instructions template `CUSTOM_AGENT_PROMPT`; under **Credentials**, click **Agent** on any account to inspect live custom agents, switch or restore default in one click, auto-create/bind, or **edit & hot-publish an existing agent's prompt directly to AWS Quick**.
 - **Multi-Account Pool & Per-Credential Proxies**:
   - `quota-aware`, `least-busy`, and `round-robin` scheduling, sticky session affinity (high Bedrock Prompt Cache hit rate), automatic circuit-breaking on quota exhaustion, and failover on 401/429/502/503.
   - Zero-dependency per-account outbound proxy supporting `http://`, `https://`, `socks5://`, `socks5h://` (remote DNS), and common provider shorthands (`host:port`, `user:pass@host:port`, `host:port:user:pass`), with automatic transient retry for residential proxies.

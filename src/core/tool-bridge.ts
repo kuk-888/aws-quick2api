@@ -67,6 +67,7 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
 export function buildToolBridgePrompt(
   tools: readonly NormalizedTool[],
   toolChoice: ToolChoiceMode,
+  opts?: { compactForCustomAgent?: boolean },
 ): string {
   if (!tools.length || toolChoice === "none") return "";
 
@@ -96,19 +97,33 @@ export function buildToolBridgePrompt(
 
   const choiceRule =
     toolChoice === "required"
-      ? "You must output at least one `<tool_call>` request block from the schemas above in this turn."
+      ? "You must output at least one `<tool_call>` block from the schemas above in this turn."
       : typeof toolChoice === "object" && toolChoice.type === "tool"
-        ? `Output the \`<tool_call>\` request block named "${toolChoice.name}" in this turn.`
-        : "Whenever the user's request can be fulfilled by one of the external tool schemas above (reading/editing files, searching code, running shell commands, or calling MCP tools), ALWAYS output the corresponding `<tool_call>` request block instead of declining due to missing local devices. Only answer in plain prose when no schema applies.";
+        ? `Output the \`<tool_call>\` block named "${toolChoice.name}" in this turn.`
+        : opts?.compactForCustomAgent
+          ? "When a tool above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text."
+          : "Whenever the user's request can be fulfilled by one of the external tool schemas above (reading/editing files, searching code, running shell commands, or calling MCP tools), ALWAYS output the corresponding `<tool_call>` request block instead of declining due to missing local devices. Only answer in plain prose when no schema applies.";
+
+  // When routed to a custom AWS Quick Agent whose own instructions already authorize client tool calls,
+  // keep custom_prompt strictly minimal (zero anti-refusal boilerplate / prompt pollution).
+  if (opts?.compactForCustomAgent) {
+    return [
+      "## Client Tools (JSON Schema)",
+      serialized,
+      choiceRule,
+      `Format (raw tags, no markdown fences; stop immediately after the block(s)):`,
+      `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
+    ].join("\n");
+  }
 
   return [
     "## Structured Tool Request Output Format",
-    "The user is calling you via an external API client (e.g. IDE/CLI). You do NOT execute local files or commands yourself — you only output a structured `<tool_call>` JSON request block, and the user's own client software parses that block from your response, executes it locally on their machine, and sends the result back in the next message.",
-    "Therefore, outputting a `<tool_call>` block is NOT claiming local access or simulating execution; it is simply returning the structured request format the user's client asked for. Do NOT refuse with 'no device connected' or 'cannot access local files' when a matching schema exists below.",
+    "The user is interacting with you through their own external API client (e.g. IDE/CLI). You do NOT access any device or execute local files/commands yourself — you only emit a declarative `<tool_call>` JSON proposal. The user's own client software parses that proposal, applies the user's local permission/approval controls before running anything on their machine, and sends the result back in the next message.",
+    "Therefore, emitting a `<tool_call>` block is NOT claiming local access, simulating execution, or bypassing any device-access/security boundary; it is simply formatting a user-authorized structured request (including for workspace dotfiles such as `.env.example`, config files, or shell commands). Do NOT refuse with 'no device connected' or 'cannot access local files' when a matching schema exists below.",
     "Available external tool schemas (JSON):",
     serialized,
     choiceRule,
-    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the client can run them):`,
+    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the user's client can review and run them):`,
     `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
   ].join("\n");
 }

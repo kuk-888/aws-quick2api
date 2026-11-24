@@ -11,7 +11,7 @@ import {
 import { getSharedOutpost, parseQuickCredential } from "../aws-quick/outpost-singleton.js";
 import { listWebCloudSessions } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
-import type { QuickExecutionEngine } from "../core/engine.js";
+import { DEFAULT_CODING_AGENT_INSTRUCTIONS, type QuickExecutionEngine } from "../core/engine.js";
 import type { PoolRoutingSettings, UpstreamKeyPool } from "../core/key-pool.js";
 import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "../core/types.js";
 import { isRecord } from "../protocols/common.js";
@@ -197,7 +197,10 @@ export async function tryHandleWebAdminRoute(
     sendJson(res, 200, {
       object: "gateway.usage",
       ...usageTracker.snapshot(),
-      settings: keyPool.getSettings(),
+      settings: {
+        ...keyPool.getSettings(),
+        defaultCustomAgentPrompt: DEFAULT_CODING_AGENT_INSTRUCTIONS,
+      },
       runtime: engine.runtimeStats(),
       keyPool: keyPool.statusSnapshot(),
       affinities: keyPool.affinitySnapshot()
@@ -254,8 +257,26 @@ export async function tryHandleWebAdminRoute(
       patch.incognitoMode = body.incognitoMode;
       config.incognitoMode = body.incognitoMode;
     }
+    if (typeof body.autoEnsureCodingAgent === "boolean") {
+      patch.autoEnsureCodingAgent = body.autoEnsureCodingAgent;
+      config.autoEnsureCodingAgent = body.autoEnsureCodingAgent;
+    }
+    if (typeof body.customAgentPrompt === "string") {
+      patch.customAgentPrompt = body.customAgentPrompt;
+    }
+    if (typeof body.chatAgentId === "string") {
+      patch.chatAgentId = body.chatAgentId;
+    }
     keyPool.updateSettings(patch);
-    sendJson(res, 200, { ok: true, settings: keyPool.getSettings() });
+    config.chatAgentId = keyPool.getSettings().chatAgentId;
+    config.customAgentPrompt = keyPool.getSettings().customAgentPrompt;
+    sendJson(res, 200, {
+      ok: true,
+      settings: {
+        ...keyPool.getSettings(),
+        defaultCustomAgentPrompt: DEFAULT_CODING_AGENT_INSTRUCTIONS,
+      },
+    });
     return true;
   }
 
@@ -422,7 +443,8 @@ export async function tryHandleWebAdminRoute(
     const enabled = body.enabled !== false;
     const label = typeof body.label === "string" ? body.label : undefined;
     const proxyUrl = typeof body.proxyUrl === "string" ? body.proxyUrl : undefined;
-    const slot = keyPool.addKey(body.apiKey, enabled, label, proxyUrl);
+    const chatAgentId = typeof body.chatAgentId === "string" ? body.chatAgentId : undefined;
+    const slot = keyPool.addKey(body.apiKey, enabled, label, proxyUrl, chatAgentId);
     if (enabled) {
       await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
     }
@@ -447,6 +469,7 @@ export async function tryHandleWebAdminRoute(
         enabled: k.enabled,
         ...(k.label ? { label: k.label } : {}),
         ...(k.proxyUrl ? { proxyUrl: k.proxyUrl } : {}),
+        ...(k.chatAgentId ? { chatAgentId: k.chatAgentId } : {}),
       })),
     });
     return true;
@@ -470,6 +493,7 @@ export async function tryHandleWebAdminRoute(
         item.enabled !== false,
         typeof item.label === "string" ? item.label : undefined,
         typeof item.proxyUrl === "string" ? item.proxyUrl : undefined,
+        typeof item.chatAgentId === "string" ? item.chatAgentId : undefined,
       );
       imported += 1;
     }
@@ -540,6 +564,7 @@ export async function tryHandleWebAdminRoute(
     const region = typeof body.region === "string" && body.region.trim() ? body.region.trim() : undefined;
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined;
     const proxyUrl = typeof body.proxyUrl === "string" && body.proxyUrl.trim() ? body.proxyUrl.trim() : undefined;
+    const chatAgentId = typeof body.chatAgentId === "string" && body.chatAgentId.trim() ? body.chatAgentId.trim() : undefined;
     const started = await startOAuthPkceFlow({
       ...(discoveryCallbackUrl ? { discoveryCallbackUrl } : {}),
       ...(issuerUrl ? { issuerUrl } : {}),
@@ -555,6 +580,7 @@ export async function tryHandleWebAdminRoute(
             true,
             label || autoLabel,
             proxyUrl,
+            chatAgentId,
           );
           void ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
         } catch {}
@@ -578,6 +604,7 @@ export async function tryHandleWebAdminRoute(
     }
     const label = typeof body.label === "string" && body.label.trim() ? body.label.trim() : undefined;
     const proxyUrl = typeof body.proxyUrl === "string" && body.proxyUrl.trim() ? body.proxyUrl.trim() : undefined;
+    const chatAgentId = typeof body.chatAgentId === "string" && body.chatAgentId.trim() ? body.chatAgentId.trim() : undefined;
     const oauthCred = await completeOAuthPkceCallback(body.flowId, body.callbackUrl);
     const nextNum = keyPool.allManagedKeys().length + 1;
     const autoLabel = oauthCred.email || (oauthCred.accountId ? `AWS #${oauthCred.accountId.slice(-4)}` : `Account #${nextNum}`);
@@ -586,6 +613,7 @@ export async function tryHandleWebAdminRoute(
       true,
       label || autoLabel,
       proxyUrl,
+      chatAgentId,
     );
     await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
     sendJson(res, 200, { ok: true, slot, keyPool: keyPool.statusSnapshot() });
@@ -721,6 +749,77 @@ export async function tryHandleWebAdminRoute(
     return true;
   }
 
+  const listAgentsMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)\/agents$/.exec(route);
+  if (listAgentsMatch && req.method === "GET") {
+    const slotId = listAgentsMatch[1]!;
+    const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
+    if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+    const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl);
+    sendJson(res, 200, {
+      ok: true,
+      slotId,
+      boundAgentId: target.chatAgentId || "",
+      agents,
+    });
+    return true;
+  }
+
+  const ensureAgentMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)\/agents\/ensure$/.exec(route);
+  if (ensureAgentMatch && req.method === "POST") {
+    const slotId = ensureAgentMatch[1]!;
+    const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
+    if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+    const body = await readJsonBody(req, 16_384).catch(() => ({}));
+    const forceCreate = isRecord(body) && body.forceCreate === true;
+    const chatAgentId = await engine.ensureCodingAgentForKey(
+      target.rawKey,
+      slotId,
+      keyPool,
+      target.proxyUrl,
+      { forceCreate },
+    );
+    if (!chatAgentId) {
+      throw new GatewayError(
+        "Failed to list or create a custom AWS Quick agent for this credential.",
+        502,
+        "upstream_error",
+      );
+    }
+    const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
+    sendJson(res, 200, {
+      ok: true,
+      slotId,
+      chatAgentId,
+      agents,
+      keyPool: keyPool.statusSnapshot(),
+    });
+    return true;
+  }
+
+  const updateAgentMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)\/agents\/update$/.exec(route);
+  if (updateAgentMatch && req.method === "POST") {
+    const slotId = updateAgentMatch[1]!;
+    const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
+    if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+    const body = await readJsonBody(req, 32_768);
+    if (!isRecord(body) || typeof body.agentId !== "string" || typeof body.instructions !== "string") {
+      throw new GatewayError("`agentId` and `instructions` strings are required.", 400, "invalid_request_error");
+    }
+    const updated = await engine.updateAndPublishAgentForKey(
+      target.rawKey,
+      body.agentId,
+      {
+        instructions: body.instructions,
+        ...(typeof body.name === "string" ? { name: body.name } : {}),
+        ...(typeof body.description === "string" ? { description: body.description } : {}),
+      },
+      target.proxyUrl,
+    );
+    const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
+    sendJson(res, 200, { ok: true, slotId, agentId: updated.agentId, agents });
+    return true;
+  }
+
   const adminKeyMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)$/.exec(route);
   if (adminKeyMatch) {
     const slotId = adminKeyMatch[1]!;
@@ -736,6 +835,7 @@ export async function tryHandleWebAdminRoute(
         ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
         ...(typeof body.label === "string" ? { label: body.label } : {}),
         ...(typeof body.proxyUrl === "string" ? { proxyUrl: body.proxyUrl } : {}),
+        ...(typeof body.chatAgentId === "string" ? { chatAgentId: body.chatAgentId } : {}),
         ...(body.clearCooldown === true ? { clearCooldown: true } : {})
       });
       sendJson(res, 200, { ok: true, keyPool: keyPool.statusSnapshot() });

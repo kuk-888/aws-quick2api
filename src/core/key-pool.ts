@@ -35,6 +35,7 @@ export interface KeySlotStatus {
   addedAt: number;
   maskedKey: string;
   maskedProxy?: string;
+  chatAgentId?: string;
   enabled: boolean;
   healthy: boolean;
   autoDisabledReason?: string;
@@ -68,6 +69,7 @@ interface InternalKeySlot {
   rawKey: string;
   maskedKey: string;
   proxyUrl?: string;
+  chatAgentId?: string;
   enabled: boolean;
   autoDisabledReason?: string;
   autoDisabledKind?: "quota" | "auth";
@@ -97,6 +99,7 @@ export interface KeyLease {
   maskedKey: string;
   label?: string;
   proxyUrl?: string;
+  chatAgentId?: string;
   viaAffinity: boolean;
   markSuccess: () => void;
   release: () => void;
@@ -108,6 +111,25 @@ export interface PoolRoutingSettings {
   sessionAffinityTtlSeconds: number;
   autoDisableExhaustedKeys: boolean;
   incognitoMode: boolean;
+  autoEnsureCodingAgent: boolean;
+  customAgentPrompt?: string;
+  chatAgentId?: string;
+}
+
+const CHAT_AGENT_ID_RE = /^[A-Za-z0-9:_./-]{2,256}$/;
+
+export function validateChatAgentId(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (!CHAT_AGENT_ID_RE.test(trimmed)) {
+    throw new GatewayError(
+      "Invalid chat_agent_id (must be 2-256 characters of letters, digits, or : _ . / - with no whitespace).",
+      400,
+      "invalid_chat_agent_id"
+    );
+  }
+  return trimmed;
 }
 
 export function maskSecretKey(key: string): string {
@@ -169,6 +191,9 @@ export class UpstreamKeyPool {
   private sessionAffinityTtlMs: number;
   private autoDisableExhaustedKeys: boolean;
   private incognitoMode: boolean;
+  private autoEnsureCodingAgent: boolean;
+  private customAgentPrompt?: string;
+  private chatAgentId?: string;
   private rrIndex = 0;
 
   constructor(config: Pick<
@@ -187,13 +212,16 @@ export class UpstreamKeyPool {
     | "incognitoMode"
     | "envFilePath"
     | "dataDir"
-  >) {
+  > & Partial<Pick<GatewayConfig, "chatAgentId" | "keyChatAgentIds" | "autoEnsureCodingAgent" | "customAgentPrompt">>) {
     this.baseCooldownMs = config.keyCooldownMs;
     this.lbStrategy = config.lbStrategy;
     this.sessionAffinityEnabled = config.sessionAffinityEnabled;
     this.sessionAffinityTtlMs = config.sessionAffinityTtlMs;
     this.autoDisableExhaustedKeys = config.autoDisableExhaustedKeys;
     this.incognitoMode = config.incognitoMode !== false;
+    this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
+    this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
+    this.chatAgentId = config.chatAgentId?.trim() || undefined;
     this.envFilePath = config.envFilePath;
     if (config.dataDir) {
       this.identityFilePath = path.join(config.dataDir, "account-identities.json");
@@ -207,6 +235,7 @@ export class UpstreamKeyPool {
       const s = this.upsertInternal(k, true);
       if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
       if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+      if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
       s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
       bootIdx += 1;
     }
@@ -215,6 +244,7 @@ export class UpstreamKeyPool {
         const s = this.upsertInternal(k, false);
         if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
         if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+        if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
         s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
         bootIdx += 1;
         const saved = config.keyAutoDisabled?.[s.slotId];
@@ -323,10 +353,12 @@ export class UpstreamKeyPool {
   private persist(): void {
     const keyLabels: Record<string, string> = {};
     const keyProxies: Record<string, string> = {};
+    const keyChatAgentIds: Record<string, string> = {};
     const keyAddedAt: Record<string, number> = {};
     for (const s of this.slots) {
       if (s.label) keyLabels[s.slotId] = s.label;
       if (s.proxyUrl) keyProxies[s.slotId] = s.proxyUrl;
+      if (s.chatAgentId) keyChatAgentIds[s.slotId] = s.chatAgentId;
       if (s.addedAt) keyAddedAt[s.slotId] = s.addedAt;
     }
     const keyAutoDisabled: Record<string, AutoDisabledState> = {};
@@ -344,13 +376,17 @@ export class UpstreamKeyPool {
       disabledKeys: this.slots.filter((s) => !s.enabled).map((s) => s.rawKey),
       keyLabels,
       keyProxies,
+      chatAgentId: this.chatAgentId ?? "",
+      keyChatAgentIds,
       keyAddedAt,
       keyAutoDisabled,
       lbStrategy: this.lbStrategy,
       sessionAffinityEnabled: this.sessionAffinityEnabled,
       sessionAffinityTtlMs: this.sessionAffinityTtlMs,
       autoDisableExhaustedKeys: this.autoDisableExhaustedKeys,
-      incognitoMode: this.incognitoMode
+      incognitoMode: this.incognitoMode,
+      autoEnsureCodingAgent: this.autoEnsureCodingAgent,
+      customAgentPrompt: this.customAgentPrompt ?? ""
     });
   }
 
@@ -360,7 +396,10 @@ export class UpstreamKeyPool {
       sessionAffinityEnabled: this.sessionAffinityEnabled,
       sessionAffinityTtlSeconds: Math.round(this.sessionAffinityTtlMs / 1000),
       autoDisableExhaustedKeys: this.autoDisableExhaustedKeys,
-      incognitoMode: this.incognitoMode
+      incognitoMode: this.incognitoMode,
+      autoEnsureCodingAgent: this.autoEnsureCodingAgent,
+      ...(this.customAgentPrompt ? { customAgentPrompt: this.customAgentPrompt } : {}),
+      ...(this.chatAgentId ? { chatAgentId: this.chatAgentId } : {})
     };
   }
 
@@ -379,10 +418,19 @@ export class UpstreamKeyPool {
     if (typeof patch.incognitoMode === "boolean") {
       this.incognitoMode = patch.incognitoMode;
     }
+    if (typeof patch.autoEnsureCodingAgent === "boolean") {
+      this.autoEnsureCodingAgent = patch.autoEnsureCodingAgent;
+    }
+    if (typeof patch.customAgentPrompt === "string") {
+      this.customAgentPrompt = patch.customAgentPrompt.trim().slice(0, 4000) || undefined;
+    }
+    if (typeof patch.chatAgentId === "string") {
+      this.chatAgentId = validateChatAgentId(patch.chatAgentId);
+    }
     this.persist();
   }
 
-  allManagedKeys(): Array<{ slotId: string; rawKey: string; enabled: boolean; label?: string; proxyUrl?: string }> {
+  allManagedKeys(): Array<{ slotId: string; rawKey: string; enabled: boolean; label?: string; proxyUrl?: string; chatAgentId?: string }> {
     this.reviveCycleResetAccounts();
     return this.slots.map((s) => ({
       slotId: s.slotId,
@@ -390,6 +438,7 @@ export class UpstreamKeyPool {
       enabled: s.enabled,
       ...(s.label ? { label: s.label } : {}),
       ...(s.proxyUrl ? { proxyUrl: s.proxyUrl } : {}),
+      ...(s.chatAgentId ? { chatAgentId: s.chatAgentId } : {}),
     }));
   }
 
@@ -449,6 +498,7 @@ export class UpstreamKeyPool {
       maskedKey: slot?.maskedKey ?? maskSecretKey(rawKey),
       ...(slot?.label ? { label: slot.label } : {}),
       ...(slot?.proxyUrl ? { proxyUrl: slot.proxyUrl } : {}),
+      ...(slot?.chatAgentId ? { chatAgentId: slot.chatAgentId } : {}),
       viaAffinity,
       markSuccess: () => {
         if (slot) slot.consecutiveRateLimits = 0;
@@ -776,13 +826,14 @@ export class UpstreamKeyPool {
     }
   }
 
-  addKey(rawKey: string, enabled = true, label?: string, proxyUrl?: string): KeySlotStatus {
+  addKey(rawKey: string, enabled = true, label?: string, proxyUrl?: string, chatAgentId?: string): KeySlotStatus {
     let validProxy: string | undefined;
     try {
       validProxy = validateProxyUrl(proxyUrl);
     } catch (err) {
       throw new GatewayError(err instanceof Error ? err.message : "Invalid proxy URL.", 400, "invalid_proxy_url");
     }
+    const validChatAgentId = validateChatAgentId(chatAgentId);
     let normalized = rawKey.trim();
     const webCred = parseWebCurlOrCredential(normalized);
     if (webCred) {
@@ -799,6 +850,7 @@ export class UpstreamKeyPool {
         existing.cooldownUntil = 0;
         if (label?.trim()) existing.label = label.trim();
         if (proxyUrl !== undefined) existing.proxyUrl = validProxy;
+        if (chatAgentId !== undefined) existing.chatAgentId = validChatAgentId;
         this.persist();
         return this.toSlotStatus(existing, this.affinityTable.countBySlot());
       }
@@ -812,13 +864,14 @@ export class UpstreamKeyPool {
     const autoWebLabel = webCred ? (webCred.email || `AWS #${webCred.accountId.slice(-4)}`) : undefined;
     const slot = this.upsertInternal(normalized, enabled, label || autoWebLabel);
     if (proxyUrl !== undefined) slot.proxyUrl = validProxy;
+    if (chatAgentId !== undefined) slot.chatAgentId = validChatAgentId;
     this.persist();
     return this.toSlotStatus(slot, this.affinityTable.countBySlot());
   }
 
   updateSlotMeta(
     slotId: string,
-    patch: { enabled?: boolean; label?: string; proxyUrl?: string; clearCooldown?: boolean }
+    patch: { enabled?: boolean; label?: string; proxyUrl?: string; chatAgentId?: string; clearCooldown?: boolean }
   ): KeySlotStatus {
     const slot = this.slots.find((s) => s.slotId === slotId);
     if (!slot) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
@@ -836,6 +889,9 @@ export class UpstreamKeyPool {
       } catch (err) {
         throw new GatewayError(err instanceof Error ? err.message : "Invalid proxy URL.", 400, "invalid_proxy_url");
       }
+    }
+    if (patch.chatAgentId !== undefined) {
+      slot.chatAgentId = validateChatAgentId(patch.chatAgentId);
     }
     if (typeof patch.enabled === "boolean") {
       slot.enabled = patch.enabled;
@@ -882,6 +938,7 @@ export class UpstreamKeyPool {
       addedAt: slot.addedAt,
       maskedKey: slot.maskedKey,
       ...(slot.proxyUrl ? { maskedProxy: maskProxyUrl(slot.proxyUrl) } : {}),
+      ...(slot.chatAgentId ? { chatAgentId: slot.chatAgentId } : {}),
       enabled: slot.enabled,
       healthy: slot.enabled && rem === 0 && !slot.autoPoolExhausted && !slot.apiPoolExhausted,
       ...(slot.autoDisabledReason ? { autoDisabledReason: slot.autoDisabledReason } : {}),

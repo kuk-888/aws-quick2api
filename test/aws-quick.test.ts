@@ -30,7 +30,8 @@ import {
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
 import { GatewayError } from "../src/core/types.js";
-import { UpstreamKeyPool } from "../src/core/key-pool.js";
+import { loadConfigFromEnv } from "../src/core/config.js";
+import { UpstreamKeyPool, validateChatAgentId } from "../src/core/key-pool.js";
 import {
   buildToolBridgePrompt,
   parseToolCallsFromText,
@@ -883,5 +884,91 @@ describe("Credential parser & ClientKeyStore", () => {
     );
     assert.equal(realQuota.isConnLimitErr, false);
     assert.equal(realQuota.isQuotaErr, true);
+  });
+
+  it("validates, persists, and resolves global + per-account chat_agent_id overrides", async () => {
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    assert.equal(validateChatAgentId(undefined), undefined);
+    assert.equal(validateChatAgentId("   "), undefined);
+    assert.equal(validateChatAgentId("  11111111-2222-3333-4444-555555555555  "), "11111111-2222-3333-4444-555555555555");
+    assert.equal(validateChatAgentId("arn:aws:quicksight:us-east-1:123456789012:agent/abc-123"), "arn:aws:quicksight:us-east-1:123456789012:agent/abc-123");
+    assert.throws(() => validateChatAgentId("bad id with spaces"), /invalid_chat_agent_id|Invalid chat_agent_id/);
+    assert.throws(() => validateChatAgentId("bad\nid"), /invalid_chat_agent_id|Invalid chat_agent_id/);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aq-agent-id-"));
+    const envPath = path.join(tmpDir, ".env");
+    fs.writeFileSync(envPath, "HOST=127.0.0.1\n", "utf8");
+    try {
+      const cfg = loadConfigFromEnv(
+        {
+          QUICK_TOKENS: "ws.example.com|tok_alpha_1234,ws.example.com|tok_beta_5678",
+          CHAT_AGENT_ID: "agent-global-001",
+        },
+        envPath,
+      );
+      assert.equal(cfg.chatAgentId, "agent-global-001");
+
+      const pool = new UpstreamKeyPool(cfg);
+      assert.equal(pool.getSettings().chatAgentId, "agent-global-001");
+
+      const slots = pool.statusSnapshot();
+      assert.equal(slots.length, 2);
+      const slotA = slots[0]!;
+      const slotB = slots[1]!;
+
+      // Per-account override on slotA
+      pool.updateSlotMeta(slotA.slotId, { chatAgentId: "agent-slot-a" });
+      assert.equal(pool.statusSnapshot().find((s) => s.slotId === slotA.slotId)?.chatAgentId, "agent-slot-a");
+      assert.equal(pool.statusSnapshot().find((s) => s.slotId === slotB.slotId)?.chatAgentId, undefined);
+
+      // Lease exposes per-account override cleanly
+      const leaseA = pool.leaseSpecificKey("ws.example.com|tok_alpha_1234");
+      assert.equal(leaseA.chatAgentId, "agent-slot-a");
+      leaseA.release();
+
+      // Update global default, autoEnsureCodingAgent, and customAgentPrompt template, verify persistence to .env
+      pool.updateSettings({
+        chatAgentId: "agent-global-002",
+        autoEnsureCodingAgent: false,
+        customAgentPrompt: "Line1\nLine2 custom prompt",
+      });
+      assert.equal(pool.getSettings().chatAgentId, "agent-global-002");
+      assert.equal(pool.getSettings().autoEnsureCodingAgent, false);
+      assert.equal(pool.getSettings().customAgentPrompt, "Line1\nLine2 custom prompt");
+
+      const envContent = fs.readFileSync(envPath, "utf8");
+      assert.ok(envContent.includes("CHAT_AGENT_ID=agent-global-002"));
+      assert.ok(envContent.includes("AUTO_ENSURE_CODING_AGENT=false"));
+      assert.ok(envContent.includes("CUSTOM_AGENT_PROMPT=Line1\\nLine2 custom prompt"));
+      assert.ok(envContent.includes(`"${slotA.slotId}":"agent-slot-a"`));
+
+      // Clear per-account and global overrides cleanly & re-enable autoEnsureCodingAgent
+      pool.updateSlotMeta(slotA.slotId, { chatAgentId: "" });
+      pool.updateSettings({ chatAgentId: "", autoEnsureCodingAgent: true, customAgentPrompt: "" });
+      assert.equal(pool.getSettings().chatAgentId, undefined);
+      assert.equal(pool.getSettings().autoEnsureCodingAgent, true);
+      assert.equal(pool.getSettings().customAgentPrompt, undefined);
+      assert.equal(pool.statusSnapshot().find((s) => s.slotId === slotA.slotId)?.chatAgentId, undefined);
+
+      // Compact tool bridge prompt omits verbose anti-refusal boilerplate when custom agent is active
+      const sampleTool = [{ name: "Read", description: "Read file", inputSchema: { type: "object" } }];
+      const compactPrompt = buildToolBridgePrompt(sampleTool, "auto", { compactForCustomAgent: true });
+      const fallbackPrompt = buildToolBridgePrompt(sampleTool, "auto", { compactForCustomAgent: false });
+      assert.ok(compactPrompt.includes("## Client Tools (JSON Schema)"));
+      assert.ok(!compactPrompt.includes("bypassing any device-access"));
+      assert.ok(fallbackPrompt.includes("bypassing any device-access"));
+
+      // Dashboard HTML still renders valid JS with the new customAgentPrompt & editChatAgent controls
+      const html = renderDashboardHtml("/dashboard", "testnonce");
+      assert.ok(html.includes("cfgCustomAgentPrompt"));
+      assert.ok(html.includes("cfgAutoEnsureCodingAgent"));
+      assert.ok(html.includes("modalChatAgentInput"));
+      assert.ok(html.includes("editChatAgent"));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

@@ -520,6 +520,40 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       padding: 12px 16px; border-top: 1px solid var(--border); background: var(--subtle);
       display: flex; justify-content: flex-end; gap: 8px; flex-shrink: 0;
     }
+    .ag-list { display: flex; flex-direction: column; gap: 10px; max-height: 300px; overflow-y: auto; }
+    .ag-item {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+      padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--bg); cursor: pointer; text-align: left; width: 100%;
+      height: auto; white-space: normal;
+      transition: border-color 0.12s, background-color 0.12s;
+    }
+    .ag-item:hover { border-color: var(--border-strong); background: var(--panel-hover); }
+    .ag-item.active { border-color: var(--cta-bg); background: var(--subtle); cursor: default; }
+    .ag-pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 11px; font-weight: 500; padding: 2px 7px; border-radius: 99px;
+      border: 1px solid var(--border); color: var(--fg-muted); background: var(--panel);
+      white-space: nowrap;
+    }
+    .ag-pill.ok { border-color: transparent; background: rgba(16,185,129,0.14); color: var(--ok); }
+    .ag-adv { border-top: 1px solid var(--border); padding-top: 10px; }
+    .ag-adv summary { cursor: pointer; font-size: 12px; color: var(--fg-muted); user-select: none; }
+    .ag-adv summary:hover { color: var(--fg); }
+    .routed-pill {
+      margin-left: 5px;
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11.5px; font-weight: 500;
+      white-space: nowrap;
+    }
+    :root[data-theme="light"] .routed-opus { color: #6d28d9; }
+    :root[data-theme="dark"] .routed-opus { color: #a78bfa; }
+    :root[data-theme="light"] .routed-sonnet { color: #2563eb; }
+    :root[data-theme="dark"] .routed-sonnet { color: #60a5fa; }
+    :root[data-theme="light"] .routed-haiku { color: #059669; }
+    :root[data-theme="dark"] .routed-haiku { color: #34d399; }
+    :root[data-theme="light"] .routed-other { color: #b45309; }
+    :root[data-theme="dark"] .routed-other { color: #fbbf24; }
     .ck-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1163,6 +1197,25 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               </div>
               <label class="switch"><input type="checkbox" id="cfgIncognitoMode" checked /><span class="slider"></span></label>
             </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <h3>自动创建 / 绑定极简编程 Agent (AUTO_ENSURE_CODING_AGENT)</h3>
+                <p>默认开启。首次调用尚未绑定 Agent 的账号时，自动通过 AWS Quick 协议查找已有自定义 Agent 或创建极简编程 Agent 并持久化绑定，大幅提升 Opus / Sonnet 工具与本地文件调用稳定性并消除长篇防拒答提示词污染。</p>
+              </div>
+              <label class="switch"><input type="checkbox" id="cfgAutoEnsureCodingAgent" checked /><span class="slider"></span></label>
+            </div>
+
+            <div class="setting-row" style="flex-direction:column;align-items:stretch;gap:8px;">
+              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                <div class="setting-info">
+                  <h3>自定义 Agent 默认提示词模板 (CUSTOM_AGENT_PROMPT)</h3>
+                  <p>新建或自动创建自定义 Agent 时写入的默认指令模板，保存后立即热生效（留空则使用内置默认模板；已创建的旧 Agent 可在「凭证池 → Agent」里一键编辑更新）。</p>
+                </div>
+                <button type="button" class="btn-xs" id="resetAgentPromptBtn" style="flex-shrink:0;">恢复默认</button>
+              </div>
+              <textarea id="cfgCustomAgentPrompt" rows="3" style="width:100%;resize:vertical;line-height:1.5;" placeholder="留空将使用内置极简默认模板"></textarea>
+            </div>
           </div>
 
           <div class="panel-box">
@@ -1332,6 +1385,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                   <option value="false">停用备用</option>
                 </select>
               </div>
+            </div>
+            <div>
+              <label class="field-lbl">专属自定义 Agent ID（可选，覆盖全局 chat_agent_id，留空跟随全局设置）</label>
+              <input id="modalChatAgentInput" type="text" class="mono" style="width:100%;background:var(--panel);" placeholder="如自定义 Quick Agent UUID / ARN（可选）" />
             </div>
           </div>
         </details>
@@ -2345,9 +2402,14 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         const st = r.ok
           ? '<span class="status-line"><span class="dot dot-ok"></span>' + r.status + '</span>'
           : '<span class="status-line" style="color:var(--err);"><span class="dot dot-err"></span>' + r.status + '</span>';
-        const routedHtml = r.routedModel
-          ? ' <span style="font-size:11px;font-weight:400;color:var(--fg-muted);">→ ' + esc(r.routedModel) + '</span>'
-          : '';
+        const routedBadgeHtml = (rm) => {
+          if (!rm) return "";
+          const clean = String(rm).replace(/^us\.anthropic\./, "");
+          const low = clean.toLowerCase();
+          const cls = low.includes("opus") ? "routed-opus" : low.includes("sonnet") ? "routed-sonnet" : low.includes("haiku") ? "routed-haiku" : "routed-other";
+          return '<span class="routed-pill ' + cls + '">→ ' + esc(clean) + '</span>';
+        };
+        const routedHtml = routedBadgeHtml(r.routedModel);
         const protoSub = (r.protocol ? esc(r.protocol) : '') + (r.stream ? ' · SSE' : ' · JSON');
         const modeBadge = r.execMode === "warm_incremental"
           ? '<span class="tag tag-info" style="font-size:10.5px;">' + esc(tr("增量复用", "Incremental")) + '</span>'
@@ -2511,6 +2573,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("cfgAffinityTtl").value = settings.sessionAffinityTtlSeconds || 3600;
       $("cfgAutoDisable").checked = settings.autoDisableExhaustedKeys !== false;
       if ($("cfgIncognitoMode")) $("cfgIncognitoMode").checked = settings.incognitoMode !== false;
+      if ($("cfgAutoEnsureCodingAgent")) $("cfgAutoEnsureCodingAgent").checked = settings.autoEnsureCodingAgent !== false;
+      window.__defaultCustomAgentPrompt = settings.defaultCustomAgentPrompt || "";
+      window.__activeCustomAgentPrompt = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
+      if ($("cfgCustomAgentPrompt")) {
+        $("cfgCustomAgentPrompt").value = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
+      }
 
       $("affinityTableBody").innerHTML = affinities.length ? affinities.map((a) =>
         '<tr>' +
@@ -2561,7 +2629,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (st === "abnormal" && (s.healthy || (!s.enabled && !s.autoDisabledReason))) return false;
         if (kw) {
           const idt = s.identity || {};
-          const hay = ((s.label || "") + " " + (s.maskedKey || "") + " " + (s.maskedProxy || "") + " " + (idt.userEmail || "") + " " + (idt.displayName || "")).toLowerCase();
+          const hay = ((s.label || "") + " " + (s.maskedKey || "") + " " + (s.maskedProxy || "") + " " + (s.chatAgentId || "") + " " + (idt.userEmail || "") + " " + (idt.displayName || "")).toLowerCase();
           if (!hay.includes(kw)) return false;
         }
         return true;
@@ -2650,6 +2718,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             '</div>' +
             (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:3px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
             (s.maskedProxy ? '<div class="mono" style="font-size:10.5px;color:var(--ok);margin-top:2px;">Proxy: ' + esc(s.maskedProxy) + '</div>' : '') +
+            (s.chatAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--accent);margin-top:2px;">Agent: ' + esc(s.chatAgentId) + '</div>' : '') +
           '</td>' +
           '<td>' + (isSyncing
             ? '<div style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--fg-muted);"><span class="inline-spin"></span><span>' + esc(tr("正在同步额度...", "Syncing quota...")) + '</span></div>'
@@ -2682,6 +2751,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '">' + esc(tr('日志', 'Logs')) + '</button>' +
             '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '">' + esc(tr('备注', 'Label')) + '</button>' +
             '<button class="btn-xs" data-click="editProxy" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.maskedProxy || '') + '">' + esc(tr('代理', 'Proxy')) + '</button>' +
+            '<button class="btn-xs" data-click="editChatAgent" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.chatAgentId || '') + '">' + esc(tr('Agent', 'Agent')) + '</button>' +
             (!s.enabled && s.autoDisabledKind ? '<button class="btn-xs" data-click="recheckKey" data-arg="' + esc(s.slotId) + '">' + esc(tr('重新检测', 'Recheck')) + '</button>' : '') +
             (s.cooldownRemainingMs > 0 ? '<button class="btn-xs" data-click="clearKeyCd" data-arg="' + esc(s.slotId) + '">' + esc(tr('解封', 'Uncool')) + '</button>' : '') +
             '<button class="btn-xs btn-danger" data-click="deleteKey" data-arg="' + esc(s.slotId) + '">' + esc(tr('移除', 'Remove')) + '</button>' +
@@ -2857,13 +2927,21 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         const m = r.metrics || {};
         if (m.sessionDeleted) badges.push('<span class="tag">' + esc(tr('已删会话', 'Deleted')) + '</span>');
         const routedShort = m.resolvedModel ? String(m.resolvedModel).replace(/^us\.anthropic\./, "") : "";
+        const routedCls = routedShort.toLowerCase().includes("opus")
+          ? "routed-opus"
+          : routedShort.toLowerCase().includes("sonnet")
+            ? "routed-sonnet"
+            : routedShort.toLowerCase().includes("haiku")
+              ? "routed-haiku"
+              : "routed-other";
+        const routedPillHtml = routedShort ? '<span class="routed-pill ' + routedCls + '">→ ' + esc(routedShort) + '</span>' : '';
         const dur = r.durationMs != null ? (r.durationMs / 1000).toFixed(2) + "s" : "—";
         const ttft = r.ttftMs != null ? (r.ttftMs / 1000).toFixed(2) + "s" : "—";
 
         return '<tr class="clickable-row" data-click="openTrace" data-arg="' + esc(r.id) + '">' +
           '<td class="mono" style="white-space:nowrap;">' + new Date(r.startedAt).toLocaleTimeString() + '</td>' +
           '<td>' + stHtml + '</td>' +
-          '<td><div class="mono" style="font-weight:500;">' + esc(r.requestedModel) + (routedShort ? ' <span style="font-size:11px;font-weight:400;color:var(--fg-muted);">→ ' + esc(routedShort) + '</span>' : '') + '</div>' +
+          '<td><div class="mono" style="font-weight:500;">' + esc(r.requestedModel) + routedPillHtml + '</div>' +
             '<div style="font-size:11px;color:var(--fg-muted);">' + esc(r.protocol) + (r.stream ? ' · SSE' : ' · JSON') + (r.client ? (' · ' + esc(r.client)) : '') + (r.clientKeyName ? (' · ' + esc(r.clientKeyName)) : '') + (r.clientIp ? (' · IP ' + esc(r.clientIp)) : '') + '</div></td>' +
           '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;"><span>' + esc(r.accountLabel || r.maskedKey || '—') + '</span>' + modeBadge + '</div></td>' +
           '<td style="max-width:340px;">' +
@@ -3641,6 +3719,216 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       } catch (e) { notify(e.message, true); }
     };
 
+    window.editChatAgent = async (slotId, curAgentId) => {
+      let activeBoundId = curAgentId || "";
+      const overlay = document.createElement("div");
+      overlay.className = "modal-mask open";
+      const card = document.createElement("div");
+      card.className = "modal-card";
+      card.style.maxWidth = "520px";
+      card.innerHTML =
+        '<div class="panel-hdr">' +
+          '<div>' +
+            '<h2>' + esc(tr("自定义 Agent 管理", "Custom Agent Manager")) + '</h2>' +
+            '<p>' + esc(tr("点击任意卡片即可立即切换并绑定该账号使用的 AWS Quick Agent。", "Click any agent card to switch immediately for this credential.")) + '</p>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:6px;">' +
+            '<button type="button" class="btn-xs" id="agRefreshBtn">' + esc(tr("刷新", "Refresh")) + '</button>' +
+            '<button type="button" class="btn-ghost" id="agCloseBtn" aria-label="Close" style="width:28px;height:28px;padding:0;">✕</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="modal-body">' +
+          '<div id="agListBox" class="ag-list">' +
+            '<div style="color:var(--fg-muted);padding:16px;text-align:center;">' + esc(tr("正在从 AWS Quick 拉取该账号的 Agent 列表…", "Loading agents from AWS Quick...")) + '</div>' +
+          '</div>' +
+          '<details class="ag-adv">' +
+            '<summary>' + esc(tr("高级：手动输入或清空 Agent ID", "Advanced: Enter or clear Agent ID manually")) + '</summary>' +
+            '<div style="display:flex;gap:8px;align-items:center;margin-top:10px;">' +
+              '<input id="agManualInput" type="text" class="mono" style="flex:1;" placeholder="' + esc(tr("输入自定义 Agent ID，留空点保存即恢复默认", "Custom Agent ID (leave empty for default)")) + '" value="' + esc(activeBoundId) + '" />' +
+              '<button type="button" id="agSaveBtn">' + esc(tr("保存", "Save")) + '</button>' +
+            '</div>' +
+          '</details>' +
+        '</div>' +
+        '<div class="modal-foot">' +
+          '<button type="button" id="agCancelBtn">' + esc(tr("关闭", "Close")) + '</button>' +
+          '<button type="button" class="btn-solid" id="agEnsureBtn">' + esc(tr("自动查找 / 创建编程 Agent", "Auto-Find / Create Coding Agent")) + '</button>' +
+        '</div>';
+      overlay.appendChild(card);
+      document.body.appendChild(overlay);
+
+      const onKeyDown = (ev) => { if (ev.key === "Escape") close(); };
+      const close = () => {
+        document.removeEventListener("keydown", onKeyDown);
+        if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      };
+      document.addEventListener("keydown", onKeyDown);
+      overlay.addEventListener("click", (ev) => { if (ev.target === overlay) close(); });
+      card.querySelector("#agCloseBtn").addEventListener("click", close);
+      card.querySelector("#agCancelBtn").addEventListener("click", close);
+
+      const listBox = card.querySelector("#agListBox");
+      const manualInput = card.querySelector("#agManualInput");
+      const ensureBtn = card.querySelector("#agEnsureBtn");
+      const refreshBtn = card.querySelector("#agRefreshBtn");
+      const saveBtn = card.querySelector("#agSaveBtn");
+      let busy = false;
+
+      const bindId = async (agentId, displayName) => {
+        if (busy) return;
+        busy = true;
+        try {
+          await api("/v1/admin/keys/" + slotId, { method: "PATCH", body: JSON.stringify({ chatAgentId: agentId }) });
+          activeBoundId = agentId;
+          manualInput.value = agentId;
+          notify(
+            agentId
+              ? tr("已切换为 ", "Switched to ") + (displayName || agentId)
+              : tr("已恢复使用官方默认 Quick Agent。", "Restored official default Quick Agent.")
+          );
+          close();
+          await loadConsoleData("");
+        } catch (e) {
+          notify(e.message, true);
+        } finally {
+          busy = false;
+        }
+      };
+
+      const renderAgents = (agents, boundId) => {
+        if (!Array.isArray(agents) || agents.length === 0) {
+          listBox.innerHTML = '<div style="color:var(--fg-muted);padding:16px;text-align:center;">' + esc(tr("未查询到自定义 Agent，可点击右下角按钮一键自动创建。", "No agents found. Click Auto-Find / Create below.")) + '</div>';
+          return;
+        }
+        listBox.innerHTML = "";
+        agents.forEach((a) => {
+          const isSystem = Boolean(a.isSystem);
+          const isBound = isSystem
+            ? !boundId
+            : Boolean(boundId && (a.shortId === boundId || a.agentId === boundId));
+          const btn = document.createElement("div");
+          btn.setAttribute("role", "button");
+          btn.tabIndex = isBound ? -1 : 0;
+          btn.className = "ag-item" + (isBound ? " active" : "");
+          const badgeHtml = isBound
+            ? '<span class="ag-pill ok">● ' + esc(tr("当前使用", "Active")) + '</span>'
+            : '<span class="ag-pill">' + esc(isSystem ? tr("切换默认", "Use Default") : tr("点击选用", "Select")) + '</span>';
+          const tagHtml = isSystem
+            ? '<span class="ag-pill">' + esc(tr("官方默认", "SYSTEM")) + '</span>'
+            : '<span class="ag-pill">' + esc(tr("自定义", "Custom")) + '</span>';
+          btn.innerHTML =
+            '<div style="min-width:0;flex:1;">' +
+              '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+                '<span style="font-weight:600;color:var(--fg);">' + esc(a.name || a.shortId) + '</span>' +
+                tagHtml +
+              '</div>' +
+              '<div class="mono" style="font-size:11px;color:var(--fg-faint);margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(a.shortId || a.agentId) + '</div>' +
+              (a.description ? '<div style="font-size:12px;color:var(--fg-muted);margin-top:4px;line-height:1.45;">' + esc(a.description) + '</div>' : '') +
+            '</div>' +
+            '<div style="flex-shrink:0;display:flex;align-items:center;gap:6px;padding-top:2px;">' +
+              (!isSystem ? '<button type="button" class="btn-xs ag-edit-prompt-btn">' + esc(tr("编辑提示词", "Edit Prompt")) + '</button>' : '') +
+              badgeHtml +
+            '</div>';
+          if (!isSystem) {
+            const editBtn = btn.querySelector(".ag-edit-prompt-btn");
+            if (editBtn) {
+              editBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                openPromptEditor(a);
+              });
+            }
+          }
+          if (!isBound) {
+            const pick = () => bindId(isSystem ? "" : (a.shortId || a.agentId), a.name || a.shortId);
+            btn.addEventListener("click", pick);
+            btn.addEventListener("keydown", (ev) => { if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); pick(); } });
+          }
+          listBox.appendChild(btn);
+        });
+      };
+
+      const openPromptEditor = (agent) => {
+        const curPrompt = agent.systemPrompt || "";
+        listBox.innerHTML = "";
+        const wrap = document.createElement("div");
+        wrap.style.cssText = "display:flex;flex-direction:column;gap:10px;";
+        wrap.innerHTML =
+          '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
+            '<div style="font-weight:600;font-size:13px;">' + esc(tr("编辑 Agent 提示词：", "Edit Agent Prompt: ") + (agent.name || agent.shortId)) + '</div>' +
+            '<button type="button" class="btn-xs" id="agApplyTplBtn">' + esc(tr("套用全局模板", "Use Global Template")) + '</button>' +
+          '</div>' +
+          '<textarea id="agPromptTextarea" rows="5" style="width:100%;resize:vertical;line-height:1.5;">' + esc(curPrompt) + '</textarea>' +
+          '<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px;">' +
+            '<button type="button" id="agPromptBackBtn">' + esc(tr("返回列表", "Back")) + '</button>' +
+            '<button type="button" class="btn-solid" id="agPromptPublishBtn">' + esc(tr("保存并热发布到 AWS Quick", "Save & Publish")) + '</button>' +
+          '</div>';
+        listBox.appendChild(wrap);
+        const ta = wrap.querySelector("#agPromptTextarea");
+        wrap.querySelector("#agApplyTplBtn").addEventListener("click", () => {
+          ta.value = window.__activeCustomAgentPrompt || window.__defaultCustomAgentPrompt || "";
+        });
+        wrap.querySelector("#agPromptBackBtn").addEventListener("click", () => fetchAgents());
+        const pubBtn = wrap.querySelector("#agPromptPublishBtn");
+        pubBtn.addEventListener("click", async () => {
+          if (busy) return;
+          busy = true;
+          pubBtn.disabled = true;
+          pubBtn.textContent = tr("发布中…", "Publishing...");
+          try {
+            const res = await api("/v1/admin/keys/" + slotId + "/agents/update", {
+              method: "POST",
+              body: JSON.stringify({ agentId: agent.shortId || agent.agentId, instructions: ta.value.trim() })
+            });
+            notify(tr("已热更新并发布该自定义 Agent 提示词。", "Custom agent prompt updated and published."));
+            busy = false;
+            renderAgents(res.agents || [], activeBoundId);
+          } catch (e) {
+            notify(e.message, true);
+            pubBtn.disabled = false;
+            pubBtn.textContent = tr("保存并热发布到 AWS Quick", "Save & Publish");
+            busy = false;
+          }
+        });
+      };
+
+      const fetchAgents = async () => {
+        refreshBtn.disabled = true;
+        listBox.innerHTML = '<div style="color:var(--fg-muted);padding:16px;text-align:center;">' + esc(tr("正在拉取账号 Agent 列表…", "Loading agents...")) + '</div>';
+        try {
+          const data = await api("/v1/admin/keys/" + slotId + "/agents");
+          activeBoundId = data.boundAgentId !== undefined ? data.boundAgentId : activeBoundId;
+          manualInput.value = activeBoundId;
+          renderAgents(data.agents || [], activeBoundId);
+        } catch (e) {
+          listBox.innerHTML = '<div style="color:var(--err);padding:14px;text-align:center;">' + esc(tr("拉取失败：", "Load failed: ") + (e.message || e)) + '</div>';
+        } finally {
+          refreshBtn.disabled = false;
+        }
+      };
+
+      refreshBtn.addEventListener("click", fetchAgents);
+      ensureBtn.addEventListener("click", async () => {
+        if (busy) return;
+        busy = true;
+        ensureBtn.disabled = true;
+        const origText = ensureBtn.textContent;
+        ensureBtn.textContent = tr("处理中…", "Working...");
+        try {
+          const data = await api("/v1/admin/keys/" + slotId + "/agents/ensure", { method: "POST", body: JSON.stringify({}) });
+          notify(tr("已自动绑定编程 Agent: ", "Auto-bound coding agent: ") + data.chatAgentId);
+          close();
+          await loadConsoleData("");
+        } catch (e) {
+          notify(e.message, true);
+          ensureBtn.disabled = false;
+          ensureBtn.textContent = origText;
+          busy = false;
+        }
+      });
+      saveBtn.addEventListener("click", () => bindId(manualInput.value.trim(), ""));
+      manualInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") bindId(manualInput.value.trim(), ""); });
+      await fetchAgents();
+    };
+
     window.deleteKey = async (slotId) => {
       const ok = await uiConfirm({
         title: tr("移除 AWS Quick 凭证", "Remove Credential"),
@@ -3866,6 +4154,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         }
         const label = $("modalLabelInput").value.trim();
         const proxyUrl = $("modalProxyInput") ? $("modalProxyInput").value.trim() : "";
+        const chatAgentId = $("modalChatAgentInput") ? $("modalChatAgentInput").value.trim() : "";
         try {
           if (issuerUrl) localStorage.setItem("aq_oauth_issuer", issuerUrl);
           if (wsHost) localStorage.setItem("aq_oauth_wshost", wsHost);
@@ -3880,7 +4169,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               ...(issuerUrl ? { issuerUrl } : {}),
               ...(wsHost ? { wsHost } : {}),
               label: label || undefined,
-              proxyUrl: proxyUrl || undefined
+              proxyUrl: proxyUrl || undefined,
+              chatAgentId: chatAgentId || undefined
             })
           });
           activeOAuthFlowId = r.flowId;
@@ -3934,9 +4224,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         try {
           const label = $("modalLabelInput").value.trim();
           const proxyUrl = $("modalProxyInput") ? $("modalProxyInput").value.trim() : "";
+          const chatAgentId = $("modalChatAgentInput") ? $("modalChatAgentInput").value.trim() : "";
           await api("/v1/admin/oauth/complete", {
             method: "POST",
-            body: JSON.stringify({ flowId: activeOAuthFlowId, callbackUrl: cb, label: label || undefined, proxyUrl: proxyUrl || undefined })
+            body: JSON.stringify({ flowId: activeOAuthFlowId, callbackUrl: cb, label: label || undefined, proxyUrl: proxyUrl || undefined, chatAgentId: chatAgentId || undefined })
           });
           stopOAuthPoll();
           activeOAuthFlowId = "";
@@ -4032,6 +4323,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         : rawInput.split(/\\r?\\n|,/).map((s) => s.trim()).filter(Boolean);
       const label = $("modalLabelInput").value.trim();
       const proxyUrl = $("modalProxyInput") ? $("modalProxyInput").value.trim() : "";
+      const chatAgentId = $("modalChatAgentInput") ? $("modalChatAgentInput").value.trim() : "";
       const enabled = $("modalEnabledSelect").value === "true";
       $("confirmAddKeyBtn").disabled = true;
       try {
@@ -4039,12 +4331,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           const itemLabel = lines.length > 1 && label ? (label + " #" + (i + 1)) : label;
           await api("/v1/admin/keys", {
             method: "POST",
-            body: JSON.stringify({ apiKey: lines[i], enabled, label: itemLabel, proxyUrl: proxyUrl || undefined })
+            body: JSON.stringify({ apiKey: lines[i], enabled, label: itemLabel, proxyUrl: proxyUrl || undefined, chatAgentId: chatAgentId || undefined })
           });
         }
         $("modalKeysInput").value = "";
         $("modalLabelInput").value = "";
         if ($("modalProxyInput")) $("modalProxyInput").value = "";
+        if ($("modalChatAgentInput")) $("modalChatAgentInput").value = "";
         closeAddModal();
         notify(tr("成功导入 " + lines.length + " 把凭证。", "Imported " + lines.length + " key(s)."));
         await loadConsoleData(enabled ? "?force=1" : "");
@@ -4137,8 +4430,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    if ($("resetAgentPromptBtn")) {
+      $("resetAgentPromptBtn").onclick = () => {
+        if ($("cfgCustomAgentPrompt")) {
+          $("cfgCustomAgentPrompt").value = window.__defaultCustomAgentPrompt || "";
+        }
+      };
+    }
+
     $("saveRoutingBtn").onclick = async () => {
       try {
+        const promptVal = $("cfgCustomAgentPrompt") ? $("cfgCustomAgentPrompt").value.trim() : "";
+        const isBuiltInDefault = promptVal === (window.__defaultCustomAgentPrompt || "").trim();
         await api("/v1/admin/settings", {
           method: "POST",
           body: JSON.stringify({
@@ -4146,10 +4449,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             sessionAffinityEnabled: $("cfgAffinityEnabled").checked,
             sessionAffinityTtlSeconds: Number($("cfgAffinityTtl").value) || 3600,
             autoDisableExhaustedKeys: $("cfgAutoDisable").checked,
-            incognitoMode: $("cfgIncognitoMode") ? $("cfgIncognitoMode").checked : true
+            incognitoMode: $("cfgIncognitoMode") ? $("cfgIncognitoMode").checked : true,
+            autoEnsureCodingAgent: $("cfgAutoEnsureCodingAgent") ? $("cfgAutoEnsureCodingAgent").checked : true,
+            customAgentPrompt: isBuiltInDefault ? "" : promptVal
           })
         });
-        notify(tr("路由、粘性亲和与熔断策略已保存生效。", "Routing, affinity, and circuit-breaker settings saved."));
+        notify(tr("路由、粘性亲和与 Agent 模板策略已热更新生效。", "Routing, affinity, and agent template settings saved."));
         await loadConsoleData("");
       } catch (e) { notify(e.message, true); }
     };

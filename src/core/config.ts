@@ -180,6 +180,12 @@ export function loadConfigFromEnv(
     disabledModels,
     keyLabels: parseKeyLabels(env.KEY_LABELS),
     keyProxies: parseKeyLabels(env.KEY_PROXIES),
+    chatAgentId: env.CHAT_AGENT_ID?.trim() || undefined,
+    autoEnsureCodingAgent: parseBoolEnv(env.AUTO_ENSURE_CODING_AGENT, true),
+    customAgentPrompt: env.CUSTOM_AGENT_PROMPT
+      ? env.CUSTOM_AGENT_PROMPT.replace(/\\n/g, "\n").trim() || undefined
+      : undefined,
+    keyChatAgentIds: parseKeyLabels(env.KEY_CHAT_AGENT_IDS),
     keyAddedAt: parseKeyAddedAt(env.KEY_ADDED_AT),
     keyAutoDisabled: parseKeyAutoDisabled(env.KEY_AUTO_DISABLED),
     lbStrategy: parseLbStrategy(env.LB_STRATEGY),
@@ -239,6 +245,8 @@ export function persistPoolConfigToEnvFile(
     disabledKeys: string[];
     keyLabels: Record<string, string>;
     keyProxies?: Record<string, string>;
+    chatAgentId?: string;
+    keyChatAgentIds?: Record<string, string>;
     keyAddedAt?: Record<string, number>;
     keyAutoDisabled: Record<string, AutoDisabledState>;
     lbStrategy: LbStrategy;
@@ -246,6 +254,8 @@ export function persistPoolConfigToEnvFile(
     sessionAffinityTtlMs: number;
     autoDisableExhaustedKeys: boolean;
     incognitoMode?: boolean;
+    autoEnsureCodingAgent?: boolean;
+    customAgentPrompt?: string;
   }
 ): void {
   if (!envFilePath || !existsSync(envFilePath)) return;
@@ -255,6 +265,8 @@ export function persistPoolConfigToEnvFile(
     DISABLED_QUICK_TOKENS: stripEnvNewlines(state.disabledKeys.join(",")),
     KEY_LABELS: stripEnvNewlines(JSON.stringify(state.keyLabels)),
     ...(state.keyProxies ? { KEY_PROXIES: stripEnvNewlines(JSON.stringify(state.keyProxies)) } : {}),
+    ...(typeof state.chatAgentId === "string" ? { CHAT_AGENT_ID: stripEnvNewlines(state.chatAgentId) } : {}),
+    ...(state.keyChatAgentIds ? { KEY_CHAT_AGENT_IDS: stripEnvNewlines(JSON.stringify(state.keyChatAgentIds)) } : {}),
     ...(state.keyAddedAt ? { KEY_ADDED_AT: stripEnvNewlines(JSON.stringify(state.keyAddedAt)) } : {}),
     KEY_AUTO_DISABLED: stripEnvNewlines(JSON.stringify(state.keyAutoDisabled)),
     LB_STRATEGY: state.lbStrategy,
@@ -263,6 +275,12 @@ export function persistPoolConfigToEnvFile(
     AUTO_DISABLE_EXHAUSTED_KEYS: String(state.autoDisableExhaustedKeys),
     ...(typeof state.incognitoMode === "boolean"
       ? { INCOGNITO: String(state.incognitoMode) }
+      : {}),
+    ...(typeof state.autoEnsureCodingAgent === "boolean"
+      ? { AUTO_ENSURE_CODING_AGENT: String(state.autoEnsureCodingAgent) }
+      : {}),
+    ...(typeof state.customAgentPrompt === "string"
+      ? { CUSTOM_AGENT_PROMPT: stripEnvNewlines(state.customAgentPrompt.replace(/\r?\n/g, "\\n")) }
       : {})
   };
   const seen = new Set<string>();

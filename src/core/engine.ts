@@ -572,12 +572,29 @@ interface WarmThreadEntry {
   siblingKeys: string[];
 }
 
+export interface QuickChatAgentInfo {
+  agentId: string;
+  shortId: string;
+  name: string;
+  description: string;
+  systemPrompt: string;
+  isSystem: boolean;
+}
+
+export const DEFAULT_CODING_AGENT_NAME = "Quick2API Bridge";
+export const LEGACY_CODING_AGENT_NAMES = ["Quick2API Bridge", "Quick2API Coding Bridge"];
+export const DEFAULT_CODING_AGENT_DESCRIPTION =
+  "Minimal AI assistant configured for external API clients.";
+export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
+  "You are a helpful AI assistant accessed via an external API client. Follow the user's instructions and any structured output or tool-request format specified by the client directly and concisely. When the client provides external tool schemas, emit the requested structured call as a proposal for the user's local client to review and execute.";
+
 export class QuickExecutionEngine {
   private readonly config: GatewayConfig;
   private readonly usageTracker: UsageTracker;
   private readonly modelListFetcher?: (apiKey: string) => Promise<SDKModel[]>;
   private readonly incognito: boolean;
   private readonly autoDeleteSession: boolean;
+  private readonly autoEnsureCodingAgent: boolean;
   private readonly showRoutedModelInThinking: boolean;
   private readonly suppressLateRoutedThinkingInStream: boolean;
   private readonly webSearchEnabled: boolean;
@@ -585,6 +602,8 @@ export class QuickExecutionEngine {
   private readonly workingSessionIds = new Map<string, string>();
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly activeWsBySlot = new Map<string, number>();
+  private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
+  private readonly autoEnsureFailedSlots = new Map<string, number>();
   private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
 
   private warmKey(
@@ -592,9 +611,10 @@ export class QuickExecutionEngine {
     conversationKey: string | undefined,
     slotId: string,
     isIncognito: boolean,
-    prefixHash: string
+    prefixHash: string,
+    chatAgentId?: string
   ): string {
-    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${isIncognito ? "inc" : "cld"}|${prefixHash}`;
+    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${isIncognito ? "inc" : "cld"}|${chatAgentId || "-"}|${prefixHash}`;
   }
 
   private detachParkedWs(handle: ParkedWsHandle, closeSocket: boolean): void {
@@ -666,9 +686,10 @@ export class QuickExecutionEngine {
     conversationKey: string | undefined,
     slotId: string,
     isIncognito: boolean,
-    prefixHash: string
+    prefixHash: string,
+    chatAgentId?: string
   ): { threadId: string; reusedWs?: WebSocket; reusedOutpostId?: string } | undefined {
-    const key = this.warmKey(scope, conversationKey, slotId, isIncognito, prefixHash);
+    const key = this.warmKey(scope, conversationKey, slotId, isIncognito, prefixHash, chatAgentId);
     const hit = this.warmThreads.get(key);
     if (!hit) return undefined;
 
@@ -709,15 +730,16 @@ export class QuickExecutionEngine {
     conversationKey: string | undefined;
     slotId: string;
     isIncognito: boolean;
+    chatAgentId?: string;
     prefixHashes: readonly string[];
     threadId: string;
     ws?: WebSocket;
     outpostId?: string;
     encodeFrame?: (frame: Record<string, unknown>) => Uint8Array | string;
   }): boolean {
-    const { scope, conversationKey, slotId, isIncognito, prefixHashes, threadId, ws, outpostId, encodeFrame } = params;
+    const { scope, conversationKey, slotId, isIncognito, chatAgentId, prefixHashes, threadId, ws, outpostId, encodeFrame } = params;
     const keys = Array.from(
-      new Set(prefixHashes.filter(Boolean).map((h) => this.warmKey(scope, conversationKey, slotId, isIncognito, h))),
+      new Set(prefixHashes.filter(Boolean).map((h) => this.warmKey(scope, conversationKey, slotId, isIncognito, h, chatAgentId))),
     );
     if (keys.length === 0) return false;
 
@@ -843,6 +865,7 @@ export class QuickExecutionEngine {
     this.modelListFetcher = options.modelListFetcher;
     this.incognito = process.env.INCOGNITO !== "false";
     this.autoDeleteSession = process.env.AUTO_DELETE_SESSION === "true";
+    this.autoEnsureCodingAgent = process.env.AUTO_ENSURE_CODING_AGENT !== "false";
     this.showRoutedModelInThinking = process.env.SHOW_ROUTED_MODEL_IN_THINKING !== "false";
     this.suppressLateRoutedThinkingInStream =
       process.env.SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM === "true";
@@ -1026,6 +1049,448 @@ export class QuickExecutionEngine {
     });
   }
 
+  private async openControlWs(
+    apiKey: string,
+    proxyUrl?: string,
+  ): Promise<{
+    ws: WebSocket;
+    encodeFrame: (frame: Record<string, unknown>) => Uint8Array | string;
+    decodeFrame: typeof decodeCloudOutputFrame;
+  }> {
+    const cred = parseQuickCredential(apiKey);
+    const isWeb = cred.mode === "web" && !!cred.web;
+    const encodeFrame = isWeb ? encodeGatewayJsonFrame : encodeCloudInputFrame;
+    const decodeFrame = isWeb ? decodeGatewayFrame : decodeCloudOutputFrame;
+    const workingSessionId = crypto.randomUUID();
+    const effectiveProxy = proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    const wsAgent = getProxyAgent(effectiveProxy);
+
+    let ws: WebSocket;
+    if (isWeb && cred.web) {
+      const conn = buildWebWsConnection(cred.web, workingSessionId);
+      ws = new WebSocket(conn.url, conn.protocols, {
+        headers: conn.headers,
+        ...(wsAgent ? { agent: wsAgent } : {}),
+      });
+    } else if (cred.mode === "oauth" && cred.oauth) {
+      const { accessToken } = await resolveOAuthAccessToken(cred.oauth, false, proxyUrl);
+      const outpostId = deriveStableOutpostId(cred.oauth.clientId);
+      const wsUrl =
+        `wss://${cred.oauth.wsHost}/streaming/quickwork-chat-bidirectional-stream` +
+        `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
+        `&token=${encodeURIComponent(accessToken)}` +
+        `&outpostId=${encodeURIComponent(outpostId)}` +
+        `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
+        `&channel=prod`;
+      ws = new WebSocket(wsUrl, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": QUICK_DESKTOP_USER_AGENT,
+          "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+          "X-Surface-Type": SURFACE_TYPE,
+          "X-Outpost-Id": outpostId,
+          "X-Agent-Service-Type": "UNIFIED_QUICK",
+          "X-Working-Session-Id": workingSessionId,
+        },
+        ...(wsAgent ? { agent: wsAgent } : {}),
+      });
+    } else {
+      const outpost = await getSharedOutpost();
+      if (cred.mode === "token" && cred.jwt) {
+        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+      } else {
+        outpost.setImportedToken(null);
+      }
+      const [session, oid] = await Promise.all([outpost.getSncsSession(), outpost.getOutpostId()]);
+      if (!session.jwt || !session.wsHost) {
+        throw new GatewayError("AWS Quick session unavailable.", 502, "upstream_auth_error");
+      }
+      const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
+      const wsUrl =
+        `wss://${session.wsHost}${wsPath}` +
+        `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
+        `&token=${encodeURIComponent(session.jwt)}` +
+        `&outpostId=${encodeURIComponent(oid)}` +
+        `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
+        `&channel=prod`;
+      ws = new WebSocket(wsUrl, {
+        headers: {
+          Authorization: `Bearer ${session.jwt}`,
+          "X-Surface-Type": SURFACE_TYPE,
+          "X-Outpost-Id": oid,
+          "X-Agent-Service-Type": "UNIFIED_QUICK",
+          "X-Working-Session-Id": workingSessionId,
+        },
+        ...(wsAgent ? { agent: wsAgent } : {}),
+      });
+    }
+    return { ws, encodeFrame, decodeFrame };
+  }
+
+  /**
+   * Lists all AWS Quick chat agents (default SYSTEM + user custom agents) on the given account
+   * using the native `get_chat_agents` -> `chat_agents_updated` WebSocket protocol.
+   */
+  async listChatAgentsForKey(apiKey: string, proxyUrl?: string): Promise<QuickChatAgentInfo[]> {
+    const { ws, encodeFrame, decodeFrame } = await this.openControlWs(apiKey, proxyUrl);
+    return new Promise<QuickChatAgentInfo[]>((resolve, reject) => {
+      let recvBuf = Buffer.alloc(0);
+      let settled = false;
+      let sent = false;
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { ws.close(); } catch { }
+        fn();
+      };
+      const timer = setTimeout(() => {
+        done(() => reject(new GatewayError("Timed out listing AWS Quick custom agents.", 504, "timeout_error")));
+      }, 10_000);
+      timer.unref?.();
+
+      ws.on("message", (data: Buffer) => {
+        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
+        const { messages, consumed } = drainEventStream(recvBuf, 0);
+        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        for (const esMsg of messages) {
+          let decoded;
+          try { decoded = decodeFrame(esMsg); } catch { continue; }
+          if (!decoded) continue;
+          if (decoded.type === "error") {
+            done(() => reject(new GatewayError(`[${decoded.code}] ${decoded.message}`, 502, "upstream_error")));
+            return;
+          }
+          const evType = String(decoded.data?.type || "");
+          const payload = (decoded.data?.payload && typeof decoded.data.payload === "object"
+            ? decoded.data.payload
+            : {}) as Record<string, unknown>;
+          if ((evType === "session_established" || evType === "connected") && !sent) {
+            sent = true;
+            try { ws.send(encodeFrame({ type: "get_chat_agents", payload: {} })); } catch { }
+          } else if (evType === "chat_agents_updated") {
+            const rawAgents = Array.isArray(payload.agents) ? payload.agents : [];
+            const agents: QuickChatAgentInfo[] = [];
+            for (const item of rawAgents) {
+              if (!item || typeof item !== "object") continue;
+              const rec = item as Record<string, unknown>;
+              const rawId = typeof rec.agentId === "string" ? rec.agentId.trim() : "";
+              if (!rawId) continue;
+              const shortId = rawId.includes("/") ? rawId.slice(rawId.lastIndexOf("/") + 1) : rawId;
+              const isSystem =
+                shortId.toUpperCase() === "SYSTEM" ||
+                rawId.endsWith("/SYSTEM") ||
+                rec.isSystemDefault === true;
+              agents.push({
+                agentId: rawId,
+                shortId,
+                name: typeof rec.name === "string" ? rec.name : shortId,
+                description: typeof rec.description === "string" ? rec.description : "",
+                systemPrompt: typeof rec.systemPrompt === "string" ? rec.systemPrompt : "",
+                isSystem,
+              });
+            }
+            done(() => resolve(agents));
+            return;
+          }
+        }
+      });
+
+      ws.once("error", (err) => done(() => reject(err)));
+      ws.once("close", () => done(() => resolve([])));
+    });
+  }
+
+  /**
+   * Creates and publishes a minimal coding custom agent on the given AWS Quick account via native WS frames:
+   * `create_agent_draft` -> `update_chat_agent_config` -> `publish_agent_draft`.
+   */
+  async createAndPublishCodingAgentForKey(
+    apiKey: string,
+    opts?: { name?: string; description?: string; instructions?: string },
+    proxyUrl?: string,
+  ): Promise<{ agentId: string; name: string }> {
+    const name = opts?.name?.trim() || DEFAULT_CODING_AGENT_NAME;
+    const description = opts?.description?.trim() || DEFAULT_CODING_AGENT_DESCRIPTION;
+    const instructions = opts?.instructions?.trim() || DEFAULT_CODING_AGENT_INSTRUCTIONS;
+    const { ws, encodeFrame, decodeFrame } = await this.openControlWs(apiKey, proxyUrl);
+
+    return new Promise<{ agentId: string; name: string }>((resolve, reject) => {
+      let recvBuf = Buffer.alloc(0);
+      let settled = false;
+      let stage: "init" | "creating" | "updating" | "publishing" = "init";
+      let draftAgentId = "";
+      let publishFallbackTimer: NodeJS.Timeout | null = null;
+
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
+        try { ws.close(); } catch { }
+        fn();
+      };
+      const timer = setTimeout(() => {
+        done(() => reject(new GatewayError("Timed out creating AWS Quick custom agent.", 504, "timeout_error")));
+      }, 15_000);
+      timer.unref?.();
+
+      const triggerPublish = () => {
+        if (stage !== "updating" || !draftAgentId || settled) return;
+        stage = "publishing";
+        if (publishFallbackTimer) {
+          clearTimeout(publishFallbackTimer);
+          publishFallbackTimer = null;
+        }
+        try {
+          ws.send(encodeFrame({ type: "publish_agent_draft", payload: { agent_id: draftAgentId } }));
+        } catch (err) {
+          done(() => reject(err));
+        }
+      };
+
+      ws.on("message", (data: Buffer) => {
+        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
+        const { messages, consumed } = drainEventStream(recvBuf, 0);
+        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        for (const esMsg of messages) {
+          let decoded;
+          try { decoded = decodeFrame(esMsg); } catch { continue; }
+          if (!decoded) continue;
+          if (decoded.type === "error") {
+            done(() => reject(new GatewayError(`[${decoded.code}] ${decoded.message}`, 502, "upstream_error")));
+            return;
+          }
+          const evType = String(decoded.data?.type || "");
+          const payload = (decoded.data?.payload && typeof decoded.data.payload === "object"
+            ? decoded.data.payload
+            : {}) as Record<string, unknown>;
+
+          if ((evType === "session_established" || evType === "connected") && stage === "init") {
+            stage = "creating";
+            try { ws.send(encodeFrame({ type: "create_agent_draft", payload: { new_agent: true } })); } catch { }
+          } else if (evType === "agent_draft_created" && stage === "creating") {
+            const id = typeof payload.agent_id === "string" ? payload.agent_id.trim() : "";
+            if (!id) {
+              done(() => reject(new GatewayError("AWS Quick returned empty draft agent_id.", 502, "upstream_error")));
+              return;
+            }
+            draftAgentId = id;
+            stage = "updating";
+            try {
+              ws.send(
+                encodeFrame({
+                  type: "update_chat_agent_config",
+                  payload: {
+                    agent_id: draftAgentId,
+                    target: "draft",
+                    name,
+                    description,
+                    instructions,
+                  },
+                }),
+              );
+            } catch (err) {
+              done(() => reject(err));
+              return;
+            }
+            publishFallbackTimer = setTimeout(() => triggerPublish(), 1_500);
+            publishFallbackTimer.unref?.();
+          } else if (evType === "agent_draft_saved" && stage === "updating") {
+            triggerPublish();
+          } else if (evType === "publish_agent_draft_success") {
+            const finalId =
+              (typeof payload.agent_id === "string" && payload.agent_id.trim()) || draftAgentId;
+            done(() => resolve({ agentId: finalId, name }));
+            return;
+          } else if (
+            evType === "publish_agent_draft_error" ||
+            evType === "update_chat_agent_config_error" ||
+            evType === "error"
+          ) {
+            const errMsg = typeof payload.error === "string" ? payload.error : evType;
+            done(() => reject(new GatewayError(`Failed to create custom agent: ${errMsg}`, 502, "upstream_error")));
+            return;
+          }
+        }
+      });
+
+      ws.once("error", (err) => done(() => reject(err)));
+      ws.once("close", () => {
+        if (!settled) done(() => reject(new GatewayError("WebSocket closed before custom agent finished publishing.", 502, "upstream_error")));
+      });
+    });
+  }
+
+  /**
+   * Updates an existing custom agent's instructions (and optional name/description) via native WS frames:
+   * `create_agent_draft(agent_id)` -> `update_chat_agent_config` -> `publish_agent_draft`.
+   */
+  async updateAndPublishAgentForKey(
+    apiKey: string,
+    agentId: string,
+    opts: { instructions: string; name?: string; description?: string },
+    proxyUrl?: string,
+  ): Promise<{ agentId: string }> {
+    const cleanId = agentId.trim();
+    if (!cleanId) throw new GatewayError("`agentId` is required.", 400, "invalid_request_error");
+    const instructions = opts.instructions.trim();
+    const { ws, encodeFrame, decodeFrame } = await this.openControlWs(apiKey, proxyUrl);
+
+    return new Promise<{ agentId: string }>((resolve, reject) => {
+      let recvBuf = Buffer.alloc(0);
+      let settled = false;
+      let stage: "init" | "drafting" | "updating" | "publishing" = "init";
+      let publishFallbackTimer: NodeJS.Timeout | null = null;
+
+      const done = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
+        try { ws.close(); } catch { }
+        fn();
+      };
+      const timer = setTimeout(() => {
+        done(() => reject(new GatewayError("Timed out updating AWS Quick custom agent.", 504, "timeout_error")));
+      }, 15_000);
+      timer.unref?.();
+
+      const triggerPublish = () => {
+        if (stage !== "updating" || settled) return;
+        stage = "publishing";
+        if (publishFallbackTimer) {
+          clearTimeout(publishFallbackTimer);
+          publishFallbackTimer = null;
+        }
+        try {
+          ws.send(encodeFrame({ type: "publish_agent_draft", payload: { agent_id: cleanId } }));
+        } catch (err) {
+          done(() => reject(err));
+        }
+      };
+
+      ws.on("message", (data: Buffer) => {
+        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
+        const { messages, consumed } = drainEventStream(recvBuf, 0);
+        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        for (const esMsg of messages) {
+          let decoded;
+          try { decoded = decodeFrame(esMsg); } catch { continue; }
+          if (!decoded) continue;
+          if (decoded.type === "error") {
+            done(() => reject(new GatewayError(`[${decoded.code}] ${decoded.message}`, 502, "upstream_error")));
+            return;
+          }
+          const evType = String(decoded.data?.type || "");
+          const payload = (decoded.data?.payload && typeof decoded.data.payload === "object"
+            ? decoded.data.payload
+            : {}) as Record<string, unknown>;
+
+          if ((evType === "session_established" || evType === "connected") && stage === "init") {
+            stage = "drafting";
+            try {
+              ws.send(encodeFrame({ type: "create_agent_draft", payload: { agent_id: cleanId, ccp_files_supported: true } }));
+            } catch { }
+          } else if (evType === "agent_draft_created" && stage === "drafting") {
+            stage = "updating";
+            try {
+              ws.send(
+                encodeFrame({
+                  type: "update_chat_agent_config",
+                  payload: {
+                    agent_id: cleanId,
+                    target: "draft",
+                    instructions,
+                    ...(opts.name?.trim() ? { name: opts.name.trim() } : {}),
+                    ...(typeof opts.description === "string" ? { description: opts.description.trim() } : {}),
+                  },
+                }),
+              );
+            } catch (err) {
+              done(() => reject(err));
+              return;
+            }
+            publishFallbackTimer = setTimeout(() => triggerPublish(), 1_500);
+            publishFallbackTimer.unref?.();
+          } else if (evType === "agent_draft_saved" && stage === "updating") {
+            triggerPublish();
+          } else if (evType === "publish_agent_draft_success") {
+            done(() => resolve({ agentId: cleanId }));
+            return;
+          } else if (
+            evType === "publish_agent_draft_error" ||
+            evType === "update_chat_agent_config_error" ||
+            evType === "error"
+          ) {
+            const errMsg = typeof payload.error === "string" ? payload.error : evType;
+            done(() => reject(new GatewayError(`Failed to update custom agent: ${errMsg}`, 502, "upstream_error")));
+            return;
+          }
+        }
+      });
+
+      ws.once("error", (err) => done(() => reject(err)));
+      ws.once("close", () => {
+        if (!settled) done(() => reject(new GatewayError("WebSocket closed before custom agent finished publishing.", 502, "upstream_error")));
+      });
+    });
+  }
+
+  /**
+   * Finds an existing custom agent on the account (preferring `Quick2API Bridge`, otherwise
+   * any existing non-SYSTEM custom agent) or creates & publishes one, then binds it to `slotId`.
+   * Deduplicates concurrent calls per `slotId` and fails open on errors.
+   */
+  async ensureCodingAgentForKey(
+    apiKey: string,
+    slotId: string,
+    keyPool: UpstreamKeyPool,
+    proxyUrl?: string,
+    opts?: { forceCreate?: boolean },
+  ): Promise<string | undefined> {
+    const existingPromise = this.ensuringAgentBySlot.get(slotId);
+    if (existingPromise && !opts?.forceCreate) {
+      return existingPromise;
+    }
+
+    const work = (async (): Promise<string | undefined> => {
+      try {
+        if (!opts?.forceCreate) {
+          const agents = await this.listChatAgentsForKey(apiKey, proxyUrl);
+          const customAgents = agents.filter((a) => !a.isSystem);
+          const knownNames = new Set(LEGACY_CODING_AGENT_NAMES.map((n) => n.toLowerCase()));
+          const preferred =
+            customAgents.find((a) => knownNames.has(a.name.trim().toLowerCase())) ||
+            customAgents[0];
+          if (preferred) {
+            const chosenId = preferred.shortId || preferred.agentId;
+            keyPool.updateSlotMeta(slotId, { chatAgentId: chosenId });
+            this.autoEnsureFailedSlots.delete(slotId);
+            return chosenId;
+          }
+        }
+        const templatePrompt = keyPool.getSettings().customAgentPrompt || DEFAULT_CODING_AGENT_INSTRUCTIONS;
+        const created = await this.createAndPublishCodingAgentForKey(
+          apiKey,
+          { instructions: templatePrompt },
+          proxyUrl,
+        );
+        keyPool.updateSlotMeta(slotId, { chatAgentId: created.agentId });
+        this.autoEnsureFailedSlots.delete(slotId);
+        return created.agentId;
+      } catch {
+        this.autoEnsureFailedSlots.set(slotId, Date.now());
+        return undefined;
+      } finally {
+        this.ensuringAgentBySlot.delete(slotId);
+      }
+    })();
+
+    this.ensuringAgentBySlot.set(slotId, work);
+    return work;
+  }
+
   async *executeTurnWithPool(
     turn: ParsedProtocolTurn,
     keyPool: UpstreamKeyPool,
@@ -1039,10 +1504,33 @@ export class QuickExecutionEngine {
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     const excluded = new Set<string>();
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 5);
+    let retriedSameSlotConnLimit = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const lease = keyPool.leaseKey(turn.requestedModel, excluded.size > 0 ? excluded : undefined, turn.conversationKey);
-      const isIncognito = keyPool.getSettings().incognitoMode;
+      const poolSettings = keyPool.getSettings();
+      const isIncognito = poolSettings.incognitoMode;
+      const shouldAutoEnsure =
+        poolSettings.autoEnsureCodingAgent !== undefined
+          ? poolSettings.autoEnsureCodingAgent
+          : this.autoEnsureCodingAgent;
+      let effectiveChatAgentId = (lease.chatAgentId || poolSettings.chatAgentId || "").trim() || undefined;
+      if (
+        !effectiveChatAgentId &&
+        shouldAutoEnsure &&
+        !turn.rawBody?.__internalSummary &&
+        !turn.signal?.aborted
+      ) {
+        const failedAt = this.autoEnsureFailedSlots.get(lease.slotId);
+        if (!failedAt || Date.now() - failedAt > 10 * 60 * 1000) {
+          effectiveChatAgentId = await this.ensureCodingAgentForKey(
+            lease.apiKey,
+            lease.slotId,
+            keyPool,
+            lease.proxyUrl,
+          ).catch(() => undefined);
+        }
+      }
       let yieldedOutput = false;
       let lastExecMode: ExecutionModeTag | undefined;
       const wrappedMeta: typeof onExecMeta = (meta) => {
@@ -1051,7 +1539,7 @@ export class QuickExecutionEngine {
       };
 
       try {
-        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta)) {
+        for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId)) {
           if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
             yieldedOutput = true;
           }
@@ -1072,7 +1560,7 @@ export class QuickExecutionEngine {
           gwErr.code !== "content_filtered"
         ) {
           try {
-            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta)) {
+            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId)) {
               if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
                 yieldedOutput = true;
               }
@@ -1094,9 +1582,24 @@ export class QuickExecutionEngine {
           isProxyOrConnErr,
         } = classifyUpstreamError(finalErr);
 
-        if (isConnLimitErr) {
-          // Immediately free all parked idle WebSockets on this account so subsequent turns succeed.
-          this.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY);
+        const evictedParked = isConnLimitErr
+          ? this.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
+          : 0;
+
+        // If we hit AWS's 5-connection ceiling and just freed parked idle sockets on this slot,
+        // wait 200ms for AWS to register the TCP close and retry the same slot once without
+        // penalizing a healthy single-account pool with a 30s rate-limit cooldown.
+        if (
+          isConnLimitErr &&
+          evictedParked > 0 &&
+          !retriedSameSlotConnLimit &&
+          !yieldedOutput &&
+          !turn.signal?.aborted
+        ) {
+          retriedSameSlotConnLimit = true;
+          await new Promise<void>((r) => setTimeout(r, 200));
+          attempt -= 1;
+          continue;
         }
 
         if (isQuotaErr) {
@@ -1138,12 +1641,15 @@ export class QuickExecutionEngine {
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
     }) => void,
+    chatAgentId?: string,
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     // Resolve model BEFORE consuming any parked warm WS so there is no async vacuum window
     // where a parked WS has no error/close listeners or leaks if model resolution fails.
     const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
 
-    const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice);
+    const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice, {
+      compactForCustomAgent: Boolean(chatAgentId),
+    });
     const customPromptParts: string[] = [];
     if (turn.systemPrompt?.trim()) {
       customPromptParts.push(
@@ -1157,7 +1663,7 @@ export class QuickExecutionEngine {
       !(isIncognito && this.autoDeleteSession) &&
         turn.priorPrefixHash &&
         turn.incrementalUserText !== undefined
-        ? this.lookupWarmThread(turn.scope, turn.conversationKey, lease.slotId, isIncognito, turn.priorPrefixHash)
+        ? this.lookupWarmThread(turn.scope, turn.conversationKey, lease.slotId, isIncognito, turn.priorPrefixHash, chatAgentId)
         : undefined;
     let warmThreadId = warmHit?.threadId;
     let reusedWs = warmHit?.reusedWs;
@@ -1255,7 +1761,7 @@ export class QuickExecutionEngine {
       if (initialCompact.compacted) {
         let middleSummary: string | undefined;
         if (process.env.AUTO_COMPACT_SUMMARY !== "false" && initialCompact.middleSample) {
-          middleSummary = await this.summarizeOverflowMiddle(initialCompact.middleSample, lease, turn.signal).catch(() => undefined);
+          middleSummary = await this.summarizeOverflowMiddle(initialCompact.middleSample, lease, turn.signal, chatAgentId).catch(() => undefined);
         }
         prompt = middleSummary
           ? compactOversizedPrompt(prompt, customPrompt, overflowLimit, middleSummary).prompt
@@ -1518,6 +2024,7 @@ export class QuickExecutionEngine {
             conversationKey: turn.conversationKey,
             slotId: lease.slotId,
             isIncognito,
+            ...(chatAgentId ? { chatAgentId } : {}),
             prefixHashes: nextHashes,
             threadId: realThreadId,
             // Never park a WS that finished via post-usage watchdog (late upstream frames could contaminate next turn).
@@ -1577,6 +2084,7 @@ export class QuickExecutionEngine {
             ...(isFinal && attachments.length > 0 ? { attachments } : {}),
             message_id: crypto.randomUUID(),
             agent_mode: isFinal ? selection.agentMode : "fast",
+            ...(chatAgentId ? { chat_agent_id: chatAgentId } : {}),
             ...(isFinal && selection.agentMode !== "fast" ? { thinking_effort: selection.thinkingEffort } : {}),
             auto_routing: isFinal && turn.requestedModel.trim().toLowerCase() === "auto",
             web_search_enabled: isFinal ? this.webSearchEnabled : false,
@@ -1629,19 +2137,29 @@ export class QuickExecutionEngine {
         const evType = String(ev.type || "");
         const payload = (ev.payload && typeof ev.payload === "object" ? ev.payload : {}) as Record<string, unknown>;
 
-        // Intermediate context chunks (for >50KB prompts): silently advance to next chunk on message_complete.
+        // Intermediate context chunks (for >46.5KB prompts): advance on message_complete,
+        // with an 8s post-turn_usage fallback in case AWS omits message_complete on a chunk.
+        const advanceIntermediateChunk = () => {
+          if (advancingChunk || ended || activeChunkIndex >= totalChunks - 1) return;
+          clearPostUsageTimer();
+          advancingChunk = true;
+          chunkAdvanceTimer = setTimeout(() => {
+            chunkAdvanceTimer = null;
+            activeChunkIndex += 1;
+            advancingChunk = false;
+            sendChunkMessage(activeChunkIndex);
+          }, 250);
+        };
         if (advancingChunk) {
           if (evType !== "error" && evType !== "guardrail_blocked") continue;
         }
         if (activeChunkIndex < totalChunks - 1) {
           if (evType === "message_complete") {
-            advancingChunk = true;
-            chunkAdvanceTimer = setTimeout(() => {
-              chunkAdvanceTimer = null;
-              activeChunkIndex += 1;
-              advancingChunk = false;
-              sendChunkMessage(activeChunkIndex);
-            }, 250);
+            advanceIntermediateChunk();
+            continue;
+          } else if (evType === "turn_usage") {
+            clearPostUsageTimer();
+            postUsageTimer = setTimeout(() => advanceIntermediateChunk(), 8_000);
             continue;
           } else if (evType === "error" || evType === "guardrail_blocked") {
             // Fall through to normal error handling below
@@ -1891,6 +2409,7 @@ export class QuickExecutionEngine {
     middleSample: string,
     lease: ReturnType<UpstreamKeyPool["leaseKey"]>,
     parentSignal?: AbortSignal,
+    chatAgentId?: string,
   ): Promise<string | undefined> {
     const cacheKey = crypto.createHash("sha256").update(middleSample).digest("hex");
     const now = Date.now();
@@ -1923,7 +2442,7 @@ export class QuickExecutionEngine {
       };
       let out = "";
       const subLease = { ...lease, release: () => { }, markSuccess: () => { } };
-      for await (const ev of this.executeTurnWithLease(summaryTurn, subLease, true)) {
+      for await (const ev of this.executeTurnWithLease(summaryTurn, subLease, true, undefined, chatAgentId)) {
         if (ev.type === "text") out += ev.text;
       }
       const trimmed = out.trim();

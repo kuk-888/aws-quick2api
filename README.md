@@ -20,9 +20,13 @@
   - Web 管理台内置 **2 步 OAuth PKCE 网页授权**（自动发现租户分片、90 天自动续期、自动提取真实邮箱与用户名）。
   - 支持浏览器 `Copy as cURL` 导入 Cookie、JSON 批量导入导出，以及 macOS 本机 `local-outpost` 会话复用。
 - **长上下文与流式稳定性**：
-  - 超长输入自动按 `≤50 KB` UTF-8 安全分片；流式请求超 50 KB 时提前发 `HTTP 200` + `: keepalive` 心跳，避免经过 Cloudflare / 反代时触发 `524` 超时。
+  - 超长输入自动按 `≤46.5 KB`（按 JSON 转义后 UTF-8 字节精准计算）安全分片，中间分片内置 `turn_usage` 8s 兜底防卡死；流式请求超 16 KB 或带工具调用时提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），避免经过 Cloudflare / 反代时触发 `524` 超时。
   - 超 `850K` tokens 时触发网关兜底裁剪/摘要（`AUTO_COMPACT_OVERFLOW_TOKENS`，低于阈值完全不介入，不影响客户端 Prompt Cache 命中）。
   - 内置流式 XML 净化器：自动将 AWS Quick 私有的 `<decision>` / `<decisions>` / `<artifact>` 交互标签转为标准 Markdown，同时保护代码块原样输出。
+- **自定义 Agent 自动绑定与零污染工具桥接**：
+  - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Quick2API Bridge`，持久化写入 `.env`（后续 0ms 额外开销）。
+  - 自定义 Agent 生效后自动切换极简工具桥接（去除长篇防拒答文案，Opus / Sonnet 保持 `user_message` 零注入），稳定支持 Claude Code / Codex CLI / Witan 发起本地文件、`.env`、终端、MCP、Skill、`apply_patch` 等调用。
+  - Web 管理台「路由与策略」支持热更新 `AUTO_ENSURE_CODING_AGENT` 开关与全局默认提示词模板 `CUSTOM_AGENT_PROMPT`；「凭证池」点击任意账号的 **Agent** 按钮即可实时查看该账号下所有自定义 Agent、一键切换/恢复默认、一键自动创建绑定，或**在线编辑并热发布已有 Agent 提示词到 AWS Quick**。
 - **多账号调度与独立代理**：
   - 支持余量感知（`quota-aware`）、最少并发（`least-busy`）、轮询（`round-robin`）与会话粘性亲和；额度耗尽自动熔断，遇到 401/429/502/503 自动切换至健康账号。
   - 零依赖单账号独立出口代理，原生支持 `http://`、`https://`、`socks5://`、`socks5h://`（远程 DNS 解析）及常见简写（`ip:port`、`user:pass@ip:port`、`ip:port:user:pass`），内置住宅代理 `ECONNRESET` 瞬态断连自动重试。
