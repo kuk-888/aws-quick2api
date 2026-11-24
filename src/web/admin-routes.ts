@@ -535,10 +535,43 @@ export async function tryHandleWebAdminRoute(
       throw new GatewayError("`action` and `slotIds` array required.", 400, "invalid_request_error");
     }
     const action = body.action;
-    if (action !== "enable" && action !== "disable" && action !== "delete") {
+    if (action !== "enable" && action !== "disable" && action !== "delete" && action !== "recheck") {
       throw new GatewayError("Unsupported batch action.", 400, "invalid_request_error");
     }
     const ids = body.slotIds.filter((x): x is string => typeof x === "string");
+    if (action === "recheck") {
+      const validIds: string[] = [];
+      for (const id of ids) {
+        try {
+          keyPool.recheckSlot(id);
+          validIds.push(id);
+        } catch {
+          // skip missing slotId
+        }
+      }
+      const reports = validIds.length
+        ? await ctx.syncKeyQuotas({ includeDisabled: true, forceRefresh: true, slotIds: validIds }).catch(() => [] as AccountQuotaReport[])
+        : [];
+      const lang = resolveAdminLang(req);
+      for (const id of validIds) {
+        const target = keyPool.allManagedKeys().find((k) => k.slotId === id);
+        if (!target) continue;
+        const masked = keyPool.statusSnapshot().find((s) => s.slotId === id)?.maskedKey;
+        const mine = reports.find((r) => r.maskedKey === masked);
+        if (mine?.status === "error" && /HTTP (401|403)\b/.test(mine.error ?? "")) {
+          keyPool.reportAuthFailure(
+            target.rawKey,
+            lang === "zh" ? "重新检测仍被上游拒绝" : "Recheck rejected by upstream (401/403)."
+          );
+        }
+      }
+      const snap = keyPool.statusSnapshot();
+      const checked = snap.filter((s) => validIds.includes(s.slotId));
+      const okCount = checked.filter((s) => s.enabled && !s.lastSyncError).length;
+      const failedCount = checked.length - okCount;
+      sendJson(res, 200, { ok: true, affected: validIds.length, okCount, failedCount, reports, keyPool: snap });
+      return true;
+    }
     let affected = 0;
     for (const id of ids) {
       try {

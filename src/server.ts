@@ -457,9 +457,11 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         if (ev.type === "usage") {
           if (ev.metrics.resolvedModel) routedModel = ev.metrics.resolvedModel;
           usage = {
-            inputTokens: ev.metrics.inputTokens,
-            cacheReadTokens: ev.metrics.cacheReadTokens,
-            outputTokens: ev.metrics.outputTokens
+            // Include cacheWriteTokens in uncached inputTokens so prompt cache hit rate
+            // reflects cacheRead / (input + cacheWrite + cacheRead) instead of inflating to 100%.
+            inputTokens: (ev.metrics.inputTokens || 0) + (ev.metrics.cacheWriteTokens || 0),
+            cacheReadTokens: ev.metrics.cacheReadTokens || 0,
+            outputTokens: ev.metrics.outputTokens || 0
           };
         }
         yield ev;

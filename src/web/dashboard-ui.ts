@@ -454,6 +454,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     tr:hover td.ops-cell, tr.clickable-row:hover td.ops-cell { background: var(--panel-hover); }
     tr.row-picked td.ops-cell { background: var(--subtle); }
     .ops-stack { display: flex; flex-wrap: nowrap; gap: 4px; width: max-content; }
+    .ops-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, max-content)); gap: 4px; width: max-content; }
     .bill-cell, .run-cell { white-space: normal; max-width: 220px; }
     .bill-cell > div, .run-cell > div { white-space: normal; }
 
@@ -881,8 +882,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                   <tr>
                     <th>状态</th>
                     <th>账号信息</th>
-                    <th>额度余量</th>
-                    <th>粘性会话 / 调度</th>
+                    <th style="min-width:175px;">额度余量</th>
+                    <th>运行与调度</th>
                   </tr>
                 </thead>
                 <tbody id="overviewAccountsBody"></tbody>
@@ -995,6 +996,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 <span style="font-size:12px;color:var(--fg-muted);" id="credSelSummary">已选 0 项</span>
               </div>
               <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                <button type="button" id="credBatchRecheckBtn">批量检测</button>
                 <button type="button" id="credClearSessionsBtn">清理会话</button>
                 <button type="button" id="credBatchImportBtn">导入 JSON</button>
                 <input type="file" id="credBatchImportFile" accept=".json,application/json" style="display:none;" />
@@ -1621,7 +1623,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "高级 API 已用额度": "Premium API Used",
       "Bot 额度": "Bot Quota",
       "总额度池 / 按需支出": "Included / On-Demand",
-      "粘性会话 / 调度": "Sticky / Dispatched",
+      "运行与调度": "Status & Dispatch",
+      "批量检测": "Batch Check",
       "最近请求": "Recent Requests",
       "仅元数据，网关不保存任何对话内容": "Metadata only; conversation text is never retained",
       "全部 IP": "All IPs",
@@ -2107,6 +2110,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
     function switchTab(tab) {
       activeTab = tab;
+      if (tabTitles[tab]) { try { localStorage.setItem("aq_active_tab", tab); } catch {} }
       document.querySelectorAll(".nav-item").forEach((b) => b.classList.toggle("active", b.getAttribute("data-tab") === tab));
       document.querySelectorAll(".view-pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
       $("topbarTitle").textContent = tabTitles[tab] ? tabTitles[tab]() : tr("控制台", "Console");
@@ -2175,7 +2179,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
 
     // ==================== OVERVIEW (ledger-backed charts) ====================
-    let ovRange = "today";
+    const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+    const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch {} };
+    const savedOvRange = lsGet("aq_ov_range");
+    let ovRange = (savedOvRange === "today" || savedOvRange === "7d" || savedOvRange === "30d") ? savedOvRange : "today";
+    if (ovRange !== "today") {
+      document.querySelectorAll("#ovRangeSeg button").forEach((b) => b.classList.toggle("active", b.getAttribute("data-arg") === ovRange));
+    }
     let ovDistMode = "model";
     const OV_COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#a855f7", "#ef4444", "#06b6d4", "#84cc16", "#8e8e96"];
 
@@ -2492,8 +2502,133 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
     window.setOvRange = (r) => {
       ovRange = r;
+      lsSet("aq_ov_range", r);
       document.querySelectorAll("#ovRangeSeg button").forEach((b) => b.classList.toggle("active", b.getAttribute("data-arg") === r));
       void loadOverview();
+    };
+
+    const shortPlan = (raw) => {
+      const s = String(raw || "").toUpperCase();
+      if (!s || s === "—") return "";
+      if (s === "QUICK_LITE_FREE_TRIAL") return "FREE TRIAL";
+      if (s.startsWith("QUICK_")) return s.replace(/^QUICK_/, "").replace(/_/g, " ");
+      return s;
+    };
+    const renderAuthTag = (s) => {
+      const t = s.authType || (String(s.maskedKey || "").startsWith("oauth:") ? "oauth" : String(s.maskedKey || "").startsWith("web:") ? "cookie" : "outpost");
+      if (t === "oauth") return '<span class="tag" style="background:var(--subtle);color:var(--fg);border-color:var(--border-strong);">' + esc(tr("OAuth 90天", "OAuth 90d")) + '</span>';
+      if (t === "cookie") return '<span class="tag tag-warn">Cookie</span>';
+      return '<span class="tag">' + esc(tr("本机桌面", "Desktop")) + '</span>';
+    };
+    const cleanMonthlyText = (raw) => String(raw || "").replace(/^Monthly\s+/i, "");
+    const fmtHmDur = (mins) => {
+      const m = Math.max(1, Math.round(mins));
+      const h = Math.floor(m / 60);
+      const rem = m % 60;
+      if (h > 0 && rem > 0) return h + "h " + rem + "m";
+      if (h > 0) return h + "h";
+      return rem + "m";
+    };
+    const fmtClockHm = (isoOrMs) => {
+      const d = new Date(isoOrMs);
+      if (Number.isNaN(d.getTime())) return "";
+      return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+    };
+    const formatShortDisableReason = (reason, kind, autoRecoverAt) => {
+      const r = String(reason || "");
+      const recMs = autoRecoverAt ? Date.parse(autoRecoverAt) : NaN;
+      const isShortRecover = Number.isFinite(recMs) && recMs > Date.now() && (recMs - Date.now()) <= 24 * 3600 * 1000;
+      const recClock = isShortRecover ? fmtClockHm(recMs) : "";
+      if (/Monthly 10h pool/i.test(r)) return tr("月度 10h 额度已满", "Monthly 10h pool exhausted");
+      if (/Session burst pool/i.test(r)) return recClock ? tr("短时已满 · " + recClock + " 自动恢复", "5h full · auto " + recClock) : tr("短时窗口已满 · 待恢复", "5h burst exhausted · waiting");
+      if (/usage limit|quota[_ ]exhausted/i.test(r) || kind === "quota") return recClock ? tr("限额熔断 · " + recClock + " 自动恢复", "Limit tripped · auto " + recClock) : tr("触发限额熔断 · 待恢复", "Usage limit tripped · waiting");
+      if (kind === "auth" || /auth/i.test(r)) return tr("认证失效 · 请重新授权", "Auth expired · re-authorize");
+      return r.length > 28 ? (r.slice(0, 28) + "…") : r;
+    };
+    const buildAccountInfoHtml = (s) => {
+      const q = s.quota || {};
+      const idt = s.identity || {};
+      const hasQuota = Boolean(q.premiumApiPool && q.premiumApiPool.usedPercent != null);
+      const realEmail = idt.userEmail && idt.userEmail.includes("@") ? idt.userEmail : "";
+      const title = s.label || realEmail || idt.userEmail || ("Account #" + (s.slotId || "").slice(0, 4));
+      const subParts = [];
+      if (realEmail && realEmail !== title) subParts.push(realEmail);
+      if (idt.displayName) subParts.push(idt.displayName);
+      if (!subParts.length && !hasQuota && !realEmail) subParts.push(tr("等待同步账号信息", "Pending sync"));
+      const planStr = shortPlan(q.membershipType);
+      const shortAgentId = s.chatAgentId
+        ? (s.chatAgentId.length > 16 ? (s.chatAgentId.slice(0, 8) + "…" + s.chatAgentId.slice(-4)) : s.chatAgentId)
+        : "";
+      return '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
+          '<span style="font-weight:600;">' + esc(title) + '</span>' +
+          renderAuthTag(s) +
+          (planStr ? '<span class="tag">' + esc(planStr) + '</span>' : '') +
+        '</div>' +
+        (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
+        (s.maskedProxy ? '<div class="mono" style="font-size:10.5px;color:var(--ok);margin-top:2px;">Proxy: ' + esc(s.maskedProxy) + '</div>' : '') +
+        (shortAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Agent: ' + esc(s.chatAgentId) + '">Agent: ' + esc(shortAgentId) + '</div>' : '');
+    };
+    const buildCompactQuotaHtml = (s, isSyncing) => {
+      if (isSyncing) {
+        return '<div style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--fg-muted);"><span class="inline-spin"></span><span>' + esc(tr("正在同步额度...", "Syncing quota...")) + '</span></div>';
+      }
+      const q = s.quota || {};
+      const hasQuota = Boolean(q.premiumApiPool && q.premiumApiPool.usedPercent != null);
+      if (!hasQuota) {
+        if (s.lastSyncError) {
+          return '<div style="font-size:11.5px;color:var(--err);font-weight:500;">' + esc(tr("同步失败", "Sync failed")) + '</div>' +
+            '<div style="font-size:10.5px;color:var(--err);margin-top:2px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(s.lastSyncError) + '</div>';
+        }
+        return '<div style="font-size:11.5px;color:var(--fg-muted);">' + esc(tr("未同步", "Not synced")) + '</div>' +
+          '<div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("点击右上角同步额度", "Click Sync Quota")) + '</div>';
+      }
+      const resetStr = q.daysRemainingInCycle != null ? (q.daysRemainingInCycle + tr("天重置", "d reset")) : "";
+      const trialStr = q.trialDaysRemaining != null ? (tr("试用 ", "Trial ") + q.trialDaysRemaining + tr("天", "d")) : "";
+      const rawMonthlyUsed = q.premiumApiPool && q.premiumApiPool.usedPercent != null ? Number(q.premiumApiPool.usedPercent) : null;
+      const monthlyUsedNum = rawMonthlyUsed != null && Number.isFinite(rawMonthlyUsed) ? rawMonthlyUsed : null;
+      const monthlyBarColor = monthlyUsedNum == null ? "var(--ok)" : monthlyUsedNum >= 90 ? "var(--err)" : monthlyUsedNum >= 75 ? "var(--warn)" : "var(--ok)";
+      const monthlyDetail = [cleanMonthlyText(q.apiDisplayMessage), resetStr].filter(Boolean).join(" · ");
+      const sessUsedNum = q.sessionPool && q.sessionPool.usedPercent != null ? Number(q.sessionPool.usedPercent) : null;
+      const sessPct = sessUsedNum != null && Number.isFinite(sessUsedNum) ? (Math.round(sessUsedNum) + "%") : "";
+      const sessBarColor = sessUsedNum == null ? "var(--ok)" : sessUsedNum >= 95 ? "var(--err)" : sessUsedNum >= 80 ? "var(--warn)" : "var(--ok)";
+      const sessResumeAtMs = q.sessionPool && q.sessionPool.resumeAt ? Date.parse(q.sessionPool.resumeAt) : NaN;
+      const sessRemainMin = Number.isFinite(sessResumeAtMs)
+        ? Math.max(0, Math.ceil((sessResumeAtMs - Date.now()) / 60000))
+        : (q.sessionPool && typeof q.sessionPool.resumeInMinutes === "number" && q.sessionPool.resumeInMinutes > 0
+            ? Math.ceil(q.sessionPool.resumeInMinutes)
+            : 0);
+      const sessResumeClock = sessRemainMin > 0
+        ? fmtClockHm(Number.isFinite(sessResumeAtMs) ? sessResumeAtMs : (Date.now() + sessRemainMin * 60000))
+        : "";
+      const sessResumeShort = sessRemainMin > 0
+        ? (fmtHmDur(sessRemainMin) + tr("后", "") + (sessResumeClock ? (" · " + sessResumeClock) : ""))
+        : "";
+      const sessResumeTitle = sessRemainMin > 0
+        ? [tr("预计 ", "Resumes ~") + (sessResumeClock || "") + tr(" 恢复（约 ", " (in ") + fmtHmDur(sessRemainMin) + tr(" 后）", ")"), trialStr].filter(Boolean).join(" · ")
+        : trialStr;
+      return '<div style="min-width:175px;max-width:215px;">' +
+          '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
+            '<span style="font-weight:600;color:' + (monthlyUsedNum != null && monthlyUsedNum >= 90 ? 'var(--err)' : 'var(--fg)') + ';white-space:nowrap;">' + esc(tr("月度 ", "Monthly ") + (monthlyUsedNum != null ? monthlyUsedNum.toFixed(1) + "%" : "—")) + '</span>' +
+            (monthlyDetail ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(monthlyDetail) + '">' + esc(monthlyDetail) + '</span>' : '') +
+          '</div>' +
+          '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
+            '<div style="height:100%;width:' + Math.max(0, Math.min(100, monthlyUsedNum || 0)) + '%;background:' + monthlyBarColor + ';border-radius:999px;"></div>' +
+          '</div>' +
+          (sessUsedNum != null && Number.isFinite(sessUsedNum)
+            ? '<div style="margin-top:6px;">' +
+                '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
+                  '<span style="color:' + (sessUsedNum >= 80 ? sessBarColor : 'var(--fg-muted)') + ';font-weight:' + (sessUsedNum >= 80 ? '600' : '500') + ';white-space:nowrap;">' + esc(tr("短时 ", "5h Burst ") + sessPct) + '</span>' +
+                  (sessResumeShort
+                    ? '<span style="font-size:10px;color:' + (sessUsedNum >= 95 ? 'var(--err)' : 'var(--warn)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(sessResumeTitle) + '">' + esc(sessResumeShort) + '</span>'
+                    : (trialStr ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;">' + esc(trialStr) + '</span>' : '')) +
+                '</div>' +
+                '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
+                  '<div style="height:100%;width:' + Math.max(0, Math.min(100, sessUsedNum)) + '%;background:' + sessBarColor + ';border-radius:999px;"></div>' +
+                '</div>' +
+              '</div>'
+            : (trialStr ? '<div style="font-size:10px;color:var(--fg-muted);margin-top:4px;">' + esc(trialStr) + '</div>' : '')) +
+        '</div>' +
+        (s.lastSyncError ? '<div style="font-size:10.5px;color:var(--err);margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(tr("最近同步失败: ", "Sync failed: ") + s.lastSyncError) + '</div>' : '');
     };
 
     function renderAll(data) {
@@ -2516,55 +2651,27 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("mActiveKeys").textContent = enabledCount + " / " + pool.length;
       $("mInflightSub").textContent = tr("活跃并发流: ", "In-flight: ") + inflight + tr(" · 自动熔断: ", " · Auto-tripped: ") + autoTripped;
 
-      const shortPlan = (raw) => {
-        const s = String(raw || "").toUpperCase();
-        if (!s || s === "—") return "";
-        if (s === "QUICK_LITE_FREE_TRIAL") return "FREE TRIAL";
-        if (s.startsWith("QUICK_")) return s.replace(/^QUICK_/, "").replace(/_/g, " ");
-        return s;
-      };
-      const renderAuthTag = (s) => {
-        const t = s.authType || (String(s.maskedKey || "").startsWith("oauth:") ? "oauth" : String(s.maskedKey || "").startsWith("web:") ? "cookie" : "outpost");
-        if (t === "oauth") return '<span class="tag" style="background:var(--subtle);color:var(--fg);border-color:var(--border-strong);">' + esc(tr("OAuth 90天", "OAuth 90d")) + '</span>';
-        if (t === "cookie") return '<span class="tag tag-warn">Cookie</span>';
-        return '<span class="tag">' + esc(tr("本机桌面", "Desktop")) + '</span>';
-      };
-      const cleanMonthlyText = (raw) => String(raw || "").replace(/^Monthly\s+/i, "");
-
-      const sortedOvPool = pool.filter((s) => s.enabled).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
-      $("overviewAccountsBody").innerHTML = sortedOvPool.length ? sortedOvPool.map((s) => {
-        const q = s.quota || {};
-        const idt = s.identity || {};
-        const hasQuota = Boolean(q.premiumApiPool && q.premiumApiPool.usedPercent != null);
-        const realEmail = idt.userEmail && idt.userEmail.includes("@") ? idt.userEmail : "";
-        const title = s.label || realEmail || idt.userEmail || ("Account #" + (s.slotId || "").slice(0, 4));
-        const subParts = [];
-        if (realEmail && realEmail !== title) subParts.push(realEmail);
-        if (idt.displayName) subParts.push(idt.displayName);
-        if (!subParts.length && !hasQuota && !realEmail) subParts.push(tr("等待同步账号信息", "Pending sync"));
-        const planStr = shortPlan(q.membershipType);
-        const sessPct = q.sessionPool && q.sessionPool.usedPercent != null ? (q.sessionPool.usedPercent + "%") : "";
-        const monthlyLine = [cleanMonthlyText(q.apiDisplayMessage), q.daysRemainingInCycle != null ? (q.daysRemainingInCycle + tr("天重置", "d reset")) : ""].filter(Boolean).join(" · ");
-        return '<tr class="clickable-row ' + (!s.enabled ? 'row-disabled' : '') + '" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '" title="' + esc(tr("点击筛选查看该账号的请求日志", "Click to filter request logs for this account")) + '">' +
-          '<td>' + renderStatusDot(s) + '</td>' +
-          '<td>' +
-            '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-              '<span style="font-weight:600;">' + esc(title) + '</span>' +
-              renderAuthTag(s) +
-              (planStr ? '<span class="tag">' + esc(planStr) + '</span>' : '') +
-            '</div>' +
-            (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
+      const onlinePool = pool.filter((s) => s.enabled).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
+      const ovLimit = 3;
+      const sortedOvPool = onlinePool.slice(0, ovLimit);
+      $("overviewAccountsBody").innerHTML = sortedOvPool.length ? (sortedOvPool.map((s) => {
+        const isSyncing = busySyncIds.has(s.slotId);
+        const rowCls = ['clickable-row', isSyncing ? 'row-busy' : ''].filter(Boolean).join(' ');
+        return '<tr class="' + rowCls + '" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '" title="' + esc(tr("点击筛选查看该账号的请求日志", "Click to filter request logs for this account")) + '">' +
+          '<td style="min-width:130px;">' +
+            '<div>' + renderStatusDot(s) + '</div>' +
+            (s.autoDisabledReason ? '<div style="font-size:10.5px;color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;max-width:165px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(s.autoDisabledReason) + '">' + esc(formatShortDisableReason(s.autoDisabledReason, s.autoDisabledKind, s.autoRecoverAt)) + '</div>' : '') +
           '</td>' +
-          '<td>' + (hasQuota
-            ? renderQuotaCell(q.premiumApiPool) +
-              '<div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' +
-                esc(monthlyLine || "—") + (sessPct ? (' · ' + esc(tr("短时 ", "Burst ")) + esc(sessPct)) : '') +
-              '</div>'
-            : '<span style="font-size:11.5px;color:var(--fg-muted);">' + esc(tr("未同步", "Not synced")) + '</span>') + '</td>' +
-          '<td class="mono">' + fmt(s.stickySessions) + tr(' 会话 / ', ' sess / ') + fmt(s.totalSelected) + tr(' 次', ' reqs') +
-            '<div style="color:var(--fg-muted);font-size:11px;">' + esc(tr('粘性命中 ', 'Affinity hits ')) + fmt(s.affinityHits) + '</div></td>' +
+          '<td title="' + esc(tr("凭证指纹: ", "Key: ") + s.maskedKey) + '">' + buildAccountInfoHtml(s) + '</td>' +
+          '<td>' + buildCompactQuotaHtml(s, isSyncing) + '</td>' +
+          '<td class="mono" style="font-size:11.5px;">' +
+            '<div>' + esc(tr('调度 ', 'Req ') + fmt(s.totalSelected) + ' · 429: ' + fmt(s.rateLimitHits) + ' · ' + tr('会话 ', 'Sess ') + (typeof s.cloudSessionCount === 'number' ? s.cloudSessionCount : '—')) + '</div>' +
+            '<div style="color:var(--fg-muted);font-size:11px;margin-top:2px;">' + esc(tr('粘性 ', 'Sticky ') + fmt(s.stickySessions) + tr(' · 命中 ', ' · Hits ') + fmt(s.affinityHits)) + '</div>' +
+          '</td>' +
         '</tr>';
-      }).join("") : '<tr><td colspan="4" style="text-align:center;color:var(--fg-muted);padding:24px;">' + esc(pool.length ? tr("当前无已启用凭证（可在「凭证与额度池」中启用）", "No enabled credentials (enable one in Credentials)") : tr("暂无凭证", "No credentials")) + '</td></tr>';
+      }).join("") + (onlinePool.length > ovLimit
+        ? '<tr><td colspan="4" style="text-align:center;color:var(--fg-muted);font-size:11.5px;padding:10px;">' + esc(tr("仅展示前 " + ovLimit + " 个在线账号（共 " + onlinePool.length + " 个在线），点击右上角「管理凭证 →」查看全部", "Showing top " + ovLimit + " of " + onlinePool.length + " online accounts · click Manage Credentials for all")) + '</td></tr>'
+        : '')) : '<tr><td colspan="4" style="text-align:center;color:var(--fg-muted);padding:24px;">' + esc(pool.length ? tr("当前无在线凭证（可在「凭证与额度池」中查看或恢复）", "No online credentials (check Credentials)") : tr("暂无凭证", "No credentials")) + '</td></tr>';
 
       renderCredTable();
 
@@ -2653,20 +2760,6 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
 
     function renderCredTable() {
-      const shortPlan = (raw) => {
-        const s = String(raw || "").toUpperCase();
-        if (!s || s === "—") return "";
-        if (s === "QUICK_LITE_FREE_TRIAL") return "FREE TRIAL";
-        if (s.startsWith("QUICK_")) return s.replace(/^QUICK_/, "").replace(/_/g, " ");
-        return s;
-      };
-      const renderAuthTag = (s) => {
-        const t = s.authType || (String(s.maskedKey || "").startsWith("oauth:") ? "oauth" : String(s.maskedKey || "").startsWith("web:") ? "cookie" : "outpost");
-        if (t === "oauth") return '<span class="tag" style="background:var(--subtle);color:var(--fg);border-color:var(--border-strong);">' + esc(tr("OAuth 90天", "OAuth 90d")) + '</span>';
-        if (t === "cookie") return '<span class="tag tag-warn">Cookie</span>';
-        return '<span class="tag">' + esc(tr("本机桌面", "Desktop")) + '</span>';
-      };
-      const cleanMonthlyText = (raw) => String(raw || "").replace(/^Monthly\s+/i, "");
       const filtered = getFilteredCreds();
       const validIds = new Set(poolSlotsCache.map((s) => s.slotId));
       for (const id of [...selectedCredIds]) { if (!validIds.has(id)) selectedCredIds.delete(id); }
@@ -2678,6 +2771,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           ? tr("同步所选 (" + selectedCredIds.size + ")", "Sync Selected (" + selectedCredIds.size + ")")
           : tr("同步最新额度", "Sync Quotas");
       }
+      if ($("credBatchRecheckBtn") && !$("credBatchRecheckBtn").disabled) {
+        $("credBatchRecheckBtn").textContent = selectedCredIds.size > 0
+          ? tr("批量检测 (" + selectedCredIds.size + ")", "Batch Check (" + selectedCredIds.size + ")")
+          : tr("批量检测", "Batch Check");
+      }
       if ($("credClearSessionsBtn") && !$("credClearSessionsBtn").disabled) {
         $("credClearSessionsBtn").textContent = selectedCredIds.size > 0
           ? tr("清理所选会话 (" + selectedCredIds.size + ")", "Clear Sessions (" + selectedCredIds.size + ")")
@@ -2687,91 +2785,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         $("credSelectAllCb").checked = filtered.length > 0 && filtered.every((s) => selectedCredIds.has(s.slotId));
       }
       $("credTableBody").innerHTML = filtered.length ? filtered.map((s) => {
-        const q = s.quota || {};
-        const idt = s.identity || {};
-        const hasQuota = Boolean(q.premiumApiPool && q.premiumApiPool.usedPercent != null);
         const checked = selectedCredIds.has(s.slotId) ? "checked" : "";
-        const realEmail = idt.userEmail && idt.userEmail.includes("@") ? idt.userEmail : "";
-        const title = s.label || realEmail || idt.userEmail || ("Account #" + (s.slotId || "").slice(0, 4));
-        const subParts = [];
-        if (realEmail && realEmail !== title) subParts.push(realEmail);
-        if (idt.displayName) subParts.push(idt.displayName);
-        if (!subParts.length && !hasQuota && !realEmail) subParts.push(tr("等待同步账号信息", "Pending sync"));
-        const planStr = shortPlan(q.membershipType);
-        const resetStr = q.daysRemainingInCycle != null ? (q.daysRemainingInCycle + tr("天重置", "d reset")) : "";
-        const trialStr = q.trialDaysRemaining != null ? (tr("试用 ", "Trial ") + q.trialDaysRemaining + tr("天", "d")) : "";
-        const rawMonthlyUsed = q.premiumApiPool && q.premiumApiPool.usedPercent != null ? Number(q.premiumApiPool.usedPercent) : null;
-        const monthlyUsedNum = rawMonthlyUsed != null && Number.isFinite(rawMonthlyUsed) ? rawMonthlyUsed : null;
-        const monthlyBarColor = monthlyUsedNum == null ? "var(--ok)" : monthlyUsedNum >= 90 ? "var(--err)" : monthlyUsedNum >= 75 ? "var(--warn)" : "var(--ok)";
-        const monthlyDetail = [cleanMonthlyText(q.apiDisplayMessage), resetStr].filter(Boolean).join(" · ");
-        const sessUsedNum = q.sessionPool && q.sessionPool.usedPercent != null ? Number(q.sessionPool.usedPercent) : null;
-        const sessPct = sessUsedNum != null && Number.isFinite(sessUsedNum) ? (Math.round(sessUsedNum) + "%") : "";
-        const sessBarColor = sessUsedNum == null ? "var(--ok)" : sessUsedNum >= 95 ? "var(--err)" : sessUsedNum >= 80 ? "var(--warn)" : "var(--ok)";
-        const fmtHmDur = (mins) => {
-          const m = Math.max(1, Math.round(mins));
-          const h = Math.floor(m / 60);
-          const rem = m % 60;
-          if (h > 0 && rem > 0) return h + "h " + rem + "m";
-          if (h > 0) return h + "h";
-          return rem + "m";
-        };
-        const fmtClockHm = (isoOrMs) => {
-          const d = new Date(isoOrMs);
-          if (Number.isNaN(d.getTime())) return "";
-          return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
-        };
-        const sessResumeAtMs = q.sessionPool && q.sessionPool.resumeAt ? Date.parse(q.sessionPool.resumeAt) : NaN;
-        const sessRemainMin = Number.isFinite(sessResumeAtMs)
-          ? Math.max(0, Math.ceil((sessResumeAtMs - Date.now()) / 60000))
-          : (q.sessionPool && typeof q.sessionPool.resumeInMinutes === "number" && q.sessionPool.resumeInMinutes > 0
-              ? Math.ceil(q.sessionPool.resumeInMinutes)
-              : 0);
-        const sessResumeClock = sessRemainMin > 0
-          ? fmtClockHm(Number.isFinite(sessResumeAtMs) ? sessResumeAtMs : (Date.now() + sessRemainMin * 60000))
-          : "";
-        const sessResumeShort = sessRemainMin > 0
-          ? (fmtHmDur(sessRemainMin) + tr("后", "") + (sessResumeClock ? (" · " + sessResumeClock) : ""))
-          : "";
-        const sessResumeTitle = sessRemainMin > 0
-          ? [tr("预计 ", "Resumes ~") + (sessResumeClock || "") + tr(" 恢复（约 ", " (in ") + fmtHmDur(sessRemainMin) + tr(" 后）", ")"), trialStr].filter(Boolean).join(" · ")
-          : trialStr;
-        const compactQuotaHtml =
-          '<div style="min-width:175px;max-width:215px;">' +
-            '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
-              '<span style="font-weight:600;color:' + (monthlyUsedNum != null && monthlyUsedNum >= 90 ? 'var(--err)' : 'var(--fg)') + ';white-space:nowrap;">' + esc(tr("月度 ", "Monthly ") + (monthlyUsedNum != null ? monthlyUsedNum.toFixed(1) + "%" : "—")) + '</span>' +
-              (monthlyDetail ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(monthlyDetail) + '">' + esc(monthlyDetail) + '</span>' : '') +
-            '</div>' +
-            '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
-              '<div style="height:100%;width:' + Math.max(0, Math.min(100, monthlyUsedNum || 0)) + '%;background:' + monthlyBarColor + ';border-radius:999px;"></div>' +
-            '</div>' +
-            (sessUsedNum != null && Number.isFinite(sessUsedNum)
-              ? '<div style="margin-top:6px;">' +
-                  '<div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:11px;margin-bottom:3px;">' +
-                    '<span style="color:' + (sessUsedNum >= 80 ? sessBarColor : 'var(--fg-muted)') + ';font-weight:' + (sessUsedNum >= 80 ? '600' : '500') + ';white-space:nowrap;">' + esc(tr("短时 ", "5h Burst ") + sessPct) + '</span>' +
-                    (sessResumeShort
-                      ? '<span style="font-size:10px;color:' + (sessUsedNum >= 95 ? 'var(--err)' : 'var(--warn)') + ';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(sessResumeTitle) + '">' + esc(sessResumeShort) + '</span>'
-                      : (trialStr ? '<span style="font-size:10px;color:var(--fg-muted);white-space:nowrap;">' + esc(trialStr) + '</span>' : '')) +
-                  '</div>' +
-                  '<div style="height:4px;border-radius:999px;background:var(--track);overflow:hidden;">' +
-                    '<div style="height:100%;width:' + Math.max(0, Math.min(100, sessUsedNum)) + '%;background:' + sessBarColor + ';border-radius:999px;"></div>' +
-                  '</div>' +
-                '</div>'
-              : (trialStr ? '<div style="font-size:10px;color:var(--fg-muted);margin-top:4px;">' + esc(trialStr) + '</div>' : '')) +
-          '</div>';
-        const shortAgentId = s.chatAgentId
-          ? (s.chatAgentId.length > 16 ? (s.chatAgentId.slice(0, 8) + "…" + s.chatAgentId.slice(-4)) : s.chatAgentId)
-          : "";
-        const formatShortDisableReason = (reason, kind, autoRecoverAt) => {
-          const r = String(reason || "");
-          const recMs = autoRecoverAt ? Date.parse(autoRecoverAt) : NaN;
-          const isShortRecover = Number.isFinite(recMs) && recMs > Date.now() && (recMs - Date.now()) <= 24 * 3600 * 1000;
-          const recClock = isShortRecover ? fmtClockHm(recMs) : "";
-          if (/Monthly 10h pool/i.test(r)) return tr("月度 10h 额度已满", "Monthly 10h pool exhausted");
-          if (/Session burst pool/i.test(r)) return recClock ? tr("短时已满 · " + recClock + " 自动恢复", "5h full · auto " + recClock) : tr("短时窗口已满 · 待恢复", "5h burst exhausted · waiting");
-          if (/usage limit|quota[_ ]exhausted/i.test(r) || kind === "quota") return recClock ? tr("限额熔断 · " + recClock + " 自动恢复", "Limit tripped · auto " + recClock) : tr("触发限额熔断 · 待恢复", "Usage limit tripped · waiting");
-          if (kind === "auth" || /auth/i.test(r)) return tr("认证失效 · 请重新授权", "Auth expired · re-authorize");
-          return r.length > 28 ? (r.slice(0, 28) + "…") : r;
-        };
         const addedTitle = s.addedAt ? new Date(s.addedAt).toLocaleString() : "";
         const isSyncing = busySyncIds.has(s.slotId);
         const isClearing = busyClearIds.has(s.slotId);
@@ -2779,25 +2793,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         return '<tr class="' + rowCls + '">' +
           '<td><input type="checkbox" ' + checked + ' data-change="toggleCredSelect" data-arg="' + esc(s.slotId) + '" /></td>' +
           '<td><label class="switch"><input type="checkbox" ' + (s.enabled ? 'checked' : '') + ' data-change="toggleKey" data-arg="' + esc(s.slotId) + '" /><span class="slider"></span></label></td>' +
-          '<td title="' + esc(tr("凭证指纹: ", "Key: ") + s.maskedKey) + '">' +
-            '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
-              '<span style="font-weight:600;">' + esc(title) + '</span>' +
-              renderAuthTag(s) +
-              (planStr ? '<span class="tag">' + esc(planStr) + '</span>' : '') +
-            '</div>' +
-            (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
-            (s.maskedProxy ? '<div class="mono" style="font-size:10.5px;color:var(--ok);margin-top:2px;">Proxy: ' + esc(s.maskedProxy) + '</div>' : '') +
-            (shortAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Agent: ' + esc(s.chatAgentId) + '">Agent: ' + esc(shortAgentId) + '</div>' : '') +
-          '</td>' +
-          '<td>' + (isSyncing
-            ? '<div style="display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--fg-muted);"><span class="inline-spin"></span><span>' + esc(tr("正在同步额度...", "Syncing quota...")) + '</span></div>'
-            : hasQuota
-            ? compactQuotaHtml +
-              (s.lastSyncError ? '<div style="font-size:10.5px;color:var(--err);margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(tr("最近同步失败: ", "Sync failed: ") + s.lastSyncError) + '</div>' : '')
-            : s.lastSyncError
-              ? '<div style="font-size:11.5px;color:var(--err);font-weight:500;">' + esc(tr("同步失败", "Sync failed")) + '</div><div style="font-size:10.5px;color:var(--err);margin-top:2px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(s.lastSyncError) + '</div>'
-              : '<div style="font-size:11.5px;color:var(--fg-muted);">' + esc(tr("未同步", "Not synced")) + '</div><div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("点击右上角同步额度", "Click Sync Quota")) + '</div>') +
-          '</td>' +
+          '<td title="' + esc(tr("凭证指纹: ", "Key: ") + s.maskedKey) + '">' + buildAccountInfoHtml(s) + '</td>' +
+          '<td>' + buildCompactQuotaHtml(s, isSyncing) + '</td>' +
           '<td title="' + esc(addedTitle) + '" style="white-space:nowrap;">' +
             '<div style="font-size:12px;font-weight:500;">' + esc(fmtRelTime(s.addedAt)) + '</div>' +
             '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(fmtShortDate(s.addedAt)) + '</div>' +
@@ -2811,14 +2808,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             '</div>' +
             (s.autoDisabledReason ? '<div style="font-size:10.5px;color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(s.autoDisabledReason) + '">' + esc(formatShortDisableReason(s.autoDisabledReason, s.autoDisabledKind, s.autoRecoverAt)) + '</div>' : '') +
           '</td>' +
-          '<td class="ops-cell"><div class="ops-stack">' +
-            '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '">' + esc(tr('日志', 'Logs')) + '</button>' +
-            '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '">' + esc(tr('备注', 'Label')) + '</button>' +
-            '<button class="btn-xs" data-click="editProxy" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.maskedProxy || '') + '">' + esc(tr('代理', 'Proxy')) + '</button>' +
-            '<button class="btn-xs" data-click="editChatAgent" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.chatAgentId || '') + '">' + esc(tr('Agent', 'Agent')) + '</button>' +
-            (!s.enabled && s.autoDisabledKind ? '<button class="btn-xs" data-click="recheckKey" data-arg="' + esc(s.slotId) + '">' + esc(tr('重新检测', 'Recheck')) + '</button>' : '') +
+          '<td class="ops-cell"><div class="ops-grid-2">' +
+            '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '" title="' + esc(tr('查看该账号的实时请求日志', 'View request logs for this account')) + '">' + esc(tr('请求日志', 'Logs')) + '</button>' +
+            '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '" title="' + esc(tr('修改账号备注名称', 'Edit account label')) + '">' + esc(tr('修改备注', 'Label')) + '</button>' +
+            '<button class="btn-xs" data-click="editProxy" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.maskedProxy || '') + '" title="' + esc(tr('配置该账号的独立出口代理', 'Configure per-account proxy')) + '">' + esc(tr('出口代理', 'Proxy')) + '</button>' +
+            '<button class="btn-xs" data-click="editChatAgent" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.chatAgentId || '') + '" title="' + esc(tr('绑定或切换该账号的专属智能体 ID', 'Bind custom chat Agent ID')) + '">' + esc(tr('定义智能体', 'Custom Agent')) + '</button>' +
             (s.cooldownRemainingMs > 0 ? '<button class="btn-xs" data-click="clearKeyCd" data-arg="' + esc(s.slotId) + '">' + esc(tr('解封', 'Uncool')) + '</button>' : '') +
-            '<button class="btn-xs btn-danger" data-click="deleteKey" data-arg="' + esc(s.slotId) + '">' + esc(tr('移除', 'Remove')) + '</button>' +
           '</div></td>' +
         '</tr>';
       }).join("") : '<tr><td colspan="7" style="text-align:center;color:var(--fg-muted);padding:24px;">' + esc(poolSlotsCache.length ? tr("当前筛选条件下无匹配凭证", "No matching credentials") : tr("暂无凭证", "No credentials")) + '</td></tr>';
@@ -2837,8 +2832,24 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
     if ($("credSearchInput")) $("credSearchInput").oninput = renderCredTable;
-    if ($("credStatusFilter")) $("credStatusFilter").onchange = renderCredTable;
-    if ($("credSortFilter")) $("credSortFilter").onchange = renderCredTable;
+    const restoreSelectPref = (sel, key) => {
+      if (!sel) return;
+      const saved = lsGet(key);
+      if (saved && Array.from(sel.options || []).some((o) => o.value === saved)) {
+        sel.value = saved;
+        if (typeof syncSelectUi === "function") syncSelectUi(sel);
+      }
+    };
+    restoreSelectPref($("credStatusFilter"), "aq_cred_status");
+    restoreSelectPref($("credSortFilter"), "aq_cred_sort");
+    if ($("credStatusFilter")) $("credStatusFilter").onchange = () => {
+      lsSet("aq_cred_status", $("credStatusFilter").value);
+      renderCredTable();
+    };
+    if ($("credSortFilter")) $("credSortFilter").onchange = () => {
+      lsSet("aq_cred_sort", $("credSortFilter").value);
+      renderCredTable();
+    };
     if ($("ovManageCredsBtn")) $("ovManageCredsBtn").onclick = () => switchTab("credentials");
 
     if ($("credBatchImportBtn") && $("credBatchImportFile")) {
@@ -2915,6 +2926,39 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     if ($("credBatchEnableBtn")) $("credBatchEnableBtn").onclick = () => void runCredBatch("enable");
     if ($("credBatchDisableBtn")) $("credBatchDisableBtn").onclick = () => void runCredBatch("disable");
     if ($("credBatchDeleteBtn")) $("credBatchDeleteBtn").onclick = () => void runCredBatch("delete");
+    if ($("credBatchRecheckBtn")) {
+      $("credBatchRecheckBtn").onclick = async () => {
+        const abnormalIds = poolSlotsCache.filter((s) => !s.enabled || s.lastSyncError || s.cooldownRemainingMs > 0).map((s) => s.slotId);
+        const ids = selectedCredIds.size > 0
+          ? [...selectedCredIds]
+          : (abnormalIds.length ? abnormalIds : poolSlotsCache.map((s) => s.slotId));
+        if (!ids.length) return notify(tr("当前没有可检测的凭证。", "No credentials to check."), true);
+        const btn = $("credBatchRecheckBtn");
+        btn.disabled = true;
+        ids.forEach((id) => busySyncIds.add(id));
+        setCredPanelLoading();
+        renderCredTable();
+        try {
+          const r = await api("/v1/admin/keys/batch", { method: "POST", body: JSON.stringify({ action: "recheck", slotIds: ids }) });
+          const okCount = r.okCount ?? 0;
+          const failedCount = r.failedCount ?? 0;
+          notify(
+            failedCount > 0
+              ? tr("批量检测完成：" + okCount + " 个正常，" + failedCount + " 个异常/停用。", "Checked: " + okCount + " healthy, " + failedCount + " failed.")
+              : tr("批量检测完成：" + okCount + " 个账号全部正常。", "Checked: " + okCount + " healthy."),
+            failedCount > 0 && okCount === 0
+          );
+          await loadConsoleData("");
+        } catch (e) {
+          notify(e.message, true);
+        } finally {
+          ids.forEach((id) => busySyncIds.delete(id));
+          setCredPanelLoading();
+          btn.disabled = false;
+          renderCredTable();
+        }
+      };
+    }
 
     function bindSnippetCopy(btnId, preId) {
       const btn = $(btnId);
@@ -4606,6 +4650,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         });
         if (st.ok) {
           showConsole();
+          const savedTab = lsGet("aq_active_tab");
+          if (savedTab && tabTitles[savedTab] && savedTab !== "overview") {
+            switchTab(savedTab);
+          }
           await loadConsoleData("");
           void checkAppVersion(false);
         } else {
