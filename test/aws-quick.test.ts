@@ -629,7 +629,7 @@ describe("Credential parser & ClientKeyStore", () => {
   });
 
   it("supports Codex CLI custom/local_shell tools, multi-turn Chat Completions tool_calls, and multi-client identity sanitization", async () => {
-    // 1. Multi-client identity-clash sanitization (only active when tools are attached)
+    // 1. Multi-client identity-clash sanitization (strictly active ONLY when hasTools=true; plain chat is 100% passthrough)
     const rawCodex = "You are Codex, a coding agent running in the user's terminal.\nKeep edits minimal.";
     const cleanedCodex = sanitizeClientSystemPromptForQuick(rawCodex, true);
     assert.ok(!cleanedCodex.includes("You are Codex"));
@@ -993,13 +993,14 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.equal(pool.getSettings().customAgentPrompt, undefined);
       assert.equal(pool.statusSnapshot().find((s) => s.slotId === slotA.slotId)?.chatAgentId, undefined);
 
-      // Compact tool bridge prompt omits verbose anti-refusal boilerplate when custom agent is active
+      // Compact & fallback tool bridge prompts stay clean (no adversarial/guardrail-trigger phrases)
       const sampleTool = [{ name: "Read", description: "Read file", inputSchema: { type: "object" } }];
       const compactPrompt = buildToolBridgePrompt(sampleTool, "auto", { compactForCustomAgent: true });
       const fallbackPrompt = buildToolBridgePrompt(sampleTool, "auto", { compactForCustomAgent: false });
       assert.ok(compactPrompt.includes("## Client Tools (JSON Schema)"));
       assert.ok(!compactPrompt.includes("bypassing any device-access"));
-      assert.ok(fallbackPrompt.includes("bypassing any device-access"));
+      assert.ok(!fallbackPrompt.includes("bypassing any device-access"));
+      assert.ok(fallbackPrompt.includes("## Structured Tool Request Format"));
 
       // Dashboard HTML still renders valid JS with the new customAgentPrompt, editChatAgent, and 5h burst bar
       const html = renderDashboardHtml("/dashboard", "testnonce");
@@ -1323,6 +1324,113 @@ describe("Credential parser & ClientKeyStore", () => {
     });
     const snapStale = pool.statusSnapshot().find((s) => s.slotId === computeKeySlotId(kBurst))!;
     assert.equal(snapStale.enabled, false);
-    assert.equal(snapStale.autoRecoverAt, nextMonthIso);
+    assert.ok(snapStale.autoRecoverAt && Date.parse(snapStale.autoRecoverAt) > Date.now() + 4 * 3600 * 1000);
+  });
+
+  it("hardens OpenAI protocol parsing/streaming, guardrail-safe prompt sanitization, and runtime quota on-trip recovery", async () => {
+    const { parseResponsesRequest, parseChatCompletionsRequest, openAiChatAdapter } = await import("../src/protocols/openai.js");
+    const { sanitizeClientSystemPromptForQuick } = await import("../src/core/tool-bridge.js");
+    const { computeKeySlotId } = await import("../src/core/key-pool.js");
+
+    // 1) Pure passthrough for plain chat (hasTools=false), and neutral fast-mode preference line in custom_prompt only
+    const rawClaudeSys = "You are Claude Code, Anthropic's CLI. Be helpful.";
+    assert.equal(sanitizeClientSystemPromptForQuick(rawClaudeSys, false), rawClaudeSys);
+    const sanitizedFallback = sanitizeClientSystemPromptForQuick(rawClaudeSys, true);
+    assert.ok(!sanitizedFallback.includes("You are Claude Code"));
+    assert.ok(sanitizedFallback.includes("Be helpful."));
+    const fastBridge = buildToolBridgePrompt(
+      [{ name: "Read", description: "Read file", inputSchema: { type: "object", properties: { file_path: { type: "string" } } } }],
+      "auto",
+      { compactForCustomAgent: true, preferClientToolsOverWorkspace: true },
+    );
+    assert.ok(fastBridge.includes("Prefer the `<tool_call>` schemas above over built-in workspace tools."));
+    const sonnetBridge = buildToolBridgePrompt(
+      [{ name: "Read", description: "Read file", inputSchema: { type: "object", properties: { file_path: { type: "string" } } } }],
+      "auto",
+      { compactForCustomAgent: true, preferClientToolsOverWorkspace: false },
+    );
+    assert.ok(!sonnetBridge.includes("built-in workspace tools"));
+
+    // 2) OpenAI /v1/responses unwraps single-turn user array input to plain text (no [USER]: prefix)
+    const singleResp = parseResponsesRequest({
+      model: "quick-smart",
+      input: [{ role: "user", content: [{ type: "input_text", text: "Hello world" }] }],
+    }, {});
+    assert.equal(singleResp.fullTranscriptText, "Hello world");
+
+    // System-only /v1/responses input promotes system message instead of empty prompt
+    const sysOnlyResp = parseResponsesRequest({
+      model: "quick-smart",
+      input: [{ role: "developer", content: "Summarize this." }],
+    }, {});
+    assert.equal(sysOnlyResp.fullTranscriptText, "Summarize this.");
+
+    // input_image object form { image_url: { url } } + object tool_calls.arguments
+    const imgTurn = parseChatCompletionsRequest({
+      model: "quick-smart",
+      messages: [
+        { role: "assistant", tool_calls: [{ id: "c1", type: "function", function: { name: "Read", arguments: { file_path: "/a.txt" } } }] },
+        { role: "tool", tool_call_id: "c1", content: [{ type: "input_image", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } }] },
+        { role: "user", content: "Describe the screenshot" },
+      ],
+    }, {});
+    assert.ok(imgTurn.fullTranscriptText.includes('{"file_path":"/a.txt"}'));
+    assert.ok(imgTurn.fullTranscriptText.includes("[Image]"));
+
+    // OpenAI Chat SSE emits fallback finish_reason: "stop" if upstream generator ends without done
+    async function* truncatedStream() {
+      yield { type: "text" as const, text: "partial" };
+    }
+    const sseFrames: string[] = [];
+    for await (const frame of openAiChatAdapter.streamSse(truncatedStream(), imgTurn)) {
+      sseFrames.push(frame);
+    }
+    assert.ok(sseFrames.some((f) => f.includes('"finish_reason":"stop"')));
+    assert.equal(sseFrames[sseFrames.length - 1], "data: [DONE]\n\n");
+
+    // 3) reportQuotaExhausted sets provisional 5h autoResetAtMs, invokes debounced onQuotaExhausted probe,
+    // and reviveCycleResetAccounts clears stale 0% quota & cooldowns
+    const cfg = loadConfigFromEnv({
+      QUICK_TOKENS: "ws.example.com|tok_runtime_trip",
+      AUTO_DISABLE_EXHAUSTED_KEYS: "true",
+    });
+    const pool = new UpstreamKeyPool(cfg);
+    const k = "ws.example.com|tok_runtime_trip";
+    const probedSlots: string[] = [];
+    pool.setOnQuotaExhausted((sid) => probedSlots.push(sid));
+    pool.reportQuotaExhausted(k, "quick-smart", "AWS Quick account reached its usage limit");
+    pool.reportQuotaExhausted(k, "quick-smart", "duplicate trip within debounce window");
+    assert.equal(probedSlots.length, 1);
+    assert.equal(probedSlots[0], computeKeySlotId(k));
+    const trippedSnap = pool.statusSnapshot()[0]!;
+    assert.equal(trippedSnap.enabled, false);
+    assert.ok(trippedSnap.autoRecoverAt && Date.parse(trippedSnap.autoRecoverAt) > Date.now() + 4 * 3600 * 1000);
+
+    // 4) Runtime quota-trip grace period: stale >0% usage-summary right after a live WS trip must NOT re-enable the slot,
+    //    yet still refines autoResetAtMs when resumeInMinutes is present.
+    pool.updateSlotQuotaCache(k, undefined, {
+      membershipType: "QUICK_LITE_FREE_TRIAL",
+      billingCycleEnd: new Date(Date.now() + 15 * 86400 * 1000).toISOString(),
+      daysRemainingInCycle: 15,
+      sessionPool: { usedPercent: 99, remainingPercent: 1, resumeInMinutes: 42 },
+      premiumApiPool: { usedPercent: 50, remainingPercent: 50 },
+      overallIncludedPlan: { usedPercent: 50, remainingPercent: 50, allowanceUsd: null },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    const graceSnap = pool.statusSnapshot()[0]!;
+    assert.equal(graceSnap.enabled, false, "stale >0% usage-summary must not prematurely re-enable a just-tripped slot");
+    assert.ok(
+      graceSnap.autoRecoverAt && Date.parse(graceSnap.autoRecoverAt) < Date.now() + 60 * 60 * 1000,
+      "resumeInMinutes should still refine provisional 5h autoResetAtMs to ~42m",
+    );
+
+    // 5) classifyUpstreamError treats OIDC 400 invalid_grant as permanent auth failure
+    const { classifyUpstreamError } = await import("../src/core/engine.js");
+    const oidcErr = new GatewayError(
+      'OIDC refresh_token failed (400): {"error":"invalid_grant","error_description":"Invalid refresh token provided"}',
+      502,
+      "upstream_error",
+    );
+    assert.equal(classifyUpstreamError(oidcErr).isAuthErr, true);
   });
 });

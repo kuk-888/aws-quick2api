@@ -75,6 +75,7 @@ interface InternalKeySlot {
   autoDisabledReason?: string;
   autoDisabledKind?: "quota" | "auth";
   autoResetAtMs?: number;
+  lastRuntimeQuotaTripAt?: number;
   apiPoolExhausted: boolean;
   autoPoolExhausted: boolean;
   activeInflight: number;
@@ -193,6 +194,8 @@ export const DEFAULT_CONCURRENCY_WAIT_MS = 4_000;
 export class UpstreamKeyPool {
   private readonly slots: InternalKeySlot[] = [];
   private readonly slotWaiters: Array<{ wake: () => void; canUse: (slot?: InternalKeySlot) => boolean }> = [];
+  private onQuotaExhaustedCallback?: (slotId: string) => void;
+  private readonly quotaProbeCooldownBySlot = new Map<string, number>();
   private readonly baseCooldownMs: number;
   private readonly maxInflightPerSlot: number;
   private readonly envFilePath?: string;
@@ -473,22 +476,44 @@ export class UpstreamKeyPool {
     return this.slots.find((s) => s.slotId === slotId)?.activeInflight ?? 0;
   }
 
+  setOnQuotaExhausted(cb: ((slotId: string) => void) | undefined): void {
+    this.onQuotaExhaustedCallback = cb;
+  }
+
   private reviveCycleResetAccounts(): void {
     const now = Date.now();
     let changed = false;
+    const revived: InternalKeySlot[] = [];
     for (const s of this.slots) {
-      // Only quota trips self-heal on the billing reset; an auth failure needs an explicit re-check.
-      if (!s.enabled && s.autoDisabledReason && s.autoDisabledKind === "quota" && s.autoResetAtMs && now >= s.autoResetAtMs) {
+      // Self-heal quota-tripped accounts once their 5h burst or monthly reset timestamp arrives
+      // (both auto-disabled slots and enabled slots with autoDisableExhaustedKeys=false).
+      const isQuotaAutoDisabled = !s.enabled && s.autoDisabledKind === "quota";
+      const isEnabledExhausted = s.enabled && (s.autoPoolExhausted || s.apiPoolExhausted);
+      if ((isQuotaAutoDisabled || isEnabledExhausted) && s.autoResetAtMs && now >= s.autoResetAtMs) {
         s.enabled = true;
         s.autoDisabledReason = undefined;
         s.autoDisabledKind = undefined;
         s.autoResetAtMs = undefined;
+        s.lastRuntimeQuotaTripAt = undefined;
         s.apiPoolExhausted = false;
         s.autoPoolExhausted = false;
+        s.cooldownUntil = 0;
+        s.connLimitCooldownUntil = 0;
+        s.consecutiveRateLimits = 0;
+        // Clear stale 0% quota snapshot so `quota-aware` does not starve the freshly revived slot.
+        if (s.quota && (s.quota.sessionPool.remainingPercent === 0 || s.quota.premiumApiPool.remainingPercent === 0)) {
+          s.quota = undefined;
+        }
         changed = true;
+        revived.push(s);
       }
     }
-    if (changed) this.persist();
+    if (changed) {
+      this.persist();
+      for (const s of revived) {
+        this.notifySlotAvailable(s, this.maxInflightPerSlot);
+      }
+    }
   }
 
   private isSlotPoolExhausted(slot: InternalKeySlot, targetPool: "auto" | "api"): boolean {
@@ -910,9 +935,19 @@ export class UpstreamKeyPool {
     this.affinityTable.evictAllForKey(rawKey);
 
     // On AWS Quick, hitting the 5h burst window or monthly 10h pool blocks ALL models on the account.
-    // Mark both pools exhausted and auto-disable immediately regardless of stale cached quota telemetry.
+    // Mark both pools exhausted and set a provisional 5h recovery window unless monthly is already known 0%,
+    // then trigger a single debounced background quota fetch to replace it with AWS's exact resume_in_minutes.
+    const monthlyAlreadyZero = slot.quota?.premiumApiPool.remainingPercent === 0;
+    const now = Date.now();
+    slot.lastRuntimeQuotaTripAt = now;
     slot.autoPoolExhausted = true;
     slot.apiPoolExhausted = true;
+    if (!monthlyAlreadyZero) {
+      const provisional5h = now + 5 * 60 * 60 * 1000;
+      if (!slot.autoResetAtMs || slot.autoResetAtMs > provisional5h || slot.autoResetAtMs <= now) {
+        slot.autoResetAtMs = provisional5h;
+      }
+    }
 
     if (this.autoDisableExhaustedKeys) {
       slot.enabled = false;
@@ -921,6 +956,18 @@ export class UpstreamKeyPool {
         ? `Auto-disabled (quota exhausted): ${redactSecrets(reasonDetail).slice(0, 60)}`
         : "Auto-disabled: quota exhausted";
       this.persist();
+    }
+
+    if (this.onQuotaExhaustedCallback) {
+      const lastProbe = this.quotaProbeCooldownBySlot.get(slot.slotId) || 0;
+      if (now - lastProbe > 60_000) {
+        this.quotaProbeCooldownBySlot.set(slot.slotId, now);
+        try {
+          this.onQuotaExhaustedCallback(slot.slotId);
+        } catch {
+          // non-fatal
+        }
+      }
     }
   }
 
@@ -982,9 +1029,30 @@ export class UpstreamKeyPool {
     const prevResetMs = slot.autoResetAtMs;
     const autoRem = quota.sessionPool.remainingPercent;
     const apiRem = quota.premiumApiPool.remainingPercent;
+    const inRuntimeTripGrace = Boolean(
+      slot.lastRuntimeQuotaTripAt && now - slot.lastRuntimeQuotaTripAt < 5 * 60_000,
+    );
 
-    slot.autoPoolExhausted = autoRem !== null && autoRem <= 0;
-    slot.apiPoolExhausted = apiRem !== null && apiRem <= 0;
+    const rawAutoExhausted = autoRem !== null && autoRem <= 0;
+    const rawApiExhausted = apiRem !== null && apiRem <= 0;
+    // Guard against upstream `/auth/usage-summary` eventual-consistency lag right after a runtime
+    // WS usage-limit trip: within 5 minutes of a live trip, never clear exhaustion or re-enable
+    // from a stale >0% summary (still allow refining `autoResetAtMs` from `resume_in_minutes`).
+    if (inRuntimeTripGrace && !rawAutoExhausted && !rawApiExhausted) {
+      const rawSessionResumeMs = quota.sessionPool.resumeAt
+        ? Date.parse(quota.sessionPool.resumeAt)
+        : typeof quota.sessionPool.resumeInMinutes === "number" && quota.sessionPool.resumeInMinutes > 0
+          ? now + Math.ceil(quota.sessionPool.resumeInMinutes) * 60_000
+          : Number.NaN;
+      if (Number.isFinite(rawSessionResumeMs) && rawSessionResumeMs > now) {
+        slot.autoResetAtMs = rawSessionResumeMs;
+        if (slot.autoResetAtMs !== prevResetMs) this.persist();
+      }
+      return;
+    }
+
+    slot.autoPoolExhausted = rawAutoExhausted;
+    slot.apiPoolExhausted = rawApiExhausted;
     const exhausted = slot.autoPoolExhausted || slot.apiPoolExhausted;
 
     const billingEndMs = quota.billingCycleEnd ? Date.parse(quota.billingCycleEnd) : Number.NaN;
@@ -995,9 +1063,12 @@ export class UpstreamKeyPool {
         : Number.NaN;
 
     // If ONLY the 5h session burst pool is exhausted (monthly 10h pool still has quota),
-    // schedule auto-recovery using AWS Quick's exact `resume_in_minutes` instead of waiting for next month!
-    if (slot.autoPoolExhausted && !slot.apiPoolExhausted && Number.isFinite(rawSessionResumeMs) && rawSessionResumeMs > now) {
-      slot.autoResetAtMs = rawSessionResumeMs;
+    // schedule auto-recovery using AWS Quick's exact `resume_in_minutes` (or a 5h fallback) instead of next month!
+    if (slot.autoPoolExhausted && !slot.apiPoolExhausted) {
+      slot.autoResetAtMs =
+        Number.isFinite(rawSessionResumeMs) && rawSessionResumeMs > now
+          ? rawSessionResumeMs
+          : now + 5 * 60 * 60 * 1000;
     } else if (Number.isFinite(billingEndMs)) {
       slot.autoResetAtMs = billingEndMs;
     }

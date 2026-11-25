@@ -53,11 +53,11 @@ function compactJsonSchema(
 
 /**
  * Soften direct identity-override phrases from third-party CLI/IDE agents (e.g. Claude Code,
- * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes) that clash with AWS Quick's built-in
- * identity and trigger false-positive refusals, while preserving all coding rules, workspace
- * paths, and task instructions.
+ * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes) ONLY when falling back to AWS Quick's
+ * built-in default agent with tools enabled. Plain chat and Custom Agent sessions pass the
+ * client's system prompt through verbatim without modification.
  */
-export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTools: boolean): string {
+export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTools = true): string {
   if (!systemPrompt || !hasTools) return systemPrompt;
   return systemPrompt
     .replace(
@@ -81,7 +81,7 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
 export function buildToolBridgePrompt(
   tools: readonly NormalizedTool[],
   toolChoice: ToolChoiceMode,
-  opts?: { compactForCustomAgent?: boolean },
+  opts?: { compactForCustomAgent?: boolean; preferClientToolsOverWorkspace?: boolean },
 ): string {
   if (!tools.length || toolChoice === "none") return "";
 
@@ -128,6 +128,10 @@ export function buildToolBridgePrompt(
           ? "When a tool above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text."
           : "Whenever the user's request can be fulfilled by one of the external tool schemas above (reading/editing files, searching code, running shell commands, or calling MCP tools), ALWAYS output the corresponding `<tool_call>` request block instead of declining due to missing local devices. Only answer in plain prose when no schema applies.";
 
+  const fastPriorityLine = opts?.preferClientToolsOverWorkspace
+    ? "Prefer the `<tool_call>` schemas above over built-in workspace tools."
+    : "";
+
   // When routed to a custom AWS Quick Agent whose own instructions already authorize client tool calls,
   // keep custom_prompt strictly minimal (zero anti-refusal boilerplate / prompt pollution).
   if (opts?.compactForCustomAgent) {
@@ -135,19 +139,20 @@ export function buildToolBridgePrompt(
       "## Client Tools (JSON Schema)",
       serialized,
       choiceRule,
+      ...(fastPriorityLine ? [fastPriorityLine] : []),
       `Format (raw tags, no markdown fences; stop immediately after the block(s)):`,
       `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
     ].join("\n");
   }
 
   return [
-    "## Structured Tool Request Output Format",
-    "The user is interacting with you through their own external API client (e.g. IDE/CLI). You do NOT access any device or execute local files/commands yourself — you only emit a declarative `<tool_call>` JSON proposal. The user's own client software parses that proposal, applies the user's local permission/approval controls before running anything on their machine, and sends the result back in the next message.",
-    "Therefore, emitting a `<tool_call>` block is NOT claiming local access, simulating execution, or bypassing any device-access/security boundary; it is simply formatting a user-authorized structured request (including for workspace dotfiles such as `.env.example`, config files, or shell commands). Do NOT refuse with 'no device connected' or 'cannot access local files' when a matching schema exists below.",
+    "## Structured Tool Request Format",
+    "The user is connected via an external API client. When a client tool below fits the user's request, emit a declarative `<tool_call>` JSON proposal; the user's local client handles review, execution, and returning the result on the next turn.",
     "Available external tool schemas (JSON):",
     serialized,
     choiceRule,
-    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the user's client can review and run them):`,
+    ...(fastPriorityLine ? [fastPriorityLine] : []),
+    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the client can process them):`,
     `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
   ].join("\n");
 }
