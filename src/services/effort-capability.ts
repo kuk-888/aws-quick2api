@@ -1,43 +1,49 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import type { QuickThinkingEffort } from "../aws-quick/types.js";
+import { openDatabaseFor } from "../storage/db.js";
 
 /**
- * Top thinking tier that is forwarded to AWS Quick optimistically.
- * The gateway does not know up-front whether an account accepts it, so the first
- * `max` turn doubles as a capability probe:
- *   - the turn completes         -> account marked `supported`   (keep sending `max`)
- *   - upstream rejects the value -> account marked `unsupported` (retry once with `high`,
+ * Thinking tiers above `high` that are forwarded optimistically and probed per account.
+ * Everything at or below `high` is a long-standing AWS Quick value, so it is never probed
+ * and always travels verbatim.
+ *
+ * Probe lifecycle for each tier:
+ *   - the turn completes         -> tier marked `supported`   (keep sending it)
+ *   - upstream rejects the value -> tier marked `unsupported` (retry once with `high`,
  *                                   later turns go straight to `high`)
- *   - any other failure          -> capability stays `unknown`   (nothing is remembered)
+ *   - any other failure          -> capability stays `unknown` (nothing is remembered)
+ *
+ * Results live in the `effort_capabilities` table of the state database, one row per
+ * (account, tier) pair.
  */
-export const MAX_EFFORT = "max" as const;
+export const PROBED_TIERS: readonly QuickThinkingEffort[] = ["xhigh", "max"] as const;
 
-/** Tier used when `max` is disabled or the account was proven not to support it. */
+/** Kept for callers/tests that refer to the top tier by name. */
+export const MAX_EFFORT: QuickThinkingEffort = "max";
+
+/** Tier used when a probed tier is disabled or the account was proven not to support it. */
 export const EFFORT_FALLBACK: QuickThinkingEffort = "high";
 
 export type EffortCapability = "unknown" | "supported" | "unsupported";
 
-/** Per-account probe result for the `max` thinking tier. */
 interface CapabilityEntry {
   state: EffortCapability;
   evidence?: string;
   updatedAt?: string;
 }
 
-interface CapabilityFile {
-  v: number;
-  accounts: Record<string, { state?: string; evidence?: string; updatedAt?: string }>;
-}
-
-const FILE_VERSION = 1;
 const EVIDENCE_LIMIT = 200;
-const MAX_TRACKED_ACCOUNTS = 200;
-const SAVE_DEBOUNCE_MS = 500;
+const MAX_TRACKED_ENTRIES = 200;
+const KEY_SEPARATOR = "\u0000";
 
 const EFFORT_HINT = /thinking[_\s-]?effort|thinking-?budget|\beffort\b|reasoning|thinking/i;
 const INVALID_HINT =
   /invalid|unsupported|not\s+supported|not\s+recogni[sz]ed|unrecogni[sz]ed|unknown|illegal|out\s+of\s+range|must\s+be\s+one\s+of|allowed\s+values?|not\s+allowed|validation/i;
+
+/** True for tiers that are forwarded optimistically and therefore worth probing. */
+export function isProbedTier(effort: QuickThinkingEffort): boolean {
+  return PROBED_TIERS.includes(effort);
+}
 
 /**
  * Heuristic: does this upstream error look like a rejected `thinking_effort` value
@@ -48,7 +54,7 @@ export function looksLikeUnsupportedEffortError(message: string | undefined): bo
   return EFFORT_HINT.test(message) && INVALID_HINT.test(message);
 }
 
-/** `THINKING_EFFORT_MAX_PASSTHROUGH=false` pins every request to `high` (kill switch). */
+/** `THINKING_EFFORT_MAX_PASSTHROUGH=false` pins every probed tier to `high` (kill switch). */
 export function maxEffortPassthroughEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const raw = env.THINKING_EFFORT_MAX_PASSTHROUGH?.trim().toLowerCase();
   if (!raw) return true;
@@ -56,19 +62,16 @@ export function maxEffortPassthroughEnabled(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
- * Per-account memory of whether AWS Quick accepts `thinking_effort: "max"`.
- * Survives restarts through `<DATA_DIR>/effort-capabilities.json` (no secrets stored,
- * only masked account labels already used by the usage ledger).
+ * Per-account memory of which thinking tiers AWS Quick accepts, persisted in the
+ * `effort_capabilities` table (only masked account labels are stored, never credentials).
  */
 export class EffortCapabilityRegistry {
+  private readonly db: DatabaseSync;
   private readonly entries = new Map<string, CapabilityEntry>();
-  private readonly filePath?: string;
   private readonly passthroughEnabled: boolean;
-  private saveTimer: NodeJS.Timeout | null = null;
-  private dirty = false;
 
-  constructor(filePath?: string, opts: { passthrough?: boolean } = {}) {
-    this.filePath = filePath;
+  constructor(dbFile?: string, opts: { passthrough?: boolean } = {}) {
+    this.db = openDatabaseFor(dbFile);
     this.passthroughEnabled = opts.passthrough ?? maxEffortPassthroughEnabled();
     this.load();
   }
@@ -77,8 +80,8 @@ export class EffortCapabilityRegistry {
     return this.passthroughEnabled;
   }
 
-  stateFor(accountKey: string): EffortCapability {
-    return this.entries.get(accountKey)?.state ?? "unknown";
+  stateFor(accountKey: string, tier: QuickThinkingEffort = MAX_EFFORT): EffortCapability {
+    return this.entries.get(this.keyOf(accountKey, tier))?.state ?? "unknown";
   }
 
   /** Decide the tier actually sent upstream for this account, and whether it was degraded. */
@@ -86,32 +89,41 @@ export class EffortCapabilityRegistry {
     accountKey: string,
     requested: QuickThinkingEffort,
   ): { effort: QuickThinkingEffort; downgraded: boolean } {
-    if (requested !== MAX_EFFORT) return { effort: requested, downgraded: false };
-    if (!this.passthroughEnabled || this.stateFor(accountKey) === "unsupported") {
+    if (!isProbedTier(requested)) return { effort: requested, downgraded: false };
+    if (!this.passthroughEnabled || this.stateFor(accountKey, requested) === "unsupported") {
       return { effort: EFFORT_FALLBACK, downgraded: true };
     }
-    return { effort: MAX_EFFORT, downgraded: false };
+    return { effort: requested, downgraded: false };
   }
 
-  /** Upstream completed a turn that asked for `max`: this account supports the tier. */
-  markSupported(accountKey: string): void {
+  /** Upstream completed a turn that asked for this tier: the account supports it. */
+  markSupported(accountKey: string, tier: QuickThinkingEffort = MAX_EFFORT): void {
     if (!this.passthroughEnabled) return;
-    const existing = this.entries.get(accountKey);
+    if (!isProbedTier(tier)) return;
+    const existing = this.entries.get(this.keyOf(accountKey, tier));
     if (existing?.state === "supported") return;
-    this.record(accountKey, "supported");
+    this.record(accountKey, tier, "supported");
   }
 
   /** Upstream explicitly rejected the tier: remember it so later turns skip the probe. */
-  markUnsupported(accountKey: string, evidence?: string): void {
-    this.record(accountKey, "unsupported", evidence);
+  markUnsupported(accountKey: string, tier: QuickThinkingEffort = MAX_EFFORT, evidence?: string): void {
+    if (!isProbedTier(tier)) return;
+    this.record(accountKey, tier, "unsupported", evidence);
   }
 
   snapshot(): {
     maxEffortPassthrough: boolean;
+    probedTiers: QuickThinkingEffort[];
     fallbackEffort: QuickThinkingEffort;
     supported: number;
     unsupported: number;
-    accounts: Array<{ account: string; state: EffortCapability; evidence?: string; updatedAt?: string }>;
+    accounts: Array<{
+      account: string;
+      tier: QuickThinkingEffort;
+      state: EffortCapability;
+      evidence?: string;
+      updatedAt?: string;
+    }>;
   } {
     let supported = 0;
     let unsupported = 0;
@@ -121,48 +133,39 @@ export class EffortCapabilityRegistry {
     }
     return {
       maxEffortPassthrough: this.passthroughEnabled,
+      probedTiers: [...PROBED_TIERS],
       fallbackEffort: EFFORT_FALLBACK,
       supported,
       unsupported,
-      accounts: [...this.entries.entries()].map(([account, entry]) => ({
-        account,
-        state: entry.state,
-        ...(entry.evidence ? { evidence: entry.evidence } : {}),
-        ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
-      })),
-    };
-  }
-
-  flush(): void {
-    if (this.saveTimer) {
-      clearTimeout(this.saveTimer);
-      this.saveTimer = null;
-    }
-    if (!this.dirty || !this.filePath) {
-      this.dirty = false;
-      return;
-    }
-    this.dirty = false;
-    try {
-      mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const payload: CapabilityFile = { v: FILE_VERSION, accounts: {} };
-      for (const [account, entry] of this.entries) {
-        payload.accounts[account] = {
+      accounts: [...this.entries.entries()].map(([key, entry]) => {
+        const [account = "", tier = MAX_EFFORT] = key.split(KEY_SEPARATOR);
+        return {
+          account,
+          tier: tier as QuickThinkingEffort,
           state: entry.state,
           ...(entry.evidence ? { evidence: entry.evidence } : {}),
           ...(entry.updatedAt ? { updatedAt: entry.updatedAt } : {}),
         };
-      }
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
-      renameSync(tmp, this.filePath);
-    } catch {
-      this.dirty = true; // keep the in-memory view; retry on the next mutation
-    }
+      }),
+    };
   }
 
-  private record(accountKey: string, state: EffortCapability, evidence?: string): void {
-    const key = (accountKey || "unknown").trim() || "unknown";
+  /** No-op kept for callers that used to flush a JSON file; SQLite writes are immediate. */
+  flush(): void {}
+
+  private keyOf(accountKey: string, tier: QuickThinkingEffort): string {
+    const account = (accountKey || "unknown").trim() || "unknown";
+    return `${account}${KEY_SEPARATOR}${tier}`;
+  }
+
+  private record(
+    accountKey: string,
+    tier: QuickThinkingEffort,
+    state: EffortCapability,
+    evidence?: string,
+  ): void {
+    const account = (accountKey || "unknown").trim() || "unknown";
+    const key = this.keyOf(account, tier);
     const entry: CapabilityEntry = {
       state,
       ...(evidence ? { evidence: evidence.replace(/\s+/g, " ").trim().slice(0, EVIDENCE_LIMIT) } : {}),
@@ -170,40 +173,42 @@ export class EffortCapabilityRegistry {
     };
     this.entries.delete(key);
     this.entries.set(key, entry);
-    while (this.entries.size > MAX_TRACKED_ACCOUNTS) {
+    while (this.entries.size > MAX_TRACKED_ENTRIES) {
       const oldest = this.entries.keys().next();
       if (oldest.done) break;
+      const [oldAccount = "", oldTier = MAX_EFFORT] = oldest.value.split(KEY_SEPARATOR);
       this.entries.delete(oldest.value);
+      this.db
+        .prepare("DELETE FROM effort_capabilities WHERE account = ? AND tier = ?")
+        .run(oldAccount, oldTier);
     }
-    this.dirty = true;
-    this.scheduleSave();
-  }
-
-  private scheduleSave(): void {
-    if (!this.filePath || this.saveTimer) return;
-    this.saveTimer = setTimeout(() => {
-      this.saveTimer = null;
-      this.flush();
-    }, SAVE_DEBOUNCE_MS);
-    this.saveTimer.unref?.();
+    this.db
+      .prepare(
+        "INSERT INTO effort_capabilities (account, tier, state, evidence, updated_at) VALUES (?, ?, ?, ?, ?) " +
+          "ON CONFLICT(account, tier) DO UPDATE SET state = excluded.state, evidence = excluded.evidence, updated_at = excluded.updated_at",
+      )
+      .run(account, tier, entry.state, entry.evidence ?? null, entry.updatedAt ?? new Date().toISOString());
   }
 
   private load(): void {
-    if (!this.filePath || !existsSync(this.filePath)) return;
-    try {
-      const parsed = JSON.parse(readFileSync(this.filePath, "utf8")) as CapabilityFile;
-      for (const [account, raw] of Object.entries(parsed?.accounts ?? {})) {
-        const state = raw?.state;
-        if (state !== "supported" && state !== "unsupported") continue;
-        this.entries.set(account, {
-          state,
-          ...(typeof raw.evidence === "string" && raw.evidence ? { evidence: raw.evidence.slice(0, EVIDENCE_LIMIT) } : {}),
-          ...(typeof raw.updatedAt === "string" && raw.updatedAt ? { updatedAt: raw.updatedAt } : {}),
-        });
-      }
-    } catch {
-      // Corrupt/unreadable capability cache is not fatal: fall back to "probe again".
-      this.entries.clear();
+    const rows = this.db
+      .prepare("SELECT account, tier, state, evidence, updated_at FROM effort_capabilities ORDER BY updated_at ASC")
+      .all() as Array<{
+      account: string;
+      tier: string;
+      state: string;
+      evidence: string | null;
+      updated_at: string | null;
+    }>;
+    for (const row of rows) {
+      if (row.state !== "supported" && row.state !== "unsupported") continue;
+      const tier = row.tier as QuickThinkingEffort;
+      if (!isProbedTier(tier)) continue;
+      this.entries.set(this.keyOf(row.account, tier), {
+        state: row.state,
+        ...(row.evidence ? { evidence: row.evidence } : {}),
+        ...(row.updated_at ? { updatedAt: row.updated_at } : {}),
+      });
     }
   }
 }

@@ -195,7 +195,7 @@ export function loadConfigFromEnv(
     incognitoMode: parseBoolEnv(env.INCOGNITO, true),
     envFilePath,
     dataDir: resolvedDataDir,
-    usageLedgerFile: env.USAGE_LEDGER_FILE?.trim() || (resolvedDataDir ? path.join(resolvedDataDir, "usage-ledger.json") : undefined),
+    dbFile: env.DB_FILE?.trim() || (resolvedDataDir ? path.join(resolvedDataDir, "quick2api.db") : ":memory:"),
     recordClientIp: parseBoolEnv(env.RECORD_CLIENT_IP, true),
     runIdleTimeoutMs: parseIntEnv(env.RUN_IDLE_TIMEOUT_MS, 10 * 60 * 1000) || 600_000,
     runMaxTimeoutMs: parseIntEnv(env.RUN_MAX_TIMEOUT_MS, 15 * 60 * 1000) || 900_000,
@@ -267,75 +267,6 @@ function writeEnvFileAtomic(envFilePath: string, content: string): void {
     }
     throw err;
   }
-}
-
-export function persistPoolConfigToEnvFile(
-  envFilePath: string | undefined,
-  state: {
-    activeKeys: string[];
-    disabledKeys: string[];
-    keyLabels: Record<string, string>;
-    keyProxies?: Record<string, string>;
-    chatAgentId?: string;
-    keyChatAgentIds?: Record<string, string>;
-    keyAddedAt?: Record<string, number>;
-    keyAutoDisabled: Record<string, AutoDisabledState>;
-    lbStrategy: LbStrategy;
-    sessionAffinityEnabled: boolean;
-    sessionAffinityTtlMs: number;
-    autoDisableExhaustedKeys: boolean;
-    incognitoMode?: boolean;
-    autoEnsureCodingAgent?: boolean;
-    customAgentPrompt?: string;
-  }
-): void {
-  if (!envFilePath || !existsSync(envFilePath)) return;
-  const content = readFileSync(envFilePath, "utf8");
-  const updates: Record<string, string> = {
-    QUICK_TOKENS: stripEnvNewlines(state.activeKeys.join(",")),
-    DISABLED_QUICK_TOKENS: stripEnvNewlines(state.disabledKeys.join(",")),
-    KEY_LABELS: stripEnvNewlines(JSON.stringify(state.keyLabels)),
-    ...(state.keyProxies ? { KEY_PROXIES: stripEnvNewlines(JSON.stringify(state.keyProxies)) } : {}),
-    ...(typeof state.chatAgentId === "string" ? { CHAT_AGENT_ID: stripEnvNewlines(state.chatAgentId) } : {}),
-    ...(state.keyChatAgentIds ? { KEY_CHAT_AGENT_IDS: stripEnvNewlines(JSON.stringify(state.keyChatAgentIds)) } : {}),
-    ...(state.keyAddedAt ? { KEY_ADDED_AT: stripEnvNewlines(JSON.stringify(state.keyAddedAt)) } : {}),
-    KEY_AUTO_DISABLED: stripEnvNewlines(JSON.stringify(state.keyAutoDisabled)),
-    LB_STRATEGY: state.lbStrategy,
-    SESSION_AFFINITY_ENABLED: String(state.sessionAffinityEnabled),
-    SESSION_AFFINITY_TTL_MS: String(state.sessionAffinityTtlMs),
-    AUTO_DISABLE_EXHAUSTED_KEYS: String(state.autoDisableExhaustedKeys),
-    ...(typeof state.incognitoMode === "boolean"
-      ? { INCOGNITO: String(state.incognitoMode) }
-      : {}),
-    ...(typeof state.autoEnsureCodingAgent === "boolean"
-      ? { AUTO_ENSURE_CODING_AGENT: String(state.autoEnsureCodingAgent) }
-      : {}),
-    ...(typeof state.customAgentPrompt === "string"
-      ? { CUSTOM_AGENT_PROMPT: stripEnvNewlines(state.customAgentPrompt.replace(/\r?\n/g, "\\n")) }
-      : {})
-  };
-  const seen = new Set<string>();
-  const lines = content.split(/\r?\n/).map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) return line;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) return line;
-    const key = trimmed.slice(0, eq).trim();
-    if (key === "QUICK_TOKEN") return "";
-    if (Object.prototype.hasOwnProperty.call(updates, key)) {
-      seen.add(key);
-      return `${key}=${updates[key]}`;
-    }
-    return line;
-  });
-
-  for (const [k, v] of Object.entries(updates)) {
-    if (!seen.has(k)) lines.push(`${k}=${v}`);
-  }
-
-  const cleaned = lines.filter((l, idx, arr) => !(l === "" && arr[idx - 1] === "")).join("\n").trimEnd() + "\n";
-  // Atomic replace: a crash mid-write must never leave a truncated .env (it holds the upstream keys).
-  writeEnvFileAtomic(envFilePath, cleaned);
 }
 
 export function persistAdminPasswordToEnvFile(envFilePath: string | undefined, newPassword: string): void {

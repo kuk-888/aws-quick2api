@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { openDatabaseFor } from "../storage/db.js";
 
 /**
  * Metadata-only request ledger behind the console overview. It stores counters per hour and dimension
@@ -70,13 +70,14 @@ const totalTokens = (c: LedgerCounters): number => c.inputTokens + c.cacheReadTo
 export class UsageLedger {
   private buckets = new Map<string, Bucket>();
   private recent: LedgerRecord[] = [];
-  private dirty = false;
-  private timer: NodeJS.Timeout | null = null;
+  private readonly db: DatabaseSync;
+  private lastPruneHour = 0;
 
   constructor(
-    private readonly filePath: string | undefined,
+    dbFile: string | undefined,
     private readonly recordIp = true
   ) {
+    this.db = openDatabaseFor(dbFile);
     this.load();
   }
 
@@ -114,7 +115,29 @@ export class UsageLedger {
     b.inputTokens += rec.inputTokens;
     b.cacheReadTokens += rec.cacheReadTokens;
     b.outputTokens += rec.outputTokens;
-    this.markDirty();
+    this.db
+      .prepare(
+        "INSERT INTO usage_buckets (hour, model, routed_model, key, ip, account, requests, errors, input_tokens, cache_read_tokens, output_tokens) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(hour, model, routed_model, key, ip, account) DO UPDATE SET " +
+          "requests = excluded.requests, errors = excluded.errors, input_tokens = excluded.input_tokens, " +
+          "cache_read_tokens = excluded.cache_read_tokens, output_tokens = excluded.output_tokens",
+      )
+      .run(
+        b.hour,
+        b.model,
+        b.routedModel ?? "",
+        b.key,
+        b.ip,
+        b.account,
+        b.requests,
+        b.errors,
+        b.inputTokens,
+        b.cacheReadTokens,
+        b.outputTokens,
+      );
+    this.db.prepare("INSERT INTO usage_recent (at, payload) VALUES (?, ?)").run(rec.at, JSON.stringify(rec));
+    if (hour !== this.lastPruneHour) this.prune(hour);
   }
 
   overview(range: LedgerRange, now = Date.now()) {
@@ -189,54 +212,78 @@ export class UsageLedger {
     };
   }
 
-  flush(): void {
-    if (this.timer) {
-      clearTimeout(this.timer);
-      this.timer = null;
-    }
-    if (!this.dirty || !this.filePath) return;
-    this.dirty = false;
-    try {
-      mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ v: 1, buckets: [...this.buckets.values()], recent: this.recent.slice(0, 30) }), { mode: 0o600 });
-      renameSync(tmp, this.filePath);
-    } catch {
-      this.dirty = true; // keep counting in memory; retry on the next flush
-    }
-  }
-
-  private markDirty(): void {
-    this.dirty = true;
-    if (this.timer || !this.filePath) return;
-    this.timer = setTimeout(() => {
-      this.timer = null;
-      this.flush();
-    }, 30_000);
-    this.timer.unref?.();
-  }
+  /** No-op kept for callers that used to flush a JSON file; SQLite writes are immediate. */
+  flush(): void {}
 
   private prune(nowHour: number): void {
     const cutoff = nowHour - RETENTION_HOURS;
     for (const [id, b] of this.buckets) if (b.hour < cutoff) this.buckets.delete(id);
-    if (this.buckets.size <= MAX_BUCKETS) return;
-    const sorted = [...this.buckets.entries()].sort((a, b) => a[1].hour - b[1].hour);
-    for (const [id] of sorted.slice(0, this.buckets.size - MAX_BUCKETS)) this.buckets.delete(id);
+    if (this.buckets.size > MAX_BUCKETS) {
+      const sorted = [...this.buckets.entries()].sort((a, b) => a[1].hour - b[1].hour);
+      for (const [id] of sorted.slice(0, this.buckets.size - MAX_BUCKETS)) this.buckets.delete(id);
+    }
+    this.db.prepare("DELETE FROM usage_buckets WHERE hour < ?").run(cutoff);
+    this.db
+      .prepare(
+        "DELETE FROM usage_recent WHERE id NOT IN (SELECT id FROM usage_recent ORDER BY at DESC, id DESC LIMIT ?)",
+      )
+      .run(RECENT_LIMIT);
+    this.lastPruneHour = nowHour;
   }
 
   private load(): void {
-    if (!this.filePath || !existsSync(this.filePath)) return;
+    const cutoff = Math.floor(Date.now() / HOUR) - RETENTION_HOURS;
     try {
-      const data = JSON.parse(readFileSync(this.filePath, "utf8")) as { buckets?: Bucket[]; recent?: LedgerRecord[] };
-      const cutoff = Math.floor(Date.now() / HOUR) - RETENTION_HOURS;
-      for (const b of data.buckets ?? []) {
-        if (typeof b.hour !== "number" || b.hour < cutoff) continue;
-        const ip = this.recordIp ? b.ip || UNKNOWN : UNKNOWN;
-        this.buckets.set(`${b.hour}|${b.model}|${b.routedModel || ""}|${b.key}|${ip}|${b.account}`, { ...zero(), ...b, ip });
+      const rows = this.db
+        .prepare(
+          "SELECT hour, model, routed_model, key, ip, account, requests, errors, input_tokens, cache_read_tokens, output_tokens FROM usage_buckets WHERE hour >= ?",
+        )
+        .all(cutoff) as Array<{
+        hour: number;
+        model: string;
+        routed_model: string;
+        key: string;
+        ip: string;
+        account: string;
+        requests: number;
+        errors: number;
+        input_tokens: number;
+        cache_read_tokens: number;
+        output_tokens: number;
+      }>;
+      for (const row of rows) {
+        const ip = this.recordIp ? row.ip || UNKNOWN : UNKNOWN;
+        const bucket: Bucket = {
+          hour: row.hour,
+          model: row.model,
+          ...(row.routed_model ? { routedModel: row.routed_model } : {}),
+          key: row.key,
+          ip,
+          account: row.account,
+          requests: row.requests,
+          errors: row.errors,
+          inputTokens: row.input_tokens,
+          cacheReadTokens: row.cache_read_tokens,
+          outputTokens: row.output_tokens,
+        };
+        this.buckets.set(`${row.hour}|${row.model}|${row.routed_model || ""}|${row.key}|${ip}|${row.account}`, bucket);
       }
-      this.recent = (data.recent ?? []).slice(0, RECENT_LIMIT);
+      const recentRows = this.db
+        .prepare("SELECT payload FROM usage_recent ORDER BY at DESC, id DESC LIMIT ?")
+        .all(RECENT_LIMIT) as Array<{ payload: string }>;
+      this.recent = recentRows
+        .map((row) => {
+          try {
+            return JSON.parse(row.payload) as LedgerRecord;
+          } catch {
+            return undefined;
+          }
+        })
+        .filter((rec): rec is LedgerRecord => Boolean(rec));
     } catch {
-      // A corrupt ledger must never block startup; start empty.
+      // A damaged ledger must never block startup; start empty.
+      this.buckets.clear();
+      this.recent = [];
     }
   }
 }

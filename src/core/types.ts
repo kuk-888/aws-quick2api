@@ -152,10 +152,14 @@ export interface GatewayConfig {
   /** Privacy mode: when true, enables AWS Quick incognito + auto session_delete (default true). */
   incognitoMode: boolean;
   envFilePath?: string;
-  /** Directory for persistent runtime state (`gateway-keys.json`, `admin-session.key`, `usage-ledger.json`). */
+  /** Directory for legacy state files imported into `dbFile` on first start (`gateway-keys.json`, `usage-ledger.json`). */
   dataDir?: string;
-  /** Where the overview ledger (metadata only, no conversation text) is persisted; unset = memory only. */
-  usageLedgerFile?: string;
+  /**
+   * SQLite state database holding every piece of runtime state (gateway keys, upstream accounts,
+   * pool settings, usage ledger, effort capabilities, admin session secret).
+   * Defaults to `<dataDir>/quick2api.db`; `":memory:"` when no data directory is configured.
+   */
+  dbFile?: string;
   /** Record the client IP in the overview ledger (default `true`). */
   recordClientIp?: boolean;
   runIdleTimeoutMs: number;

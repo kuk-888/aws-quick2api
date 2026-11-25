@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -56,6 +56,8 @@ import {
 import { anthropicMessagesAdapter, parseAnthropicMessagesRequest } from "../src/protocols/anthropic.js";
 import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
 import { AWS_QUICK_MODELS, canonicalizeModelId, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
+import { closeAllDatabases, openDatabase } from "../src/storage/db.js";
+import { importLegacyState } from "../src/storage/legacy-import.js";
 import {
   EffortCapabilityRegistry,
   looksLikeUnsupportedEffortError,
@@ -165,64 +167,83 @@ describe("Model catalog & parameter resolution", () => {
   });
 });
 
-describe("Max thinking tier (passthrough + probe)", () => {
-  it("parses max as a first-class effort and advertises it on the reasoning models", () => {
+describe("Thinking-effort tiers (verbatim passthrough + probe)", () => {
+  it("passes every tier through verbatim and advertises xhigh/max on the reasoning models", () => {
+    const expected = ["off", "low", "medium", "high", "xhigh", "max"] as const;
+    for (const tier of expected) {
+      assert.equal(resolveModelSelection(`claude-opus-5-5[effort=${tier}]`).selection.thinkingEffort, tier);
+      assert.equal(resolveModelSelection("claude-opus-5-5", { reasoning_effort: tier }).selection.thinkingEffort, tier);
+    }
     assert.deepEqual(resolveModelSelection("claude-opus-5-5[effort=max]").selection, {
       model: "claude-opus-5-5",
       agentMode: "smart",
       thinkingEffort: "max",
     });
+    // Hyphen suffix and alias spellings stay separate tiers instead of being folded together.
     assert.equal(resolveModelSelection("claude-opus-5-5-max").selection.thinkingEffort, "max");
-    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "max" }).selection.thinkingEffort, "max");
-    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning: { effort: "xhigh" } }).selection.thinkingEffort, "max");
-    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "high" }).selection.thinkingEffort, "high");
-    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "medium" }).selection.thinkingEffort, "medium");
+    assert.equal(resolveModelSelection("claude-opus-5-5-xhigh").selection.thinkingEffort, "xhigh");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning: { effort: "xhigh" } }).selection.thinkingEffort, "xhigh");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "maximum" }).selection.thinkingEffort, "max");
     const effortParam = AWS_QUICK_MODELS.find((m) => m.id === "claude-opus-5-5")!.parameters![0]!;
-    assert.deepEqual(effortParam.values, ["off", "low", "medium", "high", "max"]);
+    assert.deepEqual(effortParam.values, ["off", "low", "medium", "high", "xhigh", "max"]);
   });
 
-  it("keeps forwarding max until an account proves it rejects it, then degrades to high", () => {
+  it("keeps forwarding a probed tier until an account proves it rejects that tier", () => {
     const registry = new EffortCapabilityRegistry(undefined, { passthrough: true });
-    assert.deepEqual(registry.resolveEffort("acct-a", "max"), { effort: "max", downgraded: false });
-    assert.equal(registry.stateFor("acct-a"), "unknown");
+    for (const tier of ["off", "low", "medium", "high", "xhigh", "max"] as const) {
+      assert.deepEqual(registry.resolveEffort("acct-a", tier), { effort: tier, downgraded: false });
+      assert.equal(registry.stateFor("acct-a", tier), "unknown");
+    }
 
-    registry.markUnsupported("acct-a", "Invalid thinking_effort value: max");
-    assert.equal(registry.stateFor("acct-a"), "unsupported");
+    registry.markUnsupported("acct-a", "max", "Invalid thinking_effort value: max");
+    assert.equal(registry.stateFor("acct-a", "max"), "unsupported");
     assert.deepEqual(registry.resolveEffort("acct-a", "max"), { effort: "high", downgraded: true });
-    // Other accounts still probe the tier, and non-max tiers are never touched.
+    // Degrading one tier leaves the others alone, for this account and for everyone else.
+    assert.deepEqual(registry.resolveEffort("acct-a", "xhigh"), { effort: "xhigh", downgraded: false });
     assert.deepEqual(registry.resolveEffort("acct-b", "max"), { effort: "max", downgraded: false });
     assert.deepEqual(registry.resolveEffort("acct-a", "medium"), { effort: "medium", downgraded: false });
+
+    // Baseline tiers are never probed, so marking them is a no-op.
+    registry.markUnsupported("acct-a", "high", "should be ignored");
+    assert.deepEqual(registry.resolveEffort("acct-a", "high"), { effort: "high", downgraded: false });
   });
 
-  it("persists probe results and honors the passthrough kill switch", () => {
+  it("persists per-tier probe results and honors the passthrough kill switch", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "effort-cap-"));
     try {
-      const file = path.join(dir, "effort-capabilities.json");
+      const file = path.join(dir, "state.db");
       const registry = new EffortCapabilityRegistry(file, { passthrough: true });
-      registry.markSupported("acct-ok");
-      registry.markUnsupported("acct-bad", "thinking effort \"max\" is invalid");
+      registry.markSupported("acct-ok", "max");
+      registry.markSupported("acct-ok", "xhigh");
+      registry.markUnsupported("acct-bad", "max", "thinking effort \"max\" is invalid");
       registry.flush();
 
       const reloaded = new EffortCapabilityRegistry(file, { passthrough: true });
-      assert.equal(reloaded.stateFor("acct-ok"), "supported");
-      assert.equal(reloaded.stateFor("acct-bad"), "unsupported");
+      assert.equal(reloaded.stateFor("acct-ok", "max"), "supported");
+      assert.equal(reloaded.stateFor("acct-ok", "xhigh"), "supported");
+      assert.equal(reloaded.stateFor("acct-bad", "max"), "unsupported");
       assert.deepEqual(reloaded.resolveEffort("acct-bad", "max"), { effort: "high", downgraded: true });
       const snapshot = reloaded.snapshot();
       assert.equal(snapshot.maxEffortPassthrough, true);
       assert.equal(snapshot.fallbackEffort, "high");
-      assert.equal(snapshot.supported, 1);
+      assert.deepEqual(snapshot.probedTiers, ["xhigh", "max"]);
+      assert.equal(snapshot.supported, 2);
       assert.equal(snapshot.unsupported, 1);
       assert.deepEqual(
-        snapshot.accounts.map((entry) => [entry.account, entry.state]),
+        snapshot.accounts.map((entry) => [entry.account, entry.tier, entry.state]),
         [
-          ["acct-ok", "supported"],
-          ["acct-bad", "unsupported"],
+          ["acct-ok", "max", "supported"],
+          ["acct-ok", "xhigh", "supported"],
+          ["acct-bad", "max", "unsupported"],
         ],
       );
-      assert.equal(snapshot.accounts[1]!.evidence, 'thinking effort "max" is invalid');
+      assert.equal(snapshot.accounts[2]!.evidence, 'thinking effort "max" is invalid');
       const disabled = new EffortCapabilityRegistry(file, { passthrough: false });
       assert.deepEqual(disabled.resolveEffort("acct-ok", "max"), { effort: "high", downgraded: true });
+      assert.deepEqual(disabled.resolveEffort("acct-ok", "xhigh"), { effort: "high", downgraded: true });
+      assert.deepEqual(disabled.resolveEffort("acct-ok", "low"), { effort: "low", downgraded: false });
     } finally {
+      closeAllDatabases();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -1052,7 +1073,7 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.equal(leaseA.chatAgentId, "agent-slot-a");
       leaseA.release();
 
-      // Update global default, autoEnsureCodingAgent, and customAgentPrompt template, verify persistence to .env
+      // Update global default, autoEnsureCodingAgent, and customAgentPrompt template; settings live in SQLite now.
       pool.updateSettings({
         chatAgentId: "agent-global-002",
         autoEnsureCodingAgent: false,
@@ -1062,11 +1083,16 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.equal(pool.getSettings().autoEnsureCodingAgent, false);
       assert.equal(pool.getSettings().customAgentPrompt, "Line1\nLine2 custom prompt");
 
-      const envContent = fs.readFileSync(envPath, "utf8");
-      assert.ok(envContent.includes("CHAT_AGENT_ID=agent-global-002"));
-      assert.ok(envContent.includes("AUTO_ENSURE_CODING_AGENT=false"));
-      assert.ok(envContent.includes("CUSTOM_AGENT_PROMPT=Line1\\nLine2 custom prompt"));
-      assert.ok(envContent.includes(`"${slotA.slotId}":"agent-slot-a"`));
+      const settingsRow = openDatabase(cfg.dbFile ?? envPath)
+        .prepare("SELECT chat_agent_id, auto_ensure_coding_agent, custom_agent_prompt FROM pool_settings WHERE id = 1")
+        .get() as { chat_agent_id: string; auto_ensure_coding_agent: number; custom_agent_prompt: string };
+      assert.equal(settingsRow.chat_agent_id, "agent-global-002");
+      assert.equal(Number(settingsRow.auto_ensure_coding_agent), 0);
+      assert.equal(settingsRow.custom_agent_prompt, "Line1\nLine2 custom prompt");
+      const accountRow = openDatabase(cfg.dbFile ?? envPath)
+        .prepare("SELECT chat_agent_id FROM upstream_accounts WHERE slot_id = ?")
+        .get(slotA.slotId) as { chat_agent_id: string };
+      assert.equal(accountRow.chat_agent_id, "agent-slot-a");
 
       // Clear per-account and global overrides cleanly & re-enable autoEnsureCodingAgent
       pool.updateSlotMeta(slotA.slotId, { chatAgentId: "" });
@@ -1093,6 +1119,7 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.ok(html.includes("editChatAgent"));
       assert.ok(html.includes("5h Burst "));
     } finally {
+      closeAllDatabases();
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -1600,6 +1627,7 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
     try {
       fn(dir);
     } finally {
+      closeAllDatabases();
       rmSync(dir, { recursive: true, force: true });
     }
   };
@@ -1607,7 +1635,7 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
 
   it("seeds an env token once, tags it `env`, and a console delete survives restart via a hashed tombstone", () => {
     withDir((dir) => {
-      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       const keys = a.listKeys();
       assert.equal(keys.length, 1);
       assert.equal(keys[0]!.source, "env");
@@ -1615,18 +1643,21 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
       assert.equal(a.listKeys().length, 0);
 
       // Restart with the SAME .env token: must not come back.
-      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       assert.equal(b.listKeys().length, 0);
       assert.throws(() => b.authenticateClient(ENV_TOK));
 
-      // Tombstone file holds only a SHA-256 digest, never the plaintext token.
-      const tomb = readFileSync(path.join(dir, "env-key-tombstones.json"), "utf8");
-      assert.ok(!tomb.includes(ENV_TOK));
-      assert.match(tomb, /[a-f0-9]{64}/);
+      const tombRows = openDatabase(path.join(dir, "keys.db"))
+        .prepare("SELECT digest FROM gateway_key_tombstones")
+        .all() as Array<{ digest: string }>;
+      assert.equal(tombRows.length, 1);
+      assert.match(tombRows[0]!.digest, /^[a-f0-9]{64}$/);
+      assert.ok(!tombRows[0]!.digest.includes(ENV_TOK));
+
 
       // Rotating GATEWAY_TOKEN to a new value seeds the new key; the old one stays revoked.
       const NEW_TOK = "sk-aq-fedcba9876543210fedcba9876543210";
-      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([NEW_TOK]), dataDir: dir });
+      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([NEW_TOK]), dbFile: path.join(dir, "keys.db") });
       assert.equal(c.listKeys().length, 1);
       assert.doesNotThrow(() => c.authenticateClient(NEW_TOK));
       assert.throws(() => c.authenticateClient(ENV_TOK));
@@ -1635,12 +1666,12 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
 
   it("removes an env-sourced key when its token leaves .env, but never touches console-created keys", () => {
     withDir((dir) => {
-      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       const created = a.createKey({ name: "console-key" });
       assert.equal(created.view.source, "dashboard");
       a.flushStatsToDisk();
 
-      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set(), dataDir: dir });
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set(), dbFile: path.join(dir, "keys.db") });
       assert.deepEqual(b.listKeys().map((k) => k.name), ["console-key"]);
       assert.ok(b.startupEvents.some((e) => e.event === "gateway_env_key_pruned"));
       assert.doesNotThrow(() => b.authenticateClient(created.rawToken));
@@ -1650,17 +1681,17 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
 
   it("disabled env keys stay disabled across restarts, and re-creating a deleted env token in the console is an explicit re-add", () => {
     withDir((dir) => {
-      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       const id = a.listKeys()[0]!.id;
       a.updateKey(id, { enabled: false });
-      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       assert.equal(b.listKeys().length, 1);
       assert.equal(b.listKeys()[0]!.enabled, false);
 
       b.deleteKey(id);
       const readded = b.createKey({ name: "readded", customToken: ENV_TOK });
       assert.equal(readded.view.source, "dashboard");
-      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       assert.deepEqual(c.listKeys().map((k) => k.name), ["readded"]);
     });
   });
@@ -1672,12 +1703,16 @@ describe(".env-seeded gateway keys: delete means revoke", () => {
         { id: "gk_bbbbbbbb", name: "Env Key #1", token: ENV_TOK, enabled: true, allowAllModels: true, allowedModels: [], maxRequests: null, maxConcurrent: null, expiresAt: null, createdAt: "2026-11-01T00:00:00.000Z", stats: { requests: 5, inputTokens: 2, outputTokens: 2 } },
       ];
       writeFileSync(path.join(dir, "gateway-keys.json"), JSON.stringify(legacy));
-      const m = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      // The one-time importer moves legacy JSON into the state database and archives the file.
+      const imported = importLegacyState(openDatabase(path.join(dir, "keys.db")), { dataDir: dir });
+      assert.ok(imported.imported.some((entry) => entry.startsWith("gateway-keys.json")));
+      assert.ok(!existsSync(path.join(dir, "gateway-keys.json")));
+      assert.ok(existsSync(path.join(dir, "gateway-keys.json.imported")));
+
+      const m = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dbFile: path.join(dir, "keys.db") });
       const bySource = Object.fromEntries(m.listKeys().map((k) => [k.name, k.source]));
       assert.deepEqual(bySource, { friend: "dashboard", "Env Key #1": "env" });
       assert.equal(m.listKeys().find((k) => k.name === "friend")!.stats.requests, 3);
-      // Persisted file stays an array so a rollback to the previous release can still read it.
-      assert.ok(Array.isArray(JSON.parse(readFileSync(path.join(dir, "gateway-keys.json"), "utf8"))));
     });
   });
 

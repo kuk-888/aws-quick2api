@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
+import type { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { parseOAuthCredential } from "../aws-quick/oauth-client.js";
 import { parseWebCurlOrCredential, serializeWebCredential } from "../aws-quick/web-client.js";
@@ -8,7 +8,7 @@ import type { BotQuotaView, QuickPlanQuotaView } from "../services/quota-service
 import { evictQuotaCachesForKey } from "../services/quota-service.js";
 import { normalizeBaseModelId, redactSecrets } from "../utils/hash.js";
 import { maskProxyUrl, validateProxyUrl } from "../utils/proxy-agent.js";
-import { persistPoolConfigToEnvFile } from "./config.js";
+import { openDatabaseFor, transaction } from "../storage/db.js";
 import { SessionAffinityTable, type AffinityBindingView } from "./session-affinity.js";
 import { GatewayError, type AutoDisabledState, type GatewayConfig, type LbStrategy } from "./types.js";
 
@@ -198,8 +198,7 @@ export class UpstreamKeyPool {
   private readonly quotaProbeCooldownBySlot = new Map<string, number>();
   private readonly baseCooldownMs: number;
   private readonly maxInflightPerSlot: number;
-  private readonly envFilePath?: string;
-  private readonly identityFilePath?: string;
+  private readonly db: DatabaseSync;
   private readonly savedIdentities: Record<string, { userEmail?: string; displayName?: string }> = Object.create(null);
   readonly affinityTable = new SessionAffinityTable();
 
@@ -229,6 +228,7 @@ export class UpstreamKeyPool {
     | "incognitoMode"
     | "envFilePath"
     | "dataDir"
+    | "dbFile"
   > & Partial<Pick<GatewayConfig, "chatAgentId" | "keyChatAgentIds" | "autoEnsureCodingAgent" | "customAgentPrompt">> & {
     maxInflightPerSlot?: number;
   }) {
@@ -242,39 +242,11 @@ export class UpstreamKeyPool {
     this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
     this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
     this.chatAgentId = config.chatAgentId?.trim() || undefined;
-    this.envFilePath = config.envFilePath;
-    if (config.dataDir) {
-      this.identityFilePath = path.join(config.dataDir, "account-identities.json");
-      this.loadSavedIdentities();
-    }
-
-    const bootNow = Date.now();
-    const totalBootKeys = config.quickTokens.length + config.disabledQuickTokens.length;
-    let bootIdx = 0;
-    for (const k of config.quickTokens) {
-      const s = this.upsertInternal(k, true);
-      if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
-      if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
-      if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
-      s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
-      bootIdx += 1;
-    }
-    for (const k of config.disabledQuickTokens) {
-      if (!this.slots.some((s) => s.rawKey === k)) {
-        const s = this.upsertInternal(k, false);
-        if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
-        if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
-        if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
-        s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
-        bootIdx += 1;
-        const saved = config.keyAutoDisabled?.[s.slotId];
-        if (saved) {
-          s.autoDisabledKind = saved.kind;
-          s.autoDisabledReason = saved.reason || undefined;
-          if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
-        }
-      }
-    }
+    this.db = openDatabaseFor(config.dbFile);
+    this.loadSavedIdentities();
+    this.loadPoolSettings(config);
+    const loadedAccounts = this.loadAccountsFromDb();
+    if (loadedAccounts === 0) this.seedAccountsFromConfig(config);
   }
 
   private upsertInternal(rawKey: string, enabled: boolean, label?: string): InternalKeySlot {
@@ -337,78 +309,214 @@ export class UpstreamKeyPool {
   }
 
   private loadSavedIdentities(): void {
-    if (!this.identityFilePath) return;
     try {
-      const raw = fs.readFileSync(this.identityFilePath, "utf8");
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed)) {
-          if (k === "__proto__" || k === "constructor" || k === "prototype") continue;
-          if (v && typeof v === "object") {
-            const rec = v as Record<string, unknown>;
-            this.savedIdentities[k] = {
-              ...(typeof rec.userEmail === "string" && rec.userEmail.trim() ? { userEmail: rec.userEmail.trim() } : {}),
-              ...(typeof rec.displayName === "string" && rec.displayName.trim() ? { displayName: rec.displayName.trim() } : {}),
-            };
-          }
-        }
+      const rows = this.db
+        .prepare("SELECT slot_id, user_email, display_name FROM upstream_identities")
+        .all() as Array<{ slot_id: string; user_email: string | null; display_name: string | null }>;
+      for (const row of rows) {
+        if (row.slot_id === "__proto__" || row.slot_id === "constructor" || row.slot_id === "prototype") continue;
+        this.savedIdentities[row.slot_id] = {
+          ...(row.user_email ? { userEmail: row.user_email } : {}),
+          ...(row.display_name ? { displayName: row.display_name } : {}),
+        };
       }
     } catch {
-      // File may not exist on first boot
+      // Empty table on first boot.
     }
   }
 
   private persistSavedIdentities(): void {
-    if (!this.identityFilePath) return;
     try {
-      const dir = path.dirname(this.identityFilePath);
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const tmp = `${this.identityFilePath}.tmp.${process.pid}`;
-      fs.writeFileSync(tmp, JSON.stringify(this.savedIdentities, null, 2), { encoding: "utf8", mode: 0o600 });
-      fs.renameSync(tmp, this.identityFilePath);
+      const upsert = this.db.prepare(
+        "INSERT INTO upstream_identities (slot_id, user_email, display_name, updated_at) VALUES (?, ?, ?, ?) " +
+          "ON CONFLICT(slot_id) DO UPDATE SET user_email = excluded.user_email, display_name = excluded.display_name, updated_at = excluded.updated_at",
+      );
+      const now = new Date().toISOString();
+      transaction(this.db, () => {
+        for (const [slotId, identity] of Object.entries(this.savedIdentities)) {
+          upsert.run(slotId, identity.userEmail ?? null, identity.displayName ?? null, now);
+        }
+      });
     } catch {
       // Non-fatal persistence failure
     }
   }
 
-  private persist(): void {
-    const keyLabels: Record<string, string> = {};
-    const keyProxies: Record<string, string> = {};
-    const keyChatAgentIds: Record<string, string> = {};
-    const keyAddedAt: Record<string, number> = {};
-    for (const s of this.slots) {
-      if (s.label) keyLabels[s.slotId] = s.label;
-      if (s.proxyUrl) keyProxies[s.slotId] = s.proxyUrl;
-      if (s.chatAgentId) keyChatAgentIds[s.slotId] = s.chatAgentId;
-      if (s.addedAt) keyAddedAt[s.slotId] = s.addedAt;
+  private loadPoolSettings(config: Pick<
+    GatewayConfig,
+    | "lbStrategy"
+    | "sessionAffinityEnabled"
+    | "sessionAffinityTtlMs"
+    | "autoDisableExhaustedKeys"
+    | "incognitoMode"
+  > & Partial<Pick<GatewayConfig, "autoEnsureCodingAgent" | "customAgentPrompt" | "chatAgentId">>): void {
+    try {
+      const row = this.db
+        .prepare(
+          "SELECT lb_strategy, session_affinity_enabled, session_affinity_ttl_ms, auto_disable_exhausted_keys, " +
+            "incognito_mode, auto_ensure_coding_agent, custom_agent_prompt, chat_agent_id FROM pool_settings WHERE id = 1",
+        )
+        .get() as Record<string, unknown> | undefined;
+      if (!row) {
+        this.persistSettings();
+        return;
+      }
+      if (typeof row.lb_strategy === "string" && row.lb_strategy) this.lbStrategy = row.lb_strategy as LbStrategy;
+      this.sessionAffinityEnabled = Number(row.session_affinity_enabled) !== 0;
+      if (Number(row.session_affinity_ttl_ms) > 0) this.sessionAffinityTtlMs = Number(row.session_affinity_ttl_ms);
+      this.autoDisableExhaustedKeys = Number(row.auto_disable_exhausted_keys) !== 0;
+      this.incognitoMode = Number(row.incognito_mode) !== 0;
+      this.autoEnsureCodingAgent = Number(row.auto_ensure_coding_agent) !== 0;
+      this.customAgentPrompt = typeof row.custom_agent_prompt === "string" && row.custom_agent_prompt.trim()
+        ? row.custom_agent_prompt.trim()
+        : undefined;
+      this.chatAgentId = typeof row.chat_agent_id === "string" && row.chat_agent_id.trim() ? row.chat_agent_id.trim() : undefined;
+    } catch {
+      // Unreadable settings row: keep the env-derived defaults.
+      void config;
     }
-    const keyAutoDisabled: Record<string, AutoDisabledState> = {};
-    for (const s of this.slots) {
-      if (!s.enabled && s.autoDisabledKind && s.autoDisabledReason) {
-        keyAutoDisabled[s.slotId] = {
-          kind: s.autoDisabledKind,
-          reason: s.autoDisabledReason,
-          ...(s.autoResetAtMs ? { resetAtMs: s.autoResetAtMs } : {})
-        };
+  }
+
+  /** Load persisted upstream accounts; returns how many rows the database knew about. */
+  private loadAccountsFromDb(): number {
+    let rows: Array<Record<string, unknown>> = [];
+    try {
+      rows = this.db
+        .prepare(
+          "SELECT slot_id, token, enabled, label, proxy_url, chat_agent_id, added_at, auto_disabled_kind, " +
+            "auto_disabled_reason, auto_reset_at FROM upstream_accounts ORDER BY added_at ASC",
+        )
+        .all() as Array<Record<string, unknown>>;
+    } catch {
+      return 0;
+    }
+    for (const row of rows) {
+      const token = typeof row.token === "string" ? row.token.trim() : "";
+      if (!token) continue;
+      const slot = this.upsertInternal(token, Number(row.enabled) !== 0);
+      if (typeof row.label === "string" && row.label.trim()) slot.label = row.label.trim();
+      if (typeof row.proxy_url === "string" && row.proxy_url.trim()) slot.proxyUrl = row.proxy_url.trim();
+      if (typeof row.chat_agent_id === "string" && row.chat_agent_id.trim()) slot.chatAgentId = row.chat_agent_id.trim();
+      if (Number(row.added_at) > 0) slot.addedAt = Number(row.added_at);
+      if (typeof row.auto_disabled_kind === "string" && row.auto_disabled_kind) {
+        slot.autoDisabledKind = row.auto_disabled_kind as InternalKeySlot["autoDisabledKind"];
+        if (typeof row.auto_disabled_reason === "string" && row.auto_disabled_reason) {
+          slot.autoDisabledReason = row.auto_disabled_reason;
+        }
+        if (Number(row.auto_reset_at) > 0) slot.autoResetAtMs = Number(row.auto_reset_at);
       }
     }
-    persistPoolConfigToEnvFile(this.envFilePath, {
-      activeKeys: this.slots.filter((s) => s.enabled).map((s) => s.rawKey),
-      disabledKeys: this.slots.filter((s) => !s.enabled).map((s) => s.rawKey),
-      keyLabels,
-      keyProxies,
-      chatAgentId: this.chatAgentId ?? "",
-      keyChatAgentIds,
-      keyAddedAt,
-      keyAutoDisabled,
-      lbStrategy: this.lbStrategy,
-      sessionAffinityEnabled: this.sessionAffinityEnabled,
-      sessionAffinityTtlMs: this.sessionAffinityTtlMs,
-      autoDisableExhaustedKeys: this.autoDisableExhaustedKeys,
-      incognitoMode: this.incognitoMode,
-      autoEnsureCodingAgent: this.autoEnsureCodingAgent,
-      customAgentPrompt: this.customAgentPrompt ?? ""
-    });
+    return rows.length;
+  }
+
+  /**
+   * First boot after the SQLite migration: `.env` is a bootstrap seed only.
+   * Once any account exists in the database, the console owns the account list.
+   */
+  private seedAccountsFromConfig(
+    config: Pick<
+      GatewayConfig,
+      "quickTokens" | "disabledQuickTokens" | "keyLabels" | "keyAddedAt" | "keyAutoDisabled"
+    > & Partial<Pick<GatewayConfig, "keyProxies" | "keyChatAgentIds">>,
+  ): void {
+    const bootNow = Date.now();
+    const totalBootKeys = config.quickTokens.length + config.disabledQuickTokens.length;
+    let bootIdx = 0;
+    for (const k of config.quickTokens) {
+      const s = this.upsertInternal(k, true);
+      if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
+      if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+      if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
+      s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
+      bootIdx += 1;
+    }
+    for (const k of config.disabledQuickTokens) {
+      if (!this.slots.some((s) => s.rawKey === k)) {
+        const s = this.upsertInternal(k, false);
+        if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
+        if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+        if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
+        s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
+        bootIdx += 1;
+        const saved = config.keyAutoDisabled?.[s.slotId];
+        if (saved) {
+          s.autoDisabledKind = saved.kind;
+          s.autoDisabledReason = saved.reason || undefined;
+          if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
+        }
+      }
+    }
+    if (this.slots.length > 0) this.persist();
+  }
+
+  private persistSettings(): void {
+    this.db
+      .prepare(
+        "INSERT INTO pool_settings (id, lb_strategy, session_affinity_enabled, session_affinity_ttl_ms, " +
+          "auto_disable_exhausted_keys, incognito_mode, auto_ensure_coding_agent, custom_agent_prompt, chat_agent_id) " +
+          "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?) " +
+          "ON CONFLICT(id) DO UPDATE SET lb_strategy = excluded.lb_strategy, " +
+          "session_affinity_enabled = excluded.session_affinity_enabled, session_affinity_ttl_ms = excluded.session_affinity_ttl_ms, " +
+          "auto_disable_exhausted_keys = excluded.auto_disable_exhausted_keys, incognito_mode = excluded.incognito_mode, " +
+          "auto_ensure_coding_agent = excluded.auto_ensure_coding_agent, custom_agent_prompt = excluded.custom_agent_prompt, " +
+          "chat_agent_id = excluded.chat_agent_id",
+      )
+      .run(
+        this.lbStrategy,
+        this.sessionAffinityEnabled ? 1 : 0,
+        this.sessionAffinityTtlMs,
+        this.autoDisableExhaustedKeys ? 1 : 0,
+        this.incognitoMode ? 1 : 0,
+        this.autoEnsureCodingAgent ? 1 : 0,
+        this.customAgentPrompt ?? null,
+        this.chatAgentId ?? null,
+      );
+  }
+
+  /** Persist the account list and routing settings into SQLite (no `.env` rewrites any more). */
+  private persist(): void {
+    const upsert = this.db.prepare(`
+      INSERT INTO upstream_accounts
+        (slot_id, token, auth_type, enabled, label, proxy_url, chat_agent_id, added_at,
+         auto_disabled_kind, auto_disabled_reason, auto_reset_at, user_email, display_name, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(slot_id) DO UPDATE SET
+        token = excluded.token, enabled = excluded.enabled, label = excluded.label, proxy_url = excluded.proxy_url,
+        chat_agent_id = excluded.chat_agent_id, added_at = excluded.added_at,
+        auto_disabled_kind = excluded.auto_disabled_kind, auto_disabled_reason = excluded.auto_disabled_reason,
+        auto_reset_at = excluded.auto_reset_at, user_email = excluded.user_email,
+        display_name = excluded.display_name, updated_at = excluded.updated_at
+    `);
+    const now = new Date().toISOString();
+    try {
+      transaction(this.db, () => {
+        const slotIds = this.slots.map((s) => s.slotId);
+        const placeholders = slotIds.map(() => "?").join(",") || "''";
+        this.db.prepare(`DELETE FROM upstream_accounts WHERE slot_id NOT IN (${placeholders})`).run(...slotIds);
+        for (const s of this.slots) {
+          upsert.run(
+            s.slotId,
+            s.rawKey,
+            s.authType,
+            s.enabled ? 1 : 0,
+            s.label ?? null,
+            s.proxyUrl ?? null,
+            s.chatAgentId ?? null,
+            s.addedAt ?? 0,
+            !s.enabled && s.autoDisabledKind ? s.autoDisabledKind : null,
+            !s.enabled && s.autoDisabledKind ? s.autoDisabledReason ?? null : null,
+            !s.enabled && s.autoDisabledKind ? s.autoResetAtMs ?? null : null,
+            s.identity?.userEmail ?? null,
+            s.identity?.displayName ?? null,
+            s.identity?.createdAt ?? now,
+            now,
+          );
+        }
+        this.persistSettings();
+      });
+    } catch {
+      // Non-fatal: the in-memory pool keeps working.
+    }
   }
 
   getSettings(): PoolRoutingSettings {

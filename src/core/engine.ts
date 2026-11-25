@@ -34,6 +34,7 @@ import { listLiveModels, resolveModelSelection } from "../services/model-catalog
 import {
   EffortCapabilityRegistry,
   MAX_EFFORT,
+  isProbedTier,
   looksLikeUnsupportedEffortError,
 } from "../services/effort-capability.js";
 import type { ExecutionModeTag, UsageTracker } from "../services/usage-tracker.js";
@@ -1219,9 +1220,7 @@ export class QuickExecutionEngine {
       process.env.SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM === "true";
     this.webSearchEnabled = process.env.WEB_SEARCH_ENABLED !== "false";
     this.sanitizeAwsUiTags = process.env.SANITIZE_AWS_UI_TAGS !== "false";
-    this.effortCapabilities = new EffortCapabilityRegistry(
-      this.config.dataDir ? path.join(this.config.dataDir, "effort-capabilities.json") : undefined,
-    );
+    this.effortCapabilities = new EffortCapabilityRegistry(this.config.dbFile);
   }
 
   runtimeStats() {
@@ -1239,8 +1238,8 @@ export class QuickExecutionEngine {
     const attempt = this.effortAttempts.get(turn);
     if (!attempt) return;
     this.effortAttempts.delete(turn);
-    if (attempt.requestedEffort === MAX_EFFORT && attempt.sentEffort === MAX_EFFORT) {
-      this.effortCapabilities.markSupported(attempt.accountKey);
+    if (isProbedTier(attempt.requestedEffort) && attempt.sentEffort === attempt.requestedEffort) {
+      this.effortCapabilities.markSupported(attempt.accountKey, attempt.sentEffort);
     }
   }
 
@@ -2059,13 +2058,13 @@ export class QuickExecutionEngine {
           }
         }
 
-        // Compatibility fallback for the optimistic `max` tier: when AWS Quick rejects the value
-        // (not a quota / rate-limit / auth / transport failure), remember it for this account and
-        // retry the same slot once with `high` instead of surfacing an error the client can't act on.
+        // Compatibility fallback for optimistically forwarded top tiers: when AWS Quick rejects
+        // the value (not a quota / rate-limit / auth / transport failure), remember it for this
+        // account and retry the same slot once with `high` instead of surfacing a raw error.
         const effortAttempt = this.effortAttempts.get(turn);
         if (
           effortAttempt &&
-          effortAttempt.sentEffort === MAX_EFFORT &&
+          isProbedTier(effortAttempt.sentEffort) &&
           !yieldedOutput &&
           !turn.signal?.aborted &&
           !retriedMaxEffortDowngrade &&
@@ -2077,7 +2076,7 @@ export class QuickExecutionEngine {
           looksLikeUnsupportedEffortError(msg)
         ) {
           retriedMaxEffortDowngrade = true;
-          this.effortCapabilities.markUnsupported(effortAttempt.accountKey, msg);
+          this.effortCapabilities.markUnsupported(effortAttempt.accountKey, effortAttempt.sentEffort, msg);
           attempt -= 1;
           continue;
         }
@@ -2950,8 +2949,9 @@ export class QuickExecutionEngine {
           !(turn.stream && this.suppressLateRoutedThinkingInStream && hasEmittedText);
         const emitOrDeferRoutedThinking = (modelName: string) => {
           emittedRoutedModel = true;
+          const effortAttempt = this.effortAttempts.get(turn);
           const downgradeNote =
-            this.effortAttempts.get(turn)?.downgraded === true ? ` (requested ${MAX_EFFORT}, fallback)` : "";
+            effortAttempt?.downgraded === true ? ` (requested ${effortAttempt.requestedEffort}, fallback)` : "";
           const line = `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort}${downgradeNote} · routed=${modelName}\n`;
           if (!usageLimitChecked) {
             pendingRoutedThinking = line;

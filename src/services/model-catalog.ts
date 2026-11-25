@@ -19,7 +19,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Balanced speed and depth for coding and general tasks (AWS Quick balanced mode)",
     agentMode: "balanced",
     thinkingEffort: "off",
-    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "max"] }],
+    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "xhigh", "max"] }],
   },
   {
     id: "claude-opus-5-5",
@@ -28,7 +28,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Deep reasoning and highest quality for complex tasks (AWS Quick smart mode)",
     agentMode: "smart",
     thinkingEffort: "off",
-    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "max"] }],
+    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "xhigh", "max"] }],
   },
 ];
 
@@ -73,10 +73,12 @@ function parseEffort(raw: unknown): QuickThinkingEffort | undefined {
   if (k === "off" || k === "none" || k === "disabled" || k === "false") return "off";
   if (k === "low" || k === "minimal") return "low";
   if (k === "medium" || k === "mid") return "medium";
-  // `max` / `xhigh` / `ultra` are forwarded as-is so the top tier can be probed against
-  // AWS Quick; the engine degrades them to `high` per account if upstream rejects the value.
-  if (k === "max" || k === "maximum" || k === "xhigh" || k === "ultra") return "max";
   if (k === "high") return "high";
+  // Every tier above `high` is forwarded verbatim (no folding into a neighbour) so AWS Quick
+  // can honor it whenever it learns to; if an account rejects one, the engine degrades that
+  // tier to `high` for that account only (see services/effort-capability.ts).
+  if (k === "xhigh" || k === "x-high" || k === "extra-high" || k === "extra_high") return "xhigh";
+  if (k === "max" || k === "maximum" || k === "ultra") return "max";
   return undefined;
 }
 

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { GatewayError, type GatewayConfig } from "../core/types.js";
+import { openDatabaseFor, parseJsonColumn, transaction } from "../storage/db.js";
 import { safeStringEquals } from "../utils/hash.js";
 import { normalizeBaseModelId } from "./model-access.js";
 
@@ -90,107 +90,95 @@ function normalizeExpiresAt(val: unknown): string | null {
 
 export class ClientGatewayKeyManager {
   private readonly keys: InternalClientKey[] = [];
-  private readonly stateFilePath?: string;
+  private readonly db: DatabaseSync;
   /** SHA-256 digests (never plaintext) of `.env` tokens the operator explicitly deleted in the console. */
-  private readonly tombstoneFilePath?: string;
   private readonly tombstones = new Set<string>();
   private persistTimer: NodeJS.Timeout | null = null;
   /** Notable startup reconciliation events (pruned / suppressed env keys) for the caller to log. */
   readonly startupEvents: Array<{ event: string; id: string; name: string }> = [];
 
-  constructor(config: Pick<GatewayConfig, "gatewayTokens" | "envFilePath" | "dataDir">) {
-    const dir = config.dataDir ?? (config.envFilePath ? path.dirname(config.envFilePath) : undefined);
-    if (dir) {
-      this.stateFilePath = path.join(dir, "gateway-keys.json");
-      this.tombstoneFilePath = path.join(dir, "env-key-tombstones.json");
-    }
+  constructor(config: Pick<GatewayConfig, "gatewayTokens" | "dbFile">) {
+    this.db = openDatabaseFor(config.dbFile);
     this.loadAndSeed(config.gatewayTokens);
   }
 
   private loadTombstones(): void {
-    if (!this.tombstoneFilePath || !existsSync(this.tombstoneFilePath)) return;
     try {
-      const raw = JSON.parse(readFileSync(this.tombstoneFilePath, "utf8")) as unknown;
-      const hashes = raw && typeof raw === "object" ? (raw as { hashes?: unknown }).hashes : undefined;
-      if (Array.isArray(hashes)) {
-        for (const h of hashes) if (typeof h === "string" && /^[a-f0-9]{64}$/.test(h)) this.tombstones.add(h);
+      const rows = this.db.prepare("SELECT digest FROM gateway_key_tombstones").all() as Array<{ digest: string }>;
+      for (const row of rows) {
+        if (/^[a-f0-9]{64}$/.test(row.digest)) this.tombstones.add(row.digest);
       }
     } catch {
-      // Corrupt tombstone file: ignore (worst case an env key is re-seeded once and can be deleted again).
+      // Unreadable tombstone table: worst case an env key is re-seeded once and can be deleted again.
     }
   }
 
   private persistTombstones(): void {
-    if (!this.tombstoneFilePath) return;
-    const dir = path.dirname(this.tombstoneFilePath);
-    mkdirSync(dir, { recursive: true });
-    const tmpPath = `${this.tombstoneFilePath}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify({ v: 1, hashes: [...this.tombstones].sort() }, null, 2) + "\n", { mode: 0o600 });
-    try {
-      chmodSync(tmpPath, 0o600);
-    } catch {
-      // Ignore on platforms/filesystems without POSIX chmod
-    }
-    renameSync(tmpPath, this.tombstoneFilePath);
+    transaction(this.db, () => {
+      this.db.exec("DELETE FROM gateway_key_tombstones");
+      const insert = this.db.prepare("INSERT OR REPLACE INTO gateway_key_tombstones (digest, revoked_at) VALUES (?, ?)");
+      const now = new Date().toISOString();
+      for (const digest of this.tombstones) insert.run(digest, now);
+    });
   }
 
+
   private loadAndSeed(envTokens: ReadonlySet<string>): void {
-    let loadedFromFile = false;
+    let loadedFromDatabase = false;
     let changed = false;
     let tombstonesChanged = false;
     this.loadTombstones();
-    if (this.stateFilePath && existsSync(this.stateFilePath)) {
-      try {
-        const raw = JSON.parse(readFileSync(this.stateFilePath, "utf8")) as unknown;
-        if (Array.isArray(raw)) {
-          loadedFromFile = true;
-          for (const item of raw) {
-            if (!item || typeof item !== "object") continue;
-            const rec = item as Record<string, unknown>;
-            const token = typeof rec.token === "string" ? rec.token.trim() : "";
-            if (!token) continue;
-            const allowedList = Array.isArray(rec.allowedModels)
-              ? rec.allowedModels.filter((x): x is string => typeof x === "string").map((m) => normalizeBaseModelId(m))
-              : [];
-            const st = rec.stats && typeof rec.stats === "object" ? (rec.stats as Record<string, unknown>) : {};
-            // Files written before `source` existed: a key whose token is currently in `.env` is env-managed, the rest are console keys.
-            let source: ClientKeySource;
-            if (rec.source === "env" || rec.source === "dashboard") {
-              source = rec.source;
-            } else {
-              source = envTokens.has(token) ? "env" : "dashboard";
-              changed = true;
-            }
-            let expiresAt: string | null = null;
-            try {
-              expiresAt = normalizeExpiresAt(rec.expiresAt);
-            } catch {
-              expiresAt = null;
-            }
-            this.keys.push({
-              id: typeof rec.id === "string" && rec.id ? rec.id : `gk_${crypto.randomBytes(4).toString("hex")}`,
-              name: typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : "Gateway Key",
-              token,
-              enabled: rec.enabled !== false,
-              allowAllModels: rec.allowAllModels !== false,
-              allowedModels: new Set(allowedList),
-              maxRequests: normalizeMaxRequests(rec.maxRequests),
-              maxConcurrent: normalizeMaxRequests(rec.maxConcurrent),
-              expiresAt,
-              createdAt: typeof rec.createdAt === "string" ? rec.createdAt : new Date().toISOString(),
-              source,
-              stats: {
-                requests: typeof st.requests === "number" ? st.requests : 0,
-                inputTokens: typeof st.inputTokens === "number" ? st.inputTokens : 0,
-                outputTokens: typeof st.outputTokens === "number" ? st.outputTokens : 0,
-                ...(typeof st.lastUsedAt === "string" ? { lastUsedAt: st.lastUsedAt } : {})
-              }
-            });
-          }
+    try {
+      const rows = this.db
+        .prepare(
+          "SELECT id, name, token, enabled, allow_all_models, allowed_models, max_requests, max_concurrent, " +
+            "expires_at, created_at, source, requests, input_tokens, output_tokens, last_used_at FROM gateway_keys",
+        )
+        .all() as Array<Record<string, unknown>>;
+      if (rows.length > 0) loadedFromDatabase = true;
+      for (const row of rows) {
+        const token = typeof row.token === "string" ? row.token.trim() : "";
+        if (!token) continue;
+        const allowedList = parseJsonColumn<string[]>(row.allowed_models, [])
+          .filter((m): m is string => typeof m === "string")
+          .map((m) => normalizeBaseModelId(m));
+        let source: ClientKeySource;
+        if (row.source === "env" || row.source === "dashboard") {
+          source = row.source;
+        } else {
+          // Rows written before `source` existed: a token currently in `.env` is env-managed.
+          source = envTokens.has(token) ? "env" : "dashboard";
+          changed = true;
         }
-      } catch {
-        // Fall through to env seeding
+        let expiresAt: string | null = null;
+        try {
+          expiresAt = normalizeExpiresAt(row.expires_at);
+        } catch {
+          expiresAt = null;
+        }
+        const lastUsedAt = typeof row.last_used_at === "string" ? row.last_used_at : undefined;
+        this.keys.push({
+          id: typeof row.id === "string" && row.id ? row.id : `gk_${crypto.randomBytes(4).toString("hex")}`,
+          name: typeof row.name === "string" && row.name.trim() ? row.name.trim() : "Gateway Key",
+          token,
+          enabled: Number(row.enabled) !== 0,
+          allowAllModels: Number(row.allow_all_models) !== 0,
+          allowedModels: new Set(allowedList),
+          maxRequests: normalizeMaxRequests(row.max_requests),
+          maxConcurrent: normalizeMaxRequests(row.max_concurrent),
+          expiresAt,
+          createdAt: typeof row.created_at === "string" ? row.created_at : new Date().toISOString(),
+          source,
+          stats: {
+            requests: Number(row.requests) || 0,
+            inputTokens: Number(row.input_tokens) || 0,
+            outputTokens: Number(row.output_tokens) || 0,
+            ...(lastUsedAt ? { lastUsedAt } : {}),
+          },
+        });
       }
+    } catch {
+      // Fall through to env seeding
     }
 
     // `.env` GATEWAY_TOKEN is a declarative bootstrap, not a permanent override of the console:
@@ -226,7 +214,7 @@ export class ClientGatewayKeyManager {
       idx += 1;
       this.keys.push({
         id: `gk_${digest.slice(0, 8)}`,
-        name: idx === 1 && !loadedFromFile ? "Default Gateway Key" : `Env Key #${idx}`,
+        name: idx === 1 && !loadedFromDatabase ? "Default Gateway Key" : `Env Key #${idx}`,
         token: tok,
         enabled: true,
         allowAllModels: true,
@@ -245,40 +233,53 @@ export class ClientGatewayKeyManager {
     if (changed) this.persist();
   }
 
+  /** Sync the in-memory key list into SQLite (insert/update present rows, delete removed ones). */
   private persist(): void {
-    if (!this.stateFilePath) return;
-    const payload = this.keys.map((k) => ({
-      id: k.id,
-      name: k.name,
-      token: k.token,
-      enabled: k.enabled,
-      allowAllModels: k.allowAllModels,
-      allowedModels: [...k.allowedModels].sort(),
-      maxRequests: k.maxRequests,
-      maxConcurrent: k.maxConcurrent,
-      expiresAt: k.expiresAt,
-      createdAt: k.createdAt,
-      source: k.source,
-      stats: k.stats
-    }));
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
-    const dir = path.dirname(this.stateFilePath);
-    mkdirSync(dir, { recursive: true });
-    const tmpPath = `${this.stateFilePath}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(payload, null, 2) + "\n", { mode: 0o600 });
-    try {
-      chmodSync(tmpPath, 0o600);
-    } catch {
-      // Ignore
-    }
-    renameSync(tmpPath, this.stateFilePath);
+    const upsert = this.db.prepare(`
+      INSERT INTO gateway_keys
+        (id, name, token, enabled, allow_all_models, allowed_models, max_requests, max_concurrent,
+         expires_at, created_at, source, requests, input_tokens, output_tokens, last_used_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        name = excluded.name, token = excluded.token, enabled = excluded.enabled,
+        allow_all_models = excluded.allow_all_models, allowed_models = excluded.allowed_models,
+        max_requests = excluded.max_requests, max_concurrent = excluded.max_concurrent,
+        expires_at = excluded.expires_at, source = excluded.source,
+        requests = excluded.requests, input_tokens = excluded.input_tokens,
+        output_tokens = excluded.output_tokens, last_used_at = excluded.last_used_at
+    `);
+    transaction(this.db, () => {
+      const ids = this.keys.map((k) => k.id);
+      const placeholders = ids.map(() => "?").join(",") || "''";
+      this.db.prepare(`DELETE FROM gateway_keys WHERE id NOT IN (${placeholders})`).run(...ids);
+      for (const k of this.keys) {
+        upsert.run(
+          k.id,
+          k.name,
+          k.token,
+          k.enabled ? 1 : 0,
+          k.allowAllModels ? 1 : 0,
+          JSON.stringify([...k.allowedModels].sort()),
+          k.maxRequests,
+          k.maxConcurrent,
+          k.expiresAt,
+          k.createdAt,
+          k.source,
+          k.stats.requests,
+          k.stats.inputTokens,
+          k.stats.outputTokens,
+          k.stats.lastUsedAt ?? null,
+        );
+      }
+    });
   }
 
   private schedulePersist(): void {
-    if (!this.stateFilePath || this.persistTimer) return;
+    if (this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
       try {

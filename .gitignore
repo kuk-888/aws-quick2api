@@ -7,10 +7,18 @@ dist/
 .env.*
 !.env.example
 gateway-keys.json
+env-key-tombstones.json
 usage-ledger.json
 admin-session.key
+account-identities.json
+effort-capabilities.json
+*.imported
 *.key
 data/
+# SQLite runtime state (WAL/SHM sidecars included)
+*.db
+*.db-wal
+*.db-shm
 
 # Logs & OS files
 *.log

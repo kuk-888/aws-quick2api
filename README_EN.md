@@ -24,7 +24,7 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
   - Optional gateway safety-net compaction above `850K` tokens (`AUTO_COMPACT_OVERFLOW_TOKENS`, zero-touch below threshold so client Prompt Cache stays intact).
   - Streaming sanitizer converts AWS Quick's proprietary `<decision>` / `<decisions>` / `<artifact>` UI XML into plain Markdown while leaving fenced code blocks untouched.
 - **Auto-Managed Custom Agent & Clean Tool Bridge**:
-  - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Coding Assistant` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
+  - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Coding Assistant` from your template, persisting the binding to SQLite (`upstream_accounts`) for zero-overhead reuse.
   - When a custom agent is active, tool bridging switches to ultra-clean minimal JSON schemas (no verbose anti-refusal boilerplate; zero `user_message` suffix injection on Opus/Sonnet), reliably powering local files, `.env`, shell, MCP, Skills, and Codex `apply_patch`.
   - Under **Routing & Strategy**, hot-update `AUTO_ENSURE_CODING_AGENT` and the global default instructions template `CUSTOM_AGENT_PROMPT`; under **Credentials**, click **Agent** on any account to inspect live custom agents, switch or restore default in one click, auto-create/bind, or **edit & hot-publish an existing agent's prompt directly to AWS Quick**.
 - **Multi-Account Pool & Per-Credential Proxies**:
@@ -107,14 +107,14 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 >
 > **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax such as `claude-sonnet-5-5[effort=high]`.
 >
-> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `max`. `max` (also `xhigh` / `ultra` / `maximum`) is forwarded to AWS Quick as-is and probed per account: if the first `max` turn completes, the account is marked as supporting it; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in `<DATA_DIR>/effort-capabilities.json`, and uses `high` for that account afterwards (other accounts keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
+> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `max`. `max` (also `xhigh` / `ultra` / `maximum`) is forwarded to AWS Quick as-is and probed per account: if the first `max` turn completes, the account is marked as supporting it; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in the SQLite `effort_capabilities` table, and uses `high` for that account afterwards (other accounts keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
 
 ---
 
 ## Quick Start
 
 ### Requirements
-- Node.js `>= 22.13.0` (or Docker)
+- Node.js `>= 24.0.0` (built-in `node:sqlite`, no native dependency needed; or Docker)
 
 ### Run Locally
 
@@ -161,6 +161,7 @@ See [.env.example](./.env.example) for the full template:
 | `GATEWAY_TOKEN` | - | Optional bootstrap bearer token(s), comma-separated. Seeded once into the console and tagged `.env`; afterwards the console is authoritative: deleting it there revokes it permanently (not re-created on restart), while removing/changing it in `.env` removes/replaces that key on next restart. Unset = a random key is auto-generated. Placeholder values (e.g. `sk-aq-change-me`) are rejected at startup |
 | `ENABLE_DASHBOARD` | `true` | Enable Web Console (`false` disables all console routes) |
 | `ADMIN_PASSWORD` | - | Console login password (required on remote servers; if unset, first-time setup is restricted to localhost `127.0.0.1`/`::1`) |
+| `DB_FILE` | `<DATA_DIR>/quick2api.db` | Runtime state database (SQLite via the built-in `node:sqlite`, no native dependency): gateway sub-keys, upstream accounts and pool settings, usage ledger, reasoning-tier probe results, and the console session secret all live here. Without `DATA_DIR` it falls back to `:memory:` (lost on restart). On first start the legacy `gateway-keys.json` / `usage-ledger.json` / `effort-capabilities.json` / `account-identities.json` / `admin-session.key` files are imported and renamed to `*.imported` (never deleted) |
 | `QUICK_TOKENS` | `local-outpost` | Upstream credentials (can also be added via OAuth/Cookie in Console) |
 | `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `claude-opus-5-5`) |
 | `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console) |

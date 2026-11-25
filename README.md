@@ -24,7 +24,7 @@
   - 超 `850K` tokens 时触发网关兜底裁剪/摘要（`AUTO_COMPACT_OVERFLOW_TOKENS`，低于阈值完全不介入，不影响客户端 Prompt Cache 命中）。
   - 内置流式 XML 净化器：自动将 AWS Quick 私有的 `<decision>` / `<decisions>` / `<artifact>` 交互标签转为标准 Markdown，同时保护代码块原样输出。
 - **自定义 Agent 自动绑定与零污染工具桥接**：
-  - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，持久化写入 `.env`（后续 0ms 额外开销）。
+  - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，绑定结果持久化到 SQLite（`upstream_accounts` 表，后续 0ms 额外开销）。
   - 自定义 Agent 生效后自动切换极简工具桥接（去除长篇防拒答文案，Opus / Sonnet 保持 `user_message` 零注入），稳定支持 Claude Code / Codex CLI / Witan 发起本地文件、`.env`、终端、MCP、Skill、`apply_patch` 等调用。
   - Web 管理台「路由与策略」支持热更新 `AUTO_ENSURE_CODING_AGENT` 开关与全局默认提示词模板 `CUSTOM_AGENT_PROMPT`；「凭证池」点击任意账号的 **Agent** 按钮即可实时查看该账号下所有自定义 Agent、一键切换/恢复默认、一键自动创建绑定，或**在线编辑并热发布已有 Agent 提示词到 AWS Quick**。
 - **多账号调度与独立代理**：
@@ -115,14 +115,14 @@ flowchart LR
 >
 > **兼容别名**：旧 `quick-fast`、`quick-balanced`、`quick-smart` 仍可作为请求别名；`quick-balanced-think` 与 `quick-smart-think` 保留默认思考强度，`quick-advanced` 保留 Advanced 模式。支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking` 或方括号语法（如 `claude-sonnet-5-5[effort=high]`）按请求覆盖思考强度。
 >
-> **思考强度档位**：`off` → `low` → `medium` → `high` → `max`。`max`（也接受 `xhigh` / `ultra` / `maximum`）会原样透传给 AWS Quick，并按账号做一次探测：该账号首次 `max` 请求若正常完成即记为支持；若上游显式拒绝该取值，网关会在同一账号上自动降级为 `high` 重试一次，并把结果写入 `<DATA_DIR>/effort-capabilities.json`，之后该账号直接走 `high`（其它账号仍会各自探测）。设 `THINKING_EFFORT_MAX_PASSTHROUGH=false` 可全局强制 `high`。
+> **思考强度档位**：`off` → `low` → `medium` → `high` → `max`。`max`（也接受 `xhigh` / `ultra` / `maximum`）会原样透传给 AWS Quick，并按账号做一次探测：该账号首次 `max` 请求若正常完成即记为支持；若上游显式拒绝该取值，网关会在同一账号上自动降级为 `high` 重试一次，并把结果写入 SQLite 的 `effort_capabilities` 表，之后该账号直接走 `high`（其它账号仍会各自探测）。设 `THINKING_EFFORT_MAX_PASSTHROUGH=false` 可全局强制 `high`。
 
 ---
 
 ## 快速开始
 
 ### 环境要求
-- Node.js `>= 22.13.0`（或 Docker）
+- Node.js `>= 24.0.0`（内置 `node:sqlite`，无需任何原生依赖；或使用 Docker）
 
 ### 本地运行
 
@@ -169,6 +169,7 @@ docker compose pull && docker compose up -d
 | `GATEWAY_TOKEN` | - | 可选的首次引导令牌，支持逗号分隔多个。仅在首次启动时种入后台并标记 `.env`；之后以管理台为准：在管理台删除即永久撤销（重启不会再生成），从 `.env` 删除或更换则下次重启移除/替换对应密钥。留空会自动生成随机密钥。占位值（如 `sk-aq-change-me`）会被拒绝启动 |
 | `ENABLE_DASHBOARD` | `true` | 是否启用 Web 管理台（`false` 关闭全部管理台路由） |
 | `ADMIN_PASSWORD` | - | 管理台密码（公网部署必填；留空时仅允许 `127.0.0.1`/`::1` 初始化） |
+| `DB_FILE` | `<DATA_DIR>/quick2api.db` | 运行时状态数据库（SQLite，使用 Node 内置 `node:sqlite`，无需原生依赖）：网关子密钥、上游账号与池设置、用量台账、思考档位探测结果、管理台会话密钥全部存于此；未设置 `DATA_DIR` 时为 `:memory:`（重启即失）。首次启动会把旧版 `gateway-keys.json` / `usage-ledger.json` / `effort-capabilities.json` / `account-identities.json` / `admin-session.key` 导入后重命名为 `*.imported`（不删除） |
 | `QUICK_TOKENS` | `local-outpost` | 上游凭证（也可启动后直接在管理台用 OAuth 或 Cookie 添加） |
 | `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（如 `claude-opus-5-5`） |
 | `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换） |

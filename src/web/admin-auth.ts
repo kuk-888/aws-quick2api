@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
 import type http from "node:http";
+import type { DatabaseSync } from "node:sqlite";
 import { persistAdminPasswordToEnvFile } from "../core/config.js";
 import { GatewayError, type GatewayConfig } from "../core/types.js";
+import { openDatabaseFor } from "../storage/db.js";
 import { safeStringEquals } from "../utils/hash.js";
 
 const SESSION_COOKIE_NAME = "cgw_admin_session";
@@ -145,42 +145,46 @@ export class AdminAuthManager {
 
   constructor(
     config: Pick<GatewayConfig, "adminPassword" | "envFilePath"> &
-      Partial<Pick<GatewayConfig, "gatewayTokens" | "dataDir" | "trustProxy">>
+      Partial<Pick<GatewayConfig, "gatewayTokens" | "dataDir" | "trustProxy" | "dbFile">>
   ) {
     this.adminPassword = config.adminPassword;
     this.envFilePath = config.envFilePath;
     this.trustProxy = config.trustProxy ?? "loopback";
-    const stateDir = config.dataDir ?? (this.envFilePath ? path.dirname(this.envFilePath) : undefined);
-    // Random secret (never derived from the password) persisted beside state files so sessions survive restarts.
-    this.secretFilePath = stateDir ? path.join(stateDir, "admin-session.key") : undefined;
+    this.db = openDatabaseFor(config.dbFile);
+    // Random secret (never derived from the password) persisted in SQLite so sessions survive restarts.
     this.signingSecret = this.loadOrCreateSecret();
   }
 
-  private readonly secretFilePath?: string;
+  private readonly db: DatabaseSync;
+  private static readonly SECRET_NAME = "admin-session-secret";
 
   private loadOrCreateSecret(): Buffer {
-    if (this.secretFilePath && existsSync(this.secretFilePath)) {
-      try {
-        const buf = Buffer.from(readFileSync(this.secretFilePath, "utf8").trim(), "hex");
+    try {
+      const row = this.db
+        .prepare("SELECT value FROM app_secrets WHERE name = ?")
+        .get(AdminAuthManager.SECRET_NAME) as { value?: string } | undefined;
+      if (typeof row?.value === "string") {
+        const buf = Buffer.from(row.value.trim(), "hex");
         if (buf.length === 32) return buf;
-      } catch {
-        // fall through and regenerate
       }
+    } catch {
+      // fall through and regenerate
     }
     return this.rotateSecret();
   }
 
-  /** Generate (and persist when possible) a fresh signing secret; invalidates every existing session. */
+  /** Generate (and persist) a fresh signing secret; invalidates every existing session. */
   private rotateSecret(): Buffer {
     const secret = crypto.randomBytes(32);
-    if (this.secretFilePath) {
-      try {
-        mkdirSync(path.dirname(this.secretFilePath), { recursive: true });
-        writeFileSync(this.secretFilePath, secret.toString("hex") + "\n", { mode: 0o600 });
-        chmodSync(this.secretFilePath, 0o600);
-      } catch {
-        // read-only dir: sessions simply won't survive a restart
-      }
+    try {
+      this.db
+        .prepare(
+          "INSERT INTO app_secrets (name, value, updated_at) VALUES (?, ?, ?) " +
+            "ON CONFLICT(name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        )
+        .run(AdminAuthManager.SECRET_NAME, secret.toString("hex"), new Date().toISOString());
+    } catch {
+      // Persistence failure: sessions simply won't survive a restart.
     }
     return secret;
   }

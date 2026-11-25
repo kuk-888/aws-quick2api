@@ -24,6 +24,8 @@ import { fetchAllAccountQuotas } from "./services/quota-service.js";
 import { RequestTraceLogger, type RequestProtocolTag } from "./services/request-logger.js";
 import { readPackageVersion } from "./services/update-checker.js";
 import { UsageLedger } from "./services/usage-ledger.js";
+import { openDatabaseFor } from "./storage/db.js";
+import { importLegacyState } from "./storage/legacy-import.js";
 import { UsageTracker } from "./services/usage-tracker.js";
 import { classifyClient, sanitizeUserAgent } from "./utils/user-agent.js";
 import { AdminAuthManager, AuthFailureThrottle, clientIpOf, isDirectLoopbackRequest } from "./web/admin-auth.js";
@@ -364,6 +366,8 @@ async function pipeSseStream(
 
 export function createGatewayServer(options: GatewayServerOptions): GatewayServerInstance {
   const { config } = options;
+  // Import any pre-SQLite state files exactly once before the stores open the database.
+  importLegacyState(openDatabaseFor(config.dbFile), { dataDir: config.dataDir });
   const adminAuth = new AdminAuthManager(config);
   const clientKeys = new ClientGatewayKeyManager(config);
   const protocolAuthThrottle = new AuthFailureThrottle();
@@ -389,7 +393,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
   const keyPool = new UpstreamKeyPool(config);
   const modelAccess = new ModelAccessController(config);
   const usageTracker = new UsageTracker();
-  const usageLedger = new UsageLedger(config.usageLedgerFile, config.recordClientIp !== false);
+  const usageLedger = new UsageLedger(config.dbFile, config.recordClientIp !== false);
   const traceLogger = new RequestTraceLogger(100);
   const engine = new QuickExecutionEngine({
     config,
