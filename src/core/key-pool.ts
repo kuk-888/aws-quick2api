@@ -736,10 +736,11 @@ export class UpstreamKeyPool {
       if (s.connLimitCooldownUntil > 0 && s.connLimitCooldownUntil <= now) s.connLimitCooldownUntil = 0;
     }
 
-    // Step 1: Check CPA-style Sticky Session Affinity first!
+    // Step 1: Check Sticky Session Affinity first!
     // Elastic concurrency & brief conn-limit guard: if the sticky account is at maxInflightPerSlot
-    // or in a brief 2.5s conn-limit backoff, borrow an idle account for this turn WITHOUT evicting
-    // the sticky binding so subsequent turns still benefit from warm_incremental.
+    // or in a brief 2.5s conn-limit backoff, migrate cleanly to an idle account via `bindAndLease`
+    // so Turn N parks its fresh warm thread on the new account and Turn N+1 immediately hits
+    // warm_incremental there (avoiding a double cold-replay bounce back to the saturated slot).
     if (this.sessionAffinityEnabled && conversationKey) {
       const stickyRawKey = this.affinityTable.lookup(conversationKey, this.sessionAffinityTtlMs);
       if (stickyRawKey && !excludeKeys?.has(stickyRawKey)) {
@@ -764,7 +765,7 @@ export class UpstreamKeyPool {
           );
           if (spareCandidates.length > 0) {
             const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
-            return this.leaseSpecificKey(borrowed.rawKey, false);
+            return this.bindAndLease(borrowed, conversationKey);
           }
           return this.leaseSpecificKey(stickySlot.rawKey, true);
         } else if (onlyBriefConnBackoff && stickySlot) {
@@ -777,7 +778,7 @@ export class UpstreamKeyPool {
           );
           if (spareCandidates.length > 0) {
             const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
-            return this.leaseSpecificKey(borrowed.rawKey, false);
+            return this.bindAndLease(borrowed, conversationKey);
           }
           // Fall through without evicting sticky affinity
         } else {
@@ -909,16 +910,36 @@ export class UpstreamKeyPool {
   }
 
   /**
-   * CPA-style exponential backoff cooldown for transient 429 burst errors (30s -> 60s -> 120s -> max 300s).
+   * Brief non-escalating jittered backoff for transient upstream 502/503 or residential-proxy
+   * TCP/TLS hiccups. Does NOT escalate to 30s-300s rate-limit penalty and does NOT wipe all
+   * sticky sessions on the account (elastic sticky borrowing handles failover cleanly).
    */
-  reportRateLimit(rawKey: string): void {
+  reportTransientError(rawKey: string, baseBackoffMs = DEFAULT_CONN_LIMIT_COOLDOWN_MS): void {
+    const slot = this.slots.find((s) => s.rawKey === rawKey);
+    if (!slot) return;
+    const jitterMs = Math.floor(Math.random() * 2_000);
+    const until = Date.now() + Math.max(500, baseBackoffMs) + jitterMs;
+    if (until > slot.connLimitCooldownUntil) slot.connLimitCooldownUntil = until;
+    if (until > slot.cooldownUntil) slot.cooldownUntil = until;
+  }
+
+  /**
+   * Exponential backoff cooldown with ±15% jitter for transient 429 burst errors
+   * (30s -> 60s -> 120s -> max 300s). Honors upstream `Retry-After` when supplied.
+   */
+  reportRateLimit(rawKey: string, retryAfterMs?: number): void {
     const slot = this.slots.find((s) => s.rawKey === rawKey);
     if (!slot) return;
     slot.rateLimits += 1;
     slot.consecutiveRateLimits += 1;
     const multiplier = Math.min(10, 2 ** (slot.consecutiveRateLimits - 1));
-    const backoffMs = Math.min(300_000, this.baseCooldownMs * multiplier);
-    slot.cooldownUntil = Date.now() + backoffMs;
+    const baseBackoff = Math.min(300_000, this.baseCooldownMs * multiplier);
+    const jittered = Math.round(baseBackoff * (0.85 + Math.random() * 0.3));
+    const effectiveBackoff =
+      typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? Math.min(300_000, Math.max(1_000, Math.round(retryAfterMs)))
+        : Math.min(300_000, Math.max(1_000, jittered));
+    slot.cooldownUntil = Date.now() + effectiveBackoff;
     this.affinityTable.evictAllForKey(rawKey);
   }
 
@@ -1156,9 +1177,9 @@ export class UpstreamKeyPool {
         if (enabled) this.notifySlotAvailable(existing, this.maxInflightPerSlot);
         return this.toSlotStatus(existing, this.affinityTable.countBySlot());
       }
-    } else if (!normalized || normalized.length < 4 || /[\r\n]/.test(normalized)) {
+    } else if (!normalized || normalized.length < 4 || /[,\r\n]/.test(normalized)) {
       throw new GatewayError(
-        "Invalid AWS Quick credential (use `local-outpost`, `id_token`, or pasted `Copy as cURL` from quick.aws.com).",
+        "Invalid AWS Quick credential (commas/newlines are not allowed; use `local-outpost`, `id_token`, or pasted `Copy as cURL` from quick.aws.com).",
         400,
         "invalid_api_key",
       );

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { AutoDisabledState, GatewayConfig, LbStrategy } from "./types.js";
 
@@ -207,6 +207,32 @@ export function loadConfigFromEnv(
   };
 }
 
+/** Placeholder-looking secrets copied verbatim from docs / `.env.example`; they are public and must never protect a real gateway. */
+const PLACEHOLDER_SECRET_RE = /change[-_ ]?(?:me|this)|placeholder|your[-_](?:token|password|key|secret)|<[^>]+>/i;
+
+export function isPlaceholderSecret(val: string | undefined): boolean {
+  if (!val) return false;
+  return PLACEHOLDER_SECRET_RE.test(val.trim());
+}
+
+/**
+ * Returns human-readable problems for secrets that still hold documented placeholder values
+ * (e.g. `sk-aq-change-me`, `sk-aq-<generate-your-own>`, `change-this-admin-password`). Never includes the secret values themselves.
+ */
+export function findInsecurePlaceholderConfig(config: Pick<GatewayConfig, "gatewayTokens" | "adminPassword">): string[] {
+  const issues: string[] = [];
+  for (const tok of config.gatewayTokens) {
+    if (isPlaceholderSecret(tok)) {
+      issues.push("GATEWAY_TOKEN still contains a placeholder value from .env.example; remove it (a random key is auto-generated) or set your own secret.");
+      break;
+    }
+  }
+  if (config.adminPassword && isPlaceholderSecret(config.adminPassword)) {
+    issues.push("ADMIN_PASSWORD still contains a placeholder value from .env.example; set a strong password or leave it unset to initialize it from localhost.");
+  }
+  return issues;
+}
+
 function stripEnvNewlines(val: string): string {
   return val.replace(/[\r\n]/g, "");
 }
@@ -224,6 +250,11 @@ function writeEnvFileAtomic(envFilePath: string, content: string): void {
   try {
     renameSync(tmpPath, envFilePath);
   } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // Ignore cleanup errors
+    }
     const code = (err as NodeJS.ErrnoException)?.code;
     if (code === "EBUSY" || code === "EXDEV" || code === "EPERM") {
       writeFileSync(envFilePath, content, { mode: 0o600 });

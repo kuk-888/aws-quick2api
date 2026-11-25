@@ -126,22 +126,32 @@ class HttpConnectTunnelAgent extends https.Agent {
       path: `${targetHost}:${targetPort}`,
       headers,
     });
+    let settled = false;
+    const done = (err: Error | null, stream?: Duplex) => {
+      if (settled) return;
+      settled = true;
+      callback?.(err, stream as Duplex);
+    };
+
+    req.setTimeout(15_000, () => {
+      req.destroy(new Error("Proxy CONNECT handshake timed out after 15s"));
+    });
 
     req.once("connect", (res, socket) => {
       if (res.statusCode !== 200) {
         socket.destroy();
-        callback?.(new Error(`Proxy CONNECT failed (${res.statusCode} ${res.statusMessage || ""})`), socket);
+        done(new Error(`Proxy CONNECT failed (${res.statusCode} ${res.statusMessage || ""})`), socket);
         return;
       }
       const tlsSocket = tls.connect({
         socket,
         servername: options.servername || targetHost,
       });
-      callback?.(null, tlsSocket);
+      done(null, tlsSocket);
     });
 
     req.once("error", (err) => {
-      callback?.(err, undefined as unknown as Duplex);
+      done(err);
     });
     req.end();
 
@@ -376,12 +386,20 @@ function isTransientProxyNetworkError(err: unknown): boolean {
   );
 }
 
+const MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024;
+
 function doProxiedHttpsRequest(
   u: URL,
   agent: https.Agent | undefined,
   init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
     const req = https.request(
       {
         hostname: u.hostname,
@@ -394,9 +412,22 @@ function doProxiedHttpsRequest(
       },
       (res) => {
         const chunks: Buffer[] = [];
-        res.on("error", reject);
-        res.on("data", (c: Buffer) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        let totalBytes = 0;
+        res.on("error", fail);
+        res.on("data", (c: Buffer) => {
+          const b = Buffer.isBuffer(c) ? c : Buffer.from(c);
+          totalBytes += b.byteLength;
+          if (totalBytes > MAX_PROXY_RESPONSE_BYTES) {
+            res.destroy();
+            req.destroy();
+            fail(new Error(`Proxy HTTP response exceeded ${MAX_PROXY_RESPONSE_BYTES} byte limit`));
+            return;
+          }
+          chunks.push(b);
+        });
         res.on("end", () => {
+          if (settled) return;
+          settled = true;
           const bodyText = Buffer.concat(chunks).toString("utf8");
           const status = res.statusCode || 0;
           resolve({
@@ -411,7 +442,7 @@ function doProxiedHttpsRequest(
     req.setTimeout(30_000, () => {
       req.destroy(new Error("Proxy HTTP request timed out after 30s"));
     });
-    req.on("error", reject);
+    req.on("error", fail);
     if (init.body) req.write(init.body);
     req.end();
   });

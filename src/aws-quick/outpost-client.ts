@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertSafeWsHost } from './outpost-singleton.js';
 import type { CloudSessionMeta, QuickQuotaUsage } from './types.js';
 
 export interface SncsSession {
@@ -90,21 +91,40 @@ export class OutpostHandle {
     child.stdin.write(`${instanceToken}\n`);
 
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('Timed out waiting for OUTPOST_PORT')), timeoutMs);
+      let settled = false;
       let buf = '';
       const onData = (chunk: Buffer) => {
         buf += chunk.toString('utf8');
         if (buf.includes('OUTPOST_PORT:')) {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           child.stdout.off('data', onData);
+          child.off('exit', onExit);
           resolve();
         }
       };
-      child.stdout.on('data', onData);
-      child.once('exit', (code) => {
+      const onExit = (code: number | null) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        child.stdout.off('data', onData);
         reject(new Error(`quickwork-agent exited early with code ${code}`));
-      });
+      };
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        child.stdout.off('data', onData);
+        child.off('exit', onExit);
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        reject(new Error('Timed out waiting for OUTPOST_PORT'));
+      }, timeoutMs);
+      child.stdout.on('data', onData);
+      child.once('exit', onExit);
     });
 
     return new OutpostHandle(child, port, instanceToken);
@@ -176,7 +196,8 @@ export class OutpostHandle {
 
   async getProfileUsage(): Promise<QuickQuotaUsage> {
     const [session, outpostId] = await Promise.all([this.getSncsSession(), this.getOutpostId()]);
-    const resp = await fetch(`https://${session.wsHost}/integration/quick-work/qbs-event`, {
+    const safeHost = assertSafeWsHost(session.wsHost);
+    const resp = await fetch(`https://${safeHost}/integration/quick-work/qbs-event`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -213,7 +234,8 @@ export class OutpostHandle {
 
   async listCloudSessions(limit = 50): Promise<CloudSessionMeta[]> {
     const [session, outpostId] = await Promise.all([this.getSncsSession(), this.getOutpostId()]);
-    const resp = await fetch(`https://${session.wsHost}/integration/quick-work/qbs-event`, {
+    const safeHost = assertSafeWsHost(session.wsHost);
+    const resp = await fetch(`https://${safeHost}/integration/quick-work/qbs-event`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

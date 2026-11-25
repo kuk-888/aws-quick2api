@@ -3466,7 +3466,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         const rowCls = [(!k.enabled || k.isExpired || k.isQuotaExhausted) ? 'row-disabled' : '', isPicked ? 'row-picked' : ''].filter(Boolean).join(' ');
         return '<tr class="' + rowCls + '">' +
           '<td><label class="switch"><input type="checkbox" ' + (k.enabled ? 'checked' : '') + ' data-change="toggleCkEnabled" data-arg="' + esc(k.id) + '" /><span class="slider"></span></label></td>' +
-          '<td style="font-weight:500;">' + esc(k.name) + (isPicked ? ' <span class="tag tag-ok" style="margin-left:4px;font-size:10px;">' + esc(tr('当前接入', 'Active')) + '</span>' : '') + '</td>' +
+          '<td style="font-weight:500;">' + esc(k.name) + (k.source === 'env' ? ' <span class="tag" style="margin-left:4px;font-size:10px;" title="' + esc(tr('来自 .env 的 GATEWAY_TOKEN；在这里删除即永久撤销，重启不会再生成', 'From GATEWAY_TOKEN in .env; deleting it here revokes it permanently and it will not be re-created on restart')) + '">.env</span>' : '') + (isPicked ? ' <span class="tag tag-ok" style="margin-left:4px;font-size:10px;">' + esc(tr('当前接入', 'Active')) + '</span>' : '') + '</td>' +
           '<td><span class="mono" style="cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px;" title="' + esc(tr('点击在下方回显真实接入示例', 'Click to load real connect snippets below')) + '" data-click="selectCkForConnect" data-arg="' + esc(k.id) + '">' + esc(k.maskedToken) + '</span> <button class="btn-xs" style="margin-left:6px;" data-click="copyCkToken" data-arg="' + esc(k.id) + '">' + esc(tr('复制', 'Copy')) + '</button></td>' +
           '<td>' + scopeHtml + '</td>' +
           '<td>' + limitHtml + '</td>' +
@@ -3615,9 +3615,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     };
 
     window.deleteCk = async (id) => {
+      const target = clientKeysCache.find((k) => k.id === id);
+      const fromEnv = !!target && target.source === 'env';
       const ok = await uiConfirm({
         title: tr("删除网关子密钥", "Delete Gateway Sub-Key"),
-        desc: tr("确定删除这把网关子密钥吗？使用该密钥的外部客户端将立即无法访问。", "Delete this sub-key? Clients using it will lose access immediately."),
+        desc: fromEnv
+          ? tr("该密钥来自 .env 的 GATEWAY_TOKEN。删除后立即失效，且重启不会再自动生成；如需彻底清理，也请从 .env 中移除该令牌。", "This key comes from GATEWAY_TOKEN in .env. Deleting it revokes it immediately and it will NOT be re-created on restart; also remove the token from .env to clean up.")
+          : tr("确定删除这把网关子密钥吗？使用该密钥的外部客户端将立即无法访问。", "Delete this sub-key? Clients using it will lose access immediately."),
         okText: tr("确认删除", "Delete"),
         danger: true
       });

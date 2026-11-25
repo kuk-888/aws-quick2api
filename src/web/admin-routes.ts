@@ -385,8 +385,8 @@ export async function tryHandleWebAdminRoute(
   if (clientKeyMatch) {
     const keyId = clientKeyMatch[1]!;
     if (req.method === "DELETE") {
-      clientKeys.deleteKey(keyId);
-      sendJson(res, 200, { ok: true, clientKeys: clientKeys.listKeys() });
+      const { source } = clientKeys.deleteKey(keyId);
+      sendJson(res, 200, { ok: true, source, clientKeys: clientKeys.listKeys() });
       return true;
     }
     if (req.method === "PATCH") {

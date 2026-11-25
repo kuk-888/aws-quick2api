@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import type http from "node:http";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { describe, it } from "node:test";
 import vm from "node:vm";
 import {
@@ -15,24 +18,28 @@ import {
 } from "../src/aws-quick/event-stream-cbor.js";
 import {
   buildOAuthDiscoveryUrl,
+  evaluateDlpPollResponse,
   parseOAuthCredential,
   parseOAuthDiscoveryCallback,
   serializeOAuthCredential,
 } from "../src/aws-quick/oauth-client.js";
-import { parseQuickCredential } from "../src/aws-quick/outpost-singleton.js";
+import { assertSafeWsHost, parseQuickCredential } from "../src/aws-quick/outpost-singleton.js";
 import { parseWebCurlOrCredential, serializeWebCredential } from "../src/aws-quick/web-client.js";
 import {
+  assertSafeRemoteImageUrl,
   buildQuickImageAttachments,
   classifyUpstreamError,
   compactOversizedPrompt,
   estimatePromptTokens,
+  isPrivateOrReservedIp,
   isPseudo200UsageLimitPrefix,
   isPseudo200UsageLimitText,
   MAX_PARKED_WS_PER_SLOT,
+  pinnedHttpGet,
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
 import { GatewayError } from "../src/core/types.js";
-import { loadConfigFromEnv } from "../src/core/config.js";
+import { findInsecurePlaceholderConfig, loadConfigFromEnv } from "../src/core/config.js";
 import { UpstreamKeyPool, validateChatAgentId } from "../src/core/key-pool.js";
 import {
   buildToolBridgePrompt,
@@ -1051,9 +1058,14 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(l1.apiKey, l3.apiKey);
     assert.equal(l1.apiKey, l4.apiKey);
     const l5 = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
-    assert.notEqual(l5.apiKey, l1.apiKey); // borrowed idle account!
+    assert.notEqual(l5.apiKey, l1.apiKey); // migrated to idle account!
     assert.equal(l5.viaAffinity, false);
     for (const l of [l1, l2, l3, l4, l5]) l.release();
+    // Next turn stays on the migrated account (l5.apiKey) so it hits warm_incremental instead of bouncing back
+    const lNext = elasticPool.leaseKey("quick-smart", undefined, "conv-elastic");
+    assert.equal(lNext.apiKey, l5.apiKey);
+    assert.equal(lNext.viaAffinity, true);
+    lNext.release();
 
     // 4) quota-aware considers tighter of (monthly, 5h short-term burst) even for api/claude-* models
     const burstPool = new UpstreamKeyPool({ ...cfg, lbStrategy: "quota-aware", maxInflightPerSlot: 4 });
@@ -1109,7 +1121,8 @@ describe("Credential parser & ClientKeyStore", () => {
     });
     assert.equal(shortSys1, shortSys2);
 
-    // 7) [P1-2] reportConnLimit preserves sticky affinity even when a turn arrives during the brief cooldown
+    // 7) [P1-2] reportConnLimit migrates sticky affinity to the borrowed idle account when a turn arrives
+    //    during brief cooldown so Turn N+1 hits warm_incremental on the new account (zero double cold-replay)
     const connStickyPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 4 });
     const cs1 = connStickyPool.leaseKey("quick-smart", undefined, "conv-conn-sticky");
     cs1.release();
@@ -1117,8 +1130,8 @@ describe("Credential parser & ClientKeyStore", () => {
     const duringBackoff = connStickyPool.leaseKey("quick-smart", undefined, "conv-conn-sticky");
     assert.notEqual(duringBackoff.apiKey, cs1.apiKey);
     duringBackoff.release();
-    const csSnap = connStickyPool.statusSnapshot().find((s) => s.slotId === cs1.slotId)!;
-    assert.equal(csSnap.stickySessions, 1);
+    const migratedSnap = connStickyPool.statusSnapshot().find((s) => s.slotId === duringBackoff.slotId)!;
+    assert.equal(migratedSnap.stickySessions, 1);
 
     // 8) [P0-5] reportQuotaExhausted on claude-* (api pool) auto-disables even if stale cached sessionPool > 0%
     const { computeKeySlotId } = await import("../src/core/key-pool.js");
@@ -1394,7 +1407,7 @@ describe("Credential parser & ClientKeyStore", () => {
       "resumeInMinutes should still refine provisional 5h autoResetAtMs to ~42m",
     );
 
-    // 5) classifyUpstreamError treats OIDC 400 invalid_grant as permanent auth failure
+    // 5) classifyUpstreamError: strict separation of rate-limit, proxy-407, OIDC invalid_grant vs slow_down, and quota
     const { classifyUpstreamError } = await import("../src/core/engine.js");
     const oidcErr = new GatewayError(
       'OIDC refresh_token failed (400): {"error":"invalid_grant","error_description":"Invalid refresh token provided"}',
@@ -1402,5 +1415,404 @@ describe("Credential parser & ClientKeyStore", () => {
       "upstream_error",
     );
     assert.equal(classifyUpstreamError(oidcErr).isAuthErr, true);
+
+    // P2-5 + P1-1: OIDC permanent auth whitelist vs transient slow_down
+    const oidcSlowDown = new GatewayError(
+      'OIDC refresh_token failed (400): {"error":"slow_down"}',
+      502,
+      "upstream_error",
+    );
+    assert.equal(classifyUpstreamError(oidcSlowDown).isAuthErr, false);
+    for (const code of ["invalid_client", "unauthorized_client", "expired_token", "access_denied"]) {
+      const permErr = new GatewayError(`OIDC refresh_token failed (400): {"error":"${code}"}`, 502, "upstream_error");
+      assert.equal(classifyUpstreamError(permErr).isAuthErr, true, `expected ${code} to classify as isAuthErr`);
+    }
+
+    // P1-C + P2-2: Ordinary "Rate limit exceeded" / retries exhausted != quota, while explicit quota messages ARE quota
+    const rateLimitExceeded = new GatewayError("Rate limit exceeded (TooManyRequestsException)", 429, "upstream_error");
+    assert.equal(classifyUpstreamError(rateLimitExceeded).isRateLimitErr, true);
+    assert.equal(classifyUpstreamError(rateLimitExceeded).isQuotaErr, false);
+    const retriesExhausted = new GatewayError("Upstream retries exhausted", 502, "upstream_error");
+    assert.equal(classifyUpstreamError(retriesExhausted).isQuotaErr, false);
+    assert.equal(classifyUpstreamError(new GatewayError("You have exceeded your quota", 502, "upstream_error")).isQuotaErr, true);
+    assert.equal(classifyUpstreamError(new GatewayError("Monthly quota has been exhausted", 502, "upstream_error")).isQuotaErr, true);
+
+    // P1-D: Proxy CONNECT 407 must classify as proxy error, NEVER permanent auth disable
+    const proxy407 = new GatewayError("Proxy CONNECT failed (407 Proxy Authentication Required)", 502, "upstream_error");
+    assert.equal(classifyUpstreamError(proxy407).isProxyOrConnErr, true);
+    assert.equal(classifyUpstreamError(proxy407).isAuthErr, false);
+
+    // P2-13: Default-agent fallback bridge contains zero anti-refusal / device phrasing
+    const fallbackBridge = buildToolBridgePrompt(
+      [{ name: "Read", description: "Read file", inputSchema: { type: "object", properties: { file_path: { type: "string" } } } }],
+      "auto",
+      { compactForCustomAgent: false },
+    );
+    assert.ok(!/missing local devices|declining/i.test(fallbackBridge));
+
+    // Claude alias + prefix/suffix effort parsing in resolveModelSelection
+    assert.equal(resolveModelSelection("claude-opus-5-5", {}).selection.agentMode, "smart");
+    assert.equal(resolveModelSelection("claude-haiku-5-5", {}).selection.agentMode, "fast");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", {}).selection.agentMode, "balanced");
+    assert.deepEqual(resolveModelSelection("quick/claude-opus-5-5-high", {}).selection, {
+      model: "quick-smart",
+      agentMode: "smart",
+      thinkingEffort: "high",
+    });
+    assert.deepEqual(resolveModelSelection("amazon-quick/quick-balanced(medium)", {}).selection, {
+      model: "quick-balanced",
+      agentMode: "balanced",
+      thinkingEffort: "medium",
+    });
+    assert.deepEqual(resolveModelSelection("[aws]-quick-smart-thinking", {}).selection, {
+      model: "quick-smart",
+      agentMode: "smart",
+      thinkingEffort: "high",
+    });
+
+    // resolveKnownModelId canonicalizes aliases/prefixes and rejects unknown models (prevents DISABLED_MODELS bypass & 404 on aliases)
+    const { resolveKnownModelId } = await import("../src/services/model-catalog.js");
+    assert.equal(resolveKnownModelId("quick/claude-opus-5-5-high"), "quick-smart");
+    assert.equal(resolveKnownModelId("[aws]-quick-advanced"), "quick-advanced");
+    assert.equal(resolveKnownModelId("amazon-quick/quick-balanced(medium)"), "quick-balanced");
+    assert.equal(resolveKnownModelId("totally-unknown-model-999"), null);
+
+    // Out-of-band attachment wrapper prompt keeps tail inline and stays well under 50KB single frame
+    const { buildOutOfBandContextPrompt } = await import("../src/core/engine.js");
+    const hugePrompt = `${"Earlier log line.\n".repeat(12_000)}FINAL_USER_QUESTION=Extract all needles`;
+    const wrapped = buildOutOfBandContextPrompt(hugePrompt, "conversation_context_abc12345.txt");
+    assert.ok(wrapped.includes("conversation_context_abc12345.txt"));
+    assert.ok(wrapped.includes("FINAL_USER_QUESTION=Extract all needles"));
+    assert.ok(Buffer.byteLength(wrapped, "utf8") < 6_000);
+  });
+});
+
+describe(".env-seeded gateway keys: delete means revoke", () => {
+  const withDir = (fn: (dir: string) => void) => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "aq-keys-"));
+    try {
+      fn(dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  const ENV_TOK = "sk-aq-0123456789abcdef0123456789abcdef";
+
+  it("seeds an env token once, tags it `env`, and a console delete survives restart via a hashed tombstone", () => {
+    withDir((dir) => {
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const keys = a.listKeys();
+      assert.equal(keys.length, 1);
+      assert.equal(keys[0]!.source, "env");
+      assert.equal(a.deleteKey(keys[0]!.id).source, "env");
+      assert.equal(a.listKeys().length, 0);
+
+      // Restart with the SAME .env token: must not come back.
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      assert.equal(b.listKeys().length, 0);
+      assert.throws(() => b.authenticateClient(ENV_TOK));
+
+      // Tombstone file holds only a SHA-256 digest, never the plaintext token.
+      const tomb = readFileSync(path.join(dir, "env-key-tombstones.json"), "utf8");
+      assert.ok(!tomb.includes(ENV_TOK));
+      assert.match(tomb, /[a-f0-9]{64}/);
+
+      // Rotating GATEWAY_TOKEN to a new value seeds the new key; the old one stays revoked.
+      const NEW_TOK = "sk-aq-fedcba9876543210fedcba9876543210";
+      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([NEW_TOK]), dataDir: dir });
+      assert.equal(c.listKeys().length, 1);
+      assert.doesNotThrow(() => c.authenticateClient(NEW_TOK));
+      assert.throws(() => c.authenticateClient(ENV_TOK));
+    });
+  });
+
+  it("removes an env-sourced key when its token leaves .env, but never touches console-created keys", () => {
+    withDir((dir) => {
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const created = a.createKey({ name: "console-key" });
+      assert.equal(created.view.source, "dashboard");
+      a.flushStatsToDisk();
+
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set(), dataDir: dir });
+      assert.deepEqual(b.listKeys().map((k) => k.name), ["console-key"]);
+      assert.ok(b.startupEvents.some((e) => e.event === "gateway_env_key_pruned"));
+      assert.doesNotThrow(() => b.authenticateClient(created.rawToken));
+      assert.throws(() => b.authenticateClient(ENV_TOK));
+    });
+  });
+
+  it("disabled env keys stay disabled across restarts, and re-creating a deleted env token in the console is an explicit re-add", () => {
+    withDir((dir) => {
+      const a = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const id = a.listKeys()[0]!.id;
+      a.updateKey(id, { enabled: false });
+      const b = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      assert.equal(b.listKeys().length, 1);
+      assert.equal(b.listKeys()[0]!.enabled, false);
+
+      b.deleteKey(id);
+      const readded = b.createKey({ name: "readded", customToken: ENV_TOK });
+      assert.equal(readded.view.source, "dashboard");
+      const c = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      assert.deepEqual(c.listKeys().map((k) => k.name), ["readded"]);
+    });
+  });
+
+  it("upgrades legacy gateway-keys.json (no `source`) without losing keys", () => {
+    withDir((dir) => {
+      const legacy = [
+        { id: "gk_aaaaaaaaaaaaaaaa", name: "friend", token: "sk-aq-friend-token-1234567890", enabled: true, allowAllModels: true, allowedModels: [], maxRequests: null, maxConcurrent: null, expiresAt: null, createdAt: "2026-11-01T00:00:00.000Z", stats: { requests: 3, inputTokens: 1, outputTokens: 1 } },
+        { id: "gk_bbbbbbbb", name: "Env Key #1", token: ENV_TOK, enabled: true, allowAllModels: true, allowedModels: [], maxRequests: null, maxConcurrent: null, expiresAt: null, createdAt: "2026-11-01T00:00:00.000Z", stats: { requests: 5, inputTokens: 2, outputTokens: 2 } },
+      ];
+      writeFileSync(path.join(dir, "gateway-keys.json"), JSON.stringify(legacy));
+      const m = new ClientGatewayKeyManager({ gatewayTokens: new Set([ENV_TOK]), dataDir: dir });
+      const bySource = Object.fromEntries(m.listKeys().map((k) => [k.name, k.source]));
+      assert.deepEqual(bySource, { friend: "dashboard", "Env Key #1": "env" });
+      assert.equal(m.listKeys().find((k) => k.name === "friend")!.stats.requests, 3);
+      // Persisted file stays an array so a rollback to the previous release can still read it.
+      assert.ok(Array.isArray(JSON.parse(readFileSync(path.join(dir, "gateway-keys.json"), "utf8"))));
+    });
+  });
+
+  it("rejects documented placeholder secrets at startup but accepts real ones", () => {
+    assert.equal(findInsecurePlaceholderConfig({ gatewayTokens: new Set(["sk-aq-change-me"]), adminPassword: undefined }).length, 1);
+    assert.equal(findInsecurePlaceholderConfig({ gatewayTokens: new Set(), adminPassword: "change-this-admin-password" }).length, 1);
+    assert.equal(findInsecurePlaceholderConfig({ gatewayTokens: new Set(["sk-aq-change-me"]), adminPassword: "<set-a-strong-password>" }).length, 2);
+    assert.deepEqual(findInsecurePlaceholderConfig({ gatewayTokens: new Set([ENV_TOK]), adminPassword: "Zq7!v9Lx2#pRm4Tw" }), []);
+    assert.deepEqual(findInsecurePlaceholderConfig({ gatewayTokens: new Set(), adminPassword: undefined }), []);
+  });
+});
+
+describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redaction, model normalization)", () => {
+  it("blocks all IPv6 SSRF encodings including hex IPv4-mapped, NAT64, 6to4, Teredo, and expanded loopback", async () => {
+    const blockedIps = [
+      "::ffff:7f00:1",
+      "::ffff:127.0.0.1",
+      "::ffff:a9fe:a9fe",
+      "0:0:0:0:0:0:0:1",
+      "0000:0000:0000:0000:0000:ffff:7f00:0001",
+      "::7f00:1",
+      "64:ff9b::127.0.0.1",
+      "64:ff9b::7f00:1",
+      "2002:7f00:1::",
+      "2002:a9fe:a9fe::",
+      "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+      "fe80::1",
+      "fc00::1",
+    ];
+    for (const ip of blockedIps) {
+      assert.equal(isPrivateOrReservedIp(ip), true, `Expected ${ip} to be blocked`);
+    }
+    assert.equal(isPrivateOrReservedIp("1.1.1.1"), false);
+    assert.equal(isPrivateOrReservedIp("2606:4700:4700::1111"), false);
+
+    await assert.rejects(() => assertSafeRemoteImageUrl("http://[::ffff:127.0.0.1]/a.png"), /ssrf_blocked|Blocked/i);
+    await assert.rejects(() => assertSafeRemoteImageUrl("http://[::ffff:169.254.169.254]/latest/meta-data/"), /ssrf_blocked|Blocked/i);
+    await assert.rejects(() => assertSafeRemoteImageUrl("http://[0:0:0:0:0:0:0:1]/a.png"), /ssrf_blocked|Blocked/i);
+    await assert.rejects(() => assertSafeRemoteImageUrl("http://[64:ff9b::127.0.0.1]/a.png"), /ssrf_blocked|Blocked/i);
+  });
+
+  it("hardens CBOR and EventStream decoders against OOM, deep recursion, prototype pollution, and bad headersLen", () => {
+    // 4-billion-element CBOR array header with 0 payload bytes
+    assert.throws(() => cborDecode(new Uint8Array([0x9a, 0xff, 0xff, 0xff, 0xff])), /out of bounds/i);
+
+    // 40-level nested CBOR arrays exceed MAX_CBOR_DEPTH (32)
+    const deep = new Uint8Array(41);
+    deep.fill(0x81, 0, 40);
+    deep[40] = 0x01;
+    assert.throws(() => cborDecode(deep), /depth exceeds limit/i);
+
+    // Prototype pollution via __proto__ key is stripped safely
+    const encodedMap = cborEncode({ __proto__: { polluted: true }, safe: "ok" } as Record<string, unknown>);
+    // Manually craft CBOR map with explicit "__proto__" key: a2 69 "__proto__" a1 61 "x" 01 62 "ok" 01
+    const manualProtoMap = new Uint8Array([
+      0xa2,
+      0x69, ...Buffer.from("__proto__"),
+      0xa1, 0x61, 0x78, 0x01,
+      0x62, 0x6f, 0x6b, 0x01,
+    ]);
+    assert.ok(encodedMap.length > 0);
+    const decoded = cborDecode(manualProtoMap) as Record<string, unknown>;
+    assert.equal(decoded.ok, 1);
+    assert.equal(({} as Record<string, unknown>).x, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(decoded, "__proto__"), false);
+
+    // EventStream frame where headersLen > totalLen - 16
+    const badFrame = new Uint8Array(20);
+    const dv = new DataView(badFrame.buffer);
+    dv.setUint32(0, 20, false);
+    dv.setUint32(4, 12, false); // > 20 - 16 = 4
+    assert.throws(() => drainEventStream(badFrame, 0), /Invalid EventStream frame dimensions/i);
+  });
+
+  it("enforces AWS Quick domain allowlist on wsHost", () => {
+    assert.equal(assertSafeWsHost("api.us-east-1.quick.aws.com"), "api.us-east-1.quick.aws.com");
+    assert.equal(assertSafeWsHost("chat.quick.aws.dev"), "chat.quick.aws.dev");
+    assert.equal(assertSafeWsHost("us-east-1.quicksight.aws.amazon.com"), "us-east-1.quicksight.aws.amazon.com");
+
+    assert.throws(() => assertSafeWsHost("evil.com"), /untrusted/i);
+    assert.throws(() => assertSafeWsHost("evil.s3.amazonaws.com"), /untrusted/i);
+    assert.throws(() => assertSafeWsHost("127.0.0.1"), /untrusted/i);
+    assert.throws(() => assertSafeWsHost("quick.aws.com.evil.com"), /untrusted/i);
+    assert.throws(() => assertSafeWsHost("chat.quick.aws.dev:8443/path"), /untrusted/i);
+  });
+
+  it("normalizes prefixed models consistently, redacts all secret formats, and rejects commas in addKey", async () => {
+    const { normalizeBaseModelId, redactSecrets } = await import("../src/utils/hash.js");
+    assert.equal(normalizeBaseModelId("[aws]-quick-advanced"), "quick-advanced");
+    assert.equal(normalizeBaseModelId("quick/quick-smart[effort=high]"), "quick-smart");
+    assert.equal(normalizeBaseModelId("amazon-quick/quick-balanced(medium)"), "quick-balanced");
+
+    const fakeHttpProxy = ["http://", "alice", ":", "s3cr3t", "@", "1.2.3.4:8080"].join("");
+    const fakeSocksProxy = ["socks5://", "bob", ":", "pw", "@", "5.6.7.8:1080"].join("");
+    const dirty =
+      `oauth:eyJyZWZyZXNoVG9rZW4iOiJzZWNyZXQifQ== web:123456|mbtc_secret|cookie=xyz aoa123456789012345678901234 ${fakeHttpProxy} ${fakeSocksProxy}`;
+    const clean = redactSecrets(dirty);
+    assert.ok(!clean.includes("eyJyZWZyZXNo"));
+    assert.ok(!clean.includes("mbtc_secret"));
+    assert.ok(!clean.includes("aoa1234567890"));
+    assert.ok(!clean.includes("alice:s3cr3t"));
+    assert.ok(!clean.includes("bob:pw"));
+    assert.ok(clean.includes("oauth:[REDACTED]"));
+    assert.ok(clean.includes("web:[REDACTED]"));
+    assert.ok(clean.includes("aoa[REDACTED]"));
+    assert.ok(clean.includes("http://***:***@1.2.3.4:8080"));
+    assert.ok(clean.includes("socks5://***:***@5.6.7.8:1080"));
+
+    const pool = new UpstreamKeyPool({
+      quickTokens: [],
+      disabledQuickTokens: [],
+      keyLabels: {},
+      keyProxies: {},
+      keyAddedAt: {},
+      keyAutoDisabled: {},
+      keyCooldownMs: 1000,
+      lbStrategy: "round-robin",
+      sessionAffinityEnabled: false,
+      sessionAffinityTtlMs: 60_000,
+      autoDisableExhaustedKeys: false,
+      incognitoMode: true,
+    });
+    assert.throws(() => pool.addKey("tok_abc,tok_def"), /commas\/newlines are not allowed/i);
+  });
+
+  it("evaluates DLP poll states strictly and decouples 5xx transient backoff from 429 rate-limit penalties", () => {
+    assert.deepEqual(evaluateDlpPollResponse({ dlpJobStatus: "COMPLETED", policyAction: "ALLOW" }), { state: "ready" });
+    assert.deepEqual(evaluateDlpPollResponse({ dlpJobStatus: "COMPLETED", policyAction: "WARN" }), { state: "ready" });
+    assert.deepEqual(evaluateDlpPollResponse({ status: "SKIPPED" }), { state: "ready" });
+    assert.deepEqual(evaluateDlpPollResponse({ dlpJobStatus: "IN_PROGRESS" }), { state: "pending" });
+    assert.equal(evaluateDlpPollResponse({ dlpJobStatus: "COMPLETED", policyAction: "BLOCK" }).state, "failed");
+    assert.equal(evaluateDlpPollResponse({ dlpJobStatus: "FAILED" }).state, "failed");
+    assert.equal(evaluateDlpPollResponse({ status: "ERROR" }).state, "failed");
+
+    const pool = new UpstreamKeyPool({
+      quickTokens: ["ws.example.com|tok_alpha", "ws.example.com|tok_beta"],
+      disabledQuickTokens: [],
+      keyLabels: {},
+      keyProxies: {},
+      keyAddedAt: {},
+      keyAutoDisabled: {},
+      keyCooldownMs: 30_000,
+      lbStrategy: "round-robin",
+      sessionAffinityEnabled: true,
+      sessionAffinityTtlMs: 60_000,
+      autoDisableExhaustedKeys: false,
+      incognitoMode: true,
+    });
+
+    const leaseA = pool.leaseKey("quick-smart", undefined, "conv-transient-test");
+    leaseA.release();
+
+    // 502/503 transient hiccup: short jittered backoff (<6s), does NOT increment rateLimits or wipe sticky affinity
+    pool.reportTransientError(leaseA.apiKey, 2_500);
+    pool.reportTransientError(leaseA.apiKey, 2_500);
+    const snapAfterTransient = pool.statusSnapshot().find((s) => s.slotId === leaseA.slotId)!;
+    assert.equal(snapAfterTransient.rateLimitHits, 0);
+    assert.ok(snapAfterTransient.cooldownRemainingMs > 0 && snapAfterTransient.cooldownRemainingMs <= 6_000);
+    assert.equal(snapAfterTransient.stickySessions, 1);
+
+    // Real 429 with Retry-After: honors 12s Retry-After, increments rateLimitHits, and evicts sticky sessions
+    pool.reportRateLimit(leaseA.apiKey, 12_000);
+    const snapAfter429 = pool.statusSnapshot().find((s) => s.slotId === leaseA.slotId)!;
+    assert.equal(snapAfter429.rateLimitHits, 1);
+    assert.ok(snapAfter429.cooldownRemainingMs >= 10_000 && snapAfter429.cooldownRemainingMs <= 12_500);
+    assert.equal(snapAfter429.stickySessions, 0);
+  });
+
+  it("covers P0/P1 audit regressions: domain pinnedHttpGet (Node >=20 all:true), auto/default model gate, quota classifier, >4KB system-reminder affinity, loopback headers, and placeholder regex", async () => {
+    // P0-1: pinnedHttpGet works with domain hostnames under Node >=20 autoSelectFamily ({ all: true })
+    const imgServer = http.createServer((req, res) => {
+      assert.ok(String(req.headers.host || "").startsWith("img.example.test:"));
+      res.writeHead(200, { "Content-Type": "image/png" });
+      res.end(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    });
+    await new Promise<void>((r) => imgServer.listen(0, "127.0.0.1", r));
+    try {
+      const port = (imgServer.address() as net.AddressInfo).port;
+      const got = await pinnedHttpGet(new URL(`http://img.example.test:${port}/a.png`), "127.0.0.1", 4);
+      assert.equal(got.status, 200);
+      assert.equal(got.buf.byteLength, 4);
+    } finally {
+      imgServer.close();
+    }
+
+    // P1-1: auto / default resolve to quick-balanced so DISABLED_MODELS=quick-balanced cannot be bypassed
+    const { resolveKnownModelId } = await import("../src/services/model-catalog.js");
+    assert.equal(resolveKnownModelId("auto"), "quick-balanced");
+    assert.equal(resolveKnownModelId("default"), "quick-balanced");
+    assert.equal(resolveKnownModelId("quick/auto"), "quick-balanced");
+    assert.equal(resolveKnownModelId("auto[effort=high]"), "quick-balanced");
+
+    // P1-2 & P2: quota errors beat generic 429; rate limit stays rate limit; SOCKS5 auth stays proxy error
+    assert.equal(classifyUpstreamError(new GatewayError("QuotaExceededException: monthly limit exceeded", 429, "upstream_error")).isQuotaErr, true);
+    assert.equal(classifyUpstreamError(new GatewayError("You exceeded your current quota", 429, "upstream_error")).isQuotaErr, true);
+    assert.equal(classifyUpstreamError(new GatewayError("quota exhausted", 502, "upstream_error")).isQuotaErr, true);
+    const rateOnly = classifyUpstreamError(new GatewayError("Rate limit exceeded", 429, "rate_limit_exceeded"));
+    assert.equal(rateOnly.isRateLimitErr, true);
+    assert.equal(rateOnly.isQuotaErr, false);
+    const socksAuth = classifyUpstreamError(new GatewayError("SOCKS5 username/password authentication failed (0x1)", 502, "upstream_error"));
+    assert.equal(socksAuth.isProxyOrConnErr, true);
+    assert.equal(socksAuth.isAuthErr, false);
+
+    // P1-5: >4KB <system-reminder> prefix is stripped cleanly so parallel subagents get distinct affinity keys
+    const { deriveConversationAffinityKey } = await import("../src/core/session-affinity.js");
+    const bigReminder = `<system-reminder>${"CLAUDE.md instruction line.\n".repeat(300)}</system-reminder>\n`;
+    const key1 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_123" } },
+      firstUserText: `${bigReminder}Subagent task Alpha`,
+    });
+    const key2 = deriveConversationAffinityKey({
+      headers: {},
+      rawBody: { metadata: { user_id: "user_123" } },
+      firstUserText: `${bigReminder}Subagent task Beta`,
+    });
+    assert.notEqual(key1, key2);
+
+    // P1-7: placeholder regex catches .env.example literals like sk-aq-<generate-your-own>
+    assert.equal(findInsecurePlaceholderConfig({ gatewayTokens: new Set(["sk-aq-<generate-your-own>"]), adminPassword: undefined }).length, 1);
+
+    // P1-8: isDirectLoopbackRequest rejects CF/Forwarded headers and non-loopback Host
+    const { isDirectLoopbackRequest } = await import("../src/web/admin-auth.js");
+    const fakeReq = (headers: Record<string, string>, remoteAddress = "127.0.0.1") =>
+      ({ headers, socket: { remoteAddress } }) as unknown as http.IncomingMessage;
+    assert.equal(isDirectLoopbackRequest(fakeReq({ host: "127.0.0.1:3456" })), true);
+    assert.equal(isDirectLoopbackRequest(fakeReq({ host: "127.0.0.1:3456", "cf-connecting-ip": "1.2.3.4" })), false);
+    assert.equal(isDirectLoopbackRequest(fakeReq({ host: "127.0.0.1:3456", forwarded: "for=1.2.3.4" })), false);
+    assert.equal(isDirectLoopbackRequest(fakeReq({ host: "public.example.com" })), false);
+
+    // P2: redactSecrets handles passwords containing `@`
+    const { redactSecrets } = await import("../src/utils/hash.js");
+    const fakeAtProxy = ["http://", "user", ":", "p@ss", "@", "1.2.3.4:8080"].join("");
+    assert.equal(redactSecrets(fakeAtProxy), "http://***:***@1.2.3.4:8080");
+
+    // Multimodal budget guard: 9 images stay safely under AWS Quick's 50KB single-frame limit
+    const sharpMod = (await import("sharp")).default;
+    const samplePng = await sharpMod({ create: { width: 200, height: 200, channels: 3, background: { r: 80, g: 140, b: 220 } } }).png().toBuffer();
+    const nineImages = Array.from({ length: 9 }, () => ({ mimeType: "image/png", data: samplePng.toString("base64") }));
+    const builtNine = await buildQuickImageAttachments(nineImages, undefined, 34_000);
+    assert.equal(builtNine.length, 9);
+    const totalJsonBytes = Buffer.byteLength(JSON.stringify(builtNine), "utf8");
+    assert.ok(totalJsonBytes < 46_000, `Expected 9 images JSON (${totalJsonBytes}B) to fit under 46KB`);
   });
 });

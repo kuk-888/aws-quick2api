@@ -83,8 +83,29 @@ export class AuthFailureThrottle {
   }
 }
 
+const FORWARDED_PROXY_HEADERS = [
+  "x-forwarded-for",
+  "x-real-ip",
+  "forwarded",
+  "cf-connecting-ip",
+  "true-client-ip",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+] as const;
+
 export function isDirectLoopbackRequest(req: http.IncomingMessage): boolean {
-  if (req.headers["x-forwarded-for"] || req.headers["x-real-ip"]) return false;
+  for (const h of FORWARDED_PROXY_HEADERS) {
+    if (req.headers[h]) return false;
+  }
+  const hostHeader = typeof req.headers.host === "string" ? req.headers.host.trim().toLowerCase() : "";
+  if (hostHeader) {
+    const hostWithoutPort = hostHeader.startsWith("[")
+      ? hostHeader.slice(1, hostHeader.indexOf("]") > 0 ? hostHeader.indexOf("]") : undefined)
+      : hostHeader.split(":")[0]!;
+    if (hostWithoutPort !== "127.0.0.1" && hostWithoutPort !== "localhost" && hostWithoutPort !== "::1") {
+      return false;
+    }
+  }
   const addr = req.socket?.remoteAddress || "";
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }

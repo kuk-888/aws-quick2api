@@ -22,13 +22,36 @@ interface InternalAffinityRecord {
   expiresAtMs: number;
 }
 
+function stripSystemReminderTagsLinear(input: string): string {
+  const lower = input.toLowerCase();
+  const openTag = "<system-reminder>";
+  const closeTag = "</system-reminder>";
+  let out = "";
+  let pos = 0;
+  while (pos < input.length) {
+    const start = lower.indexOf(openTag, pos);
+    if (start < 0) {
+      out += input.slice(pos);
+      break;
+    }
+    out += input.slice(pos, start);
+    const end = lower.indexOf(closeTag, start + openTag.length);
+    if (end < 0) {
+      out += input.slice(start);
+      break;
+    }
+    pos = end + closeTag.length;
+  }
+  return out;
+}
+
 function shortHash(prefix: string, raw: string): string {
   const hex = crypto.createHash("sha256").update(raw).digest("hex").slice(0, 16);
   return `${prefix}_${hex}`;
 }
 
 /**
- * Derive a deterministic conversation key for CPA-style sticky session affinity:
+ * Derive a deterministic conversation key for sticky session affinity:
  *  1. Explicit client session header (`x-session-id`, `session-id`, `x-session-affinity`, etc.)
  *  2. Explicit body cache/session field (`prompt_cache_key`, `metadata.session_id`, Claude Code `metadata.user_id`)
  *  3. Implicit anchor hash of `systemPrompt + firstUserTurnText` (keeps multi-turn chats pinned to 1 account even when client sends no session headers!)
@@ -73,7 +96,7 @@ export function deriveConversationAffinityKey(params: {
       // `<system-reminder>` wrappers and omitting volatile systemPrompt) so multi-turn chats
       // keep 100% warm_incremental stickiness while separate windows and parallel subagents rotate.
       const rawFirst = (firstUserText || "").trim();
-      const strippedFirst = rawFirst.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim();
+      const strippedFirst = stripSystemReminderTagsLinear(rawFirst).trim();
       const effectiveFirst = strippedFirst || rawFirst;
       if (effectiveFirst) {
         return shortHash("meta", `${meta.user_id.trim()}\0${effectiveFirst.slice(0, 1024)}`);

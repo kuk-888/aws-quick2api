@@ -2,7 +2,7 @@ import http from "node:http";
 import { fileURLToPath } from "node:url";
 import type { SDKModel } from "./aws-quick/types.js";
 import { closeAllOAuthServers } from "./aws-quick/oauth-client.js";
-import { loadConfigFromEnv, loadDotEnv } from "./core/config.js";
+import { findInsecurePlaceholderConfig, isPlaceholderSecret, loadConfigFromEnv, loadDotEnv } from "./core/config.js";
 import { QuickExecutionEngine, mapSdkError, type AgentFactory } from "./core/engine.js";
 import { UpstreamKeyPool } from "./core/key-pool.js";
 import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "./core/types.js";
@@ -19,9 +19,10 @@ import {
 } from "./protocols/openai.js";
 import { ClientGatewayKeyManager } from "./services/client-keys.js";
 import { ModelAccessController, normalizeBaseModelId } from "./services/model-access.js";
-import { formatOpenAiModelList, listLiveModels } from "./services/model-catalog.js";
+import { formatOpenAiModelList, listLiveModels, resolveKnownModelId } from "./services/model-catalog.js";
 import { fetchAllAccountQuotas } from "./services/quota-service.js";
 import { RequestTraceLogger, type RequestProtocolTag } from "./services/request-logger.js";
+import { readPackageVersion } from "./services/update-checker.js";
 import { UsageLedger } from "./services/usage-ledger.js";
 import { UsageTracker } from "./services/usage-tracker.js";
 import { classifyClient, sanitizeUserAgent } from "./utils/user-agent.js";
@@ -222,10 +223,13 @@ async function pipeSseStream(
   chunks: AsyncIterable<string>,
   onErrorChunk: (err: GatewayError) => string,
   extraHeaders: Record<string, string> = {},
-  opts: { flushEarly?: boolean; postStartKeepAliveFrame?: string } = {}
+  opts: { flushEarly?: boolean; flushEarlyAfter?: Promise<void>; postStartKeepAliveFrame?: string } = {}
 ): Promise<void> {
   const iterator = chunks[Symbol.asyncIterator]();
+  let headersCommitted = false;
   const commitHeaders = () => {
+    if (headersCommitted) return;
+    headersCommitted = true;
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
@@ -255,7 +259,39 @@ async function pipeSseStream(
   };
 
   let first: IteratorResult<string>;
-  if (opts.flushEarly) {
+  if (opts.flushEarly && opts.flushEarlyAfter) {
+    // Wait until an upstream slot lease is actually acquired before committing HTTP 200 + keepalive.
+    // Pre-lease errors (429 pool full, 503 no keys, 400 empty/SSRF) propagate cleanly as real HTTP statuses
+    // so SDKs like Claude Code can apply native HTTP 429 retry/backoff!
+    let settled = false;
+    const nextPromise = iterator.next();
+    void opts.flushEarlyAfter.then(() => {
+      if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
+        commitHeaders();
+        res.write(": keepalive\n\n");
+        startKeepAlive();
+      }
+    });
+    try {
+      first = await nextPromise;
+      settled = true;
+    } catch (err) {
+      settled = true;
+      if (keepAlive) clearInterval(keepAlive);
+      if (headersCommitted) {
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(onErrorChunk(mapSdkError(err)));
+          res.end();
+        }
+        await iterator.return?.().catch(() => undefined);
+        return;
+      }
+      await iterator.return?.().catch(() => undefined);
+      throw err;
+    }
+    commitHeaders();
+    startKeepAlive();
+  } else if (opts.flushEarly) {
     // For huge multi-chunk (>50KB) streaming prompts, flush 200 OK + SSE keepalive immediately
     // so reverse proxies like Cloudflare (100s 524 timeout) never drop the connection while chunking.
     commitHeaders();
@@ -512,9 +548,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         });
         if (
           rep.status === "error" &&
-          /invalid_grant|invalid refresh token|oidc refresh_token failed \(400\)/i.test(rep.error || "")
+          /invalid_grant|invalid_client|unauthorized_client|expired_token|access_denied|invalid refresh token/i.test(rep.error || "")
         ) {
-          keyPool.reportAuthFailure(rawKey, "OAuth token revoked (invalid_grant) — please re-authorize");
+          keyPool.reportAuthFailure(rawKey, "OAuth token revoked/expired — please re-authorize");
         }
         const detectedEmail = rep.identity?.userEmail;
         if (detectedEmail && detectedEmail.includes("@")) {
@@ -580,14 +616,15 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         return;
       }
 
-      // 1. Liveness Probe (`/health`)
-      if (route === "/health" && (req.method === "GET" || req.method === "HEAD")) {
+      // 1. Liveness Probe (`/health` & `/healthz`)
+      if ((route === "/health" || route === "/healthz") && (req.method === "GET" || req.method === "HEAD")) {
         const detailed = isDirectLoopbackRequest(req);
         sendJson(res, 200, {
           ok: true,
           ...(detailed
             ? {
               service: "aws-quick2api",
+              version: readPackageVersion(),
               uptimeSeconds: Math.floor(process.uptime()),
               enabledKeys: keyPool.enabledKeyCount(),
               ...engine.runtimeStats()
@@ -652,15 +689,17 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         } catch {
           throw new GatewayError("Malformed model identifier.", 400, "invalid_request_error", "model");
         }
-        modelAccess.assertModelAllowed(targetId);
-        clientKeys.assertModelPermitted(clientAuth, targetId);
         const catalogKey = keyPool.enabledKeyCount() > 0 ? keyPool.peekKeyForCatalog() : "";
-        const models = formatOpenAiModelList(await listLiveModels(catalogKey, options.modelListFetcher));
-        // Variant ids such as `quick-balanced[effort=high]` are accepted by POST; accept them here too.
+        const rawModels = await listLiveModels(catalogKey, options.modelListFetcher);
+        const canonicalId = resolveKnownModelId(targetId) ?? normalizeBaseModelId(targetId);
+        modelAccess.assertModelAllowed(canonicalId);
+        clientKeys.assertModelPermitted(clientAuth, canonicalId);
+        const models = formatOpenAiModelList(rawModels);
+        // Variant/alias ids such as `quick-balanced[effort=high]` or `quick/claude-opus-4-6-high` are accepted by POST; accept them here too.
         const found =
           models.find((m) => m.id === targetId) ??
           (() => {
-            const base = models.find((m) => m.id === normalizeBaseModelId(targetId));
+            const base = models.find((m) => m.id === canonicalId);
             return base ? { ...base, id: targetId } : undefined;
           })();
         if (!found) {
@@ -726,9 +765,10 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           ? traceLogger.startTrace(protocolEntry.tag, turn, { keyId: clientKeyId, keyName: clientAuth.keyName, clientIp: recordedIp, userAgent: ua })
           : null;
         try {
-          modelAccess.assertModelAllowed(turn.requestedModel);
-          clientKeys.assertModelPermitted(clientAuth, turn.requestedModel);
-          await assertModelExists(turn.requestedModel);
+          const canonicalModelId = resolveKnownModelId(turn.requestedModel) ?? turn.requestedModel;
+          modelAccess.assertModelAllowed(canonicalModelId);
+          clientKeys.assertModelPermitted(clientAuth, canonicalModelId);
+          await assertModelExists(canonicalModelId);
           clientKeys.tryReserveRequest(clientKeyId);
         } catch (err) {
           const gwErr = mapSdkError(err);
@@ -736,11 +776,16 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           throw gwErr;
         }
         const ledgerMeta = { account: "", execMode: "", usedProxy: false, startedAt: Date.now() };
+        let resolveLeaseReady!: () => void;
+        const leaseReadyPromise = new Promise<void>((r) => {
+          resolveLeaseReady = r;
+        });
         const rawEvents = engine.executeTurnWithPool(turn, keyPool, (meta) => {
           traceLogger.bindExecutionMeta(traceId, meta);
           ledgerMeta.account = meta.accountLabel || meta.maskedKey;
           ledgerMeta.execMode = meta.execMode;
           ledgerMeta.usedProxy = Boolean(meta.usedProxy);
+          resolveLeaseReady();
         });
         const events = tapStreamWithLedger(
           tapStreamWithTrace(rawEvents, traceId, clientKeyId),
@@ -771,6 +816,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             ignoredParamsHeader(turn.rawBody),
             {
               flushEarly,
+              ...(flushEarly ? { flushEarlyAfter: leaseReadyPromise } : {}),
               ...(protocolEntry.tag === "anthropic-messages"
                 ? { postStartKeepAliveFrame: 'event: ping\ndata: {"type":"ping"}\n\n' }
                 : {}),
@@ -844,9 +890,68 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 if (isMain) {
-  const envFilePath = loadDotEnv();
-  const config = loadConfigFromEnv(process.env, envFilePath);
-  const instance = createGatewayServer({ config });
+  let envFilePath: string | undefined;
+  let config: GatewayConfig;
+  try {
+    envFilePath = loadDotEnv();
+    config = loadConfigFromEnv(process.env, envFilePath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    console.error(
+      JSON.stringify({
+        event: "gateway_refused_to_start",
+        reason: err instanceof Error ? err.message : String(err),
+        ...(code === "EACCES"
+          ? { hint: "Permission denied reading .env/data. If upgrading Docker to v0.1.16+ (non-root uid 1000), run: chown -R 1000:1000 data .env" }
+          : {}),
+      }),
+    );
+    process.exit(1);
+  }
+  const insecureIssues = findInsecurePlaceholderConfig(config);
+  if (insecureIssues.length > 0) {
+    console.error(
+      JSON.stringify({
+        event: "gateway_refused_to_start",
+        reason: "Refusing to start with documented placeholder secrets.",
+        issues: insecureIssues
+      })
+    );
+    process.exit(1);
+  }
+  let instance: ReturnType<typeof createGatewayServer>;
+  try {
+    instance = createGatewayServer({ config });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    console.error(
+      JSON.stringify({
+        event: "gateway_refused_to_start",
+        reason: err instanceof Error ? err.message : String(err),
+        ...(code === "EACCES"
+          ? { hint: "Permission denied accessing data directory or .env. If upgrading Docker to v0.1.16+ (non-root uid 1000), run: chown -R 1000:1000 data .env" }
+          : {}),
+      }),
+    );
+    process.exit(1);
+  }
+  const storedPlaceholderKeys = instance.clientKeys
+    .listKeys()
+    .filter((k) => k.enabled && isPlaceholderSecret(instance.clientKeys.revealKeyToken(k.id)));
+  if (storedPlaceholderKeys.length > 0) {
+    console.error(
+      JSON.stringify({
+        event: "gateway_refused_to_start",
+        reason: "Refusing to start with an enabled placeholder key still stored in gateway-keys.json.",
+        keyNames: storedPlaceholderKeys.map((k) => k.name),
+        hint: "Delete or disable the placeholder key in gateway-keys.json (or remove the file to auto-generate a strong random key).",
+      }),
+    );
+    process.exit(1);
+  }
+  for (const ev of instance.clientKeys.startupEvents) {
+    console.log(JSON.stringify(ev));
+  }
   if (instance.clientKeys.listKeys().length === 0) {
     if (config.enableDashboard) {
       instance.clientKeys.createKey({ name: "Default Key (Auto-Generated)" });
