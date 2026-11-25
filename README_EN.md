@@ -105,9 +105,9 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 
 > **Dynamic Routing**: `/v1/models` advertises only these three models. AWS Quick assigns the underlying model server-side based on mode and reasoning effort. The actual routed model is surfaced in the thinking block, OpenAI `system_fingerprint`, and console request logs.
 >
-> **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax such as `claude-sonnet-5-5[effort=high]`.
+> **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Parenthetical hints (e.g. `quick-balanced(Sonnet)`, `quick-smart(max)`) are accepted too, and reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, `-max` suffixes, or bracket syntax such as `claude-sonnet-5-5[effort=max]`.
 >
-> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `max`. `max` (also `xhigh` / `ultra` / `maximum`) is forwarded to AWS Quick as-is and probed per account: if the first `max` turn completes, the account is marked as supporting it; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in the SQLite `effort_capabilities` table, and uses `high` for that account afterwards (other accounts keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
+> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `xhigh` → `max`. `xhigh` / `max` (`max` also accepts `ultra` / `maximum`) are forwarded to AWS Quick as-is and probed per account and per tier: the first turn at a tier that completes marks it supported; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in the SQLite `effort_capabilities` table, and uses `high` for that account and tier afterwards (other accounts and tiers keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
 
 ---
 
@@ -185,7 +185,7 @@ See [.env.example](./.env.example) for the full template:
 
 - **Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`)**: Not enforced upstream; accepted for client compatibility and reported via response headers.
 - **`response_format` (`json_object` / `json_schema`) & `n > 1`**: Not supported; returns an explicit `400` error.
-- **Attachments**: Image inputs (PNG/JPG/WebP/GIF) are supported. Because AWS Quick enforces a 50 KB single-frame WebSocket limit, oversized images are automatically downscaled and JPEG-compressed (`sharp`) to fit; for dense small-font tables or code screenshots, cropping to the target area yields sharper OCR. PDF, document, and audio attachments are not supported yet.
+- **Attachments**: Image inputs (PNG/JPG/WebP/GIF) are supported. Because AWS Quick currently enforces a 50 KB single-frame WebSocket limit for inline images, oversized images are automatically downscaled and JPEG-compressed (`sharp`) within the shared frame budget; 1–2 cropped screenshots remain sharp and reliable, while sending 4+ dense small-font screenshots in a single turn degrades OCR accuracy due to tighter per-image budget (**out-of-band native attachment upload for images is planned for `v0.1.18`**). PDF, document, and audio attachments are not supported yet.
 - **Non-chat endpoints**: Embeddings, image generation, TTS, and Whisper are not supported.
 
 ---

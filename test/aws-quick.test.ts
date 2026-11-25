@@ -1966,5 +1966,16 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
     assert.equal(builtNine.length, 9);
     const totalJsonBytes = Buffer.byteLength(JSON.stringify(builtNine), "utf8");
     assert.ok(totalJsonBytes < 46_000, `Expected 9 images JSON (${totalJsonBytes}B) to fit under 46KB`);
+
+    // Native thinking_effort="max" passthrough (this fork aliases quick-* onto the Claude 5.5 IDs
+    // and keeps `xhigh` as its own probed tier instead of folding it into `max`).
+    assert.equal(resolveModelSelection("quick-smart-max", {}).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-smart[effort=max]", {}).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-smart(max)", {}).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-balanced(xhigh)", {}).selection.thinkingEffort, "xhigh");
+    assert.equal(resolveModelSelection("quick-smart-think", { reasoning_effort: "max" }).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-smart", { reasoning: { effort: "max" } }).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-fast", { reasoning_effort: "max" }).selection.thinkingEffort, "off");
+    assert.equal(resolveKnownModelId("quick-smart-max"), "claude-opus-5-5");
   });
 });
