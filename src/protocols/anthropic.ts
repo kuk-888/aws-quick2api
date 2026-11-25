@@ -317,9 +317,13 @@ export function parseAnthropicMessagesRequest(
     firstUserText: firstUserItem?.text
   });
 
+  const betaHeader = headers["anthropic-beta"];
+  const beta = Array.isArray(betaHeader) ? betaHeader.join(",") : betaHeader;
+
   return {
     requestedModel,
     rawBody,
+    ...(beta ? { clientHints: { beta: beta.slice(0, 200) } } : {}),
     ...(conversationKey ? { conversationKey } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
     fullTranscriptText,

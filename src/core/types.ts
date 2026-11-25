@@ -58,6 +58,11 @@ export type ToolChoiceMode =
 export interface ParsedProtocolTurn {
   requestedModel: string;
   rawBody: Record<string, unknown>;
+  /**
+   * Content-free client hints lifted from request headers, for the `[turn]` diagnostic line only.
+   * Never used to route or build a request.
+   */
+  clientHints?: { beta?: string };
   /** Deterministic or header-derived conversation key for sticky session affinity. */
   conversationKey?: string;
   systemPrompt?: string;

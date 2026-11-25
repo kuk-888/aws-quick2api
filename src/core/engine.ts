@@ -860,9 +860,9 @@ export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
   "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly.";
 
 // Content-free fingerprint of an inbound request body, for the `[turn]` diagnostic line only.
-// Keys are reported by name; values are reported only when they are primitives on the handful of
-// fields that carry a thinking/effort signal, so prompts, tool text and message bodies never leak.
-const SHAPE_SCALAR_KEYS = new Set([
+// Every top-level key is named, so a field nobody has taught the gateway to read can never hide
+// again; values are printed only for the fixed-schema keys that carry a thinking/effort signal.
+const SHAPE_VALUE_KEYS = new Set([
   "model",
   "max_tokens",
   "stream",
@@ -871,38 +871,42 @@ const SHAPE_SCALAR_KEYS = new Set([
   "thinking_effort",
   "enable_thinking",
   "service_tier",
-  "metadata",
   "thinking",
   "reasoning",
+  "output_config",
 ]);
+// Free-form client text living in an otherwise fixed-schema object: names only, never values.
+const SHAPE_OPAQUE_KEYS = new Set(["metadata"]);
+
 
 export function describeRequestShape(body: unknown): string {
   if (!body || typeof body !== "object") return "";
   const record = body as Record<string, unknown>;
   const parts: string[] = [];
   for (const key of Object.keys(record).sort()) {
-    if (!SHAPE_SCALAR_KEYS.has(key)) continue;
     const value = record[key];
+    // Unknown keys are still named: the operator needs to see that the client sent something the
+    // gateway does not read yet, which is exactly the bug this line was added to expose.
+    if (!SHAPE_VALUE_KEYS.has(key) && !SHAPE_OPAQUE_KEYS.has(key)) {
+      parts.push(key);
+      continue;
+    }
     if (value === null || typeof value !== "object") {
       parts.push(`${key}=${String(value)}`);
-    } else {
-      // `metadata` is free-form client text and never carries a tier, so it contributes key names
-      // only. Every other nested object here (thinking/reasoning) is a fixed schema, and its
-      // scalar values are exactly the signal we need.
-      const revealValues = key !== "metadata";
-      const nested = Object.keys(value as Record<string, unknown>).sort();
-      if (!revealValues) {
-        parts.push(`${key}{${nested.join(",")}}`);
-      } else {
-        const scalars = nested
-          .filter((k) => {
-            const v = (value as Record<string, unknown>)[k];
-            return v === null || ["string", "number", "boolean"].includes(typeof v);
-          })
-          .map((k) => `${k}:${String((value as Record<string, unknown>)[k])}`);
-        parts.push(`${key}{${scalars.join(",")}}`);
-      }
+      continue;
     }
+    const nested = Object.keys(value as Record<string, unknown>).sort();
+    if (SHAPE_OPAQUE_KEYS.has(key)) {
+      parts.push(`${key}{${nested.join(",")}}`);
+      continue;
+    }
+    const scalars = nested
+      .filter((k) => {
+        const v = (value as Record<string, unknown>)[k];
+        return v === null || ["string", "number", "boolean"].includes(typeof v);
+      })
+      .map((k) => `${k}:${String((value as Record<string, unknown>)[k])}`);
+    parts.push(`${key}{${scalars.join(",")}}`);
   }
   return parts.join(" ");
 }
@@ -2283,10 +2287,11 @@ export class QuickExecutionEngine {
     // operator can tell a client that never asked for thinking apart from a gateway that dropped it.
     if (process.env.TURN_EFFORT_LOG !== "off") {
       const shape = describeRequestShape(turn.rawBody);
+      const beta = turn.clientHints?.beta;
       console.log(
         `[turn] model=${selection.model} mode=${selection.agentMode} effort=${effortSent ?? "none(fast)"}` +
           `${effortDowngraded ? ` (requested ${effortRequested}, fallback)` : ""} source=${effortSource} account=${lease.maskedKey}` +
-          `${shape ? ` body{${shape}}` : ""}`,
+          `${shape ? ` body{${shape}}` : ""}${beta ? ` beta=${beta}` : ""}`,
       );
     }
 

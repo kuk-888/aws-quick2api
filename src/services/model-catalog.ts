@@ -198,13 +198,25 @@ export function resolveModelSelection(
     ? (body.reasoning as { effort?: unknown })
     : undefined;
   const thinkingObj = body.thinking && typeof body.thinking === "object"
-    ? (body.thinking as { type?: unknown; budget_tokens?: unknown })
+    ? (body.thinking as { type?: unknown; budget_tokens?: unknown; display?: unknown })
     : undefined;
+  // Anthropic's canonical depth control on adaptive-thinking models is `output_config.effort`.
+  // Claude Code sends `thinking: {type: "adaptive", display: "summarized"}` plus this field, so
+  // reading it is the difference between honouring the user's tier and silently falling back to
+  // the model default.
+  const outputConfigObj =
+    body.output_config && typeof body.output_config === "object"
+      ? (body.output_config as { effort?: unknown })
+      : undefined;
   // Anthropic extended thinking: the client's `budget_tokens` is the closest thing to a tier the
   // Claude SDKs send, so map it across the whole ladder. Claude Code asks for a ~32k budget when
   // the user picks its top tier, and that should reach AWS Quick as `max`, not silently cap at
   // `high` (a tier the account rejects is still probed and degraded per account).
   const thinkingBudget = thinkingObj?.type === "enabled" ? thinkingObj.budget_tokens : undefined;
+  // `adaptive` means "thinking on, depth chosen by the model"; AWS Quick needs a concrete tier,
+  // so approximate with the documented default for effort-capable models and let an explicit
+  // `output_config.effort` override it. `between_tools` keeps thinking on between tool calls.
+  // Anything unrecognised stays `undefined`, so it cannot masquerade as a tier.
   const thinkingEffortFromObj =
     thinkingObj?.type === "enabled"
       ? typeof thinkingBudget === "number" && thinkingBudget < 2048
@@ -214,9 +226,11 @@ export function resolveModelSelection(
           : typeof thinkingBudget === "number" && thinkingBudget >= 16384
             ? "max"
             : "high"
-      : thinkingObj?.type === "disabled"
-        ? "off"
-        : undefined;
+      : thinkingObj?.type === "adaptive" || thinkingObj?.type === "between_tools"
+        ? "high"
+        : thinkingObj?.type === "disabled"
+          ? "off"
+          : undefined;
   const enableThinkingEffort =
     body.enable_thinking === true
       ? agentMode === "balanced"
@@ -227,6 +241,9 @@ export function resolveModelSelection(
         : undefined;
 
   const bodyCandidates: Array<[QuickThinkingEffort | undefined, string]> = [
+    // `output_config.effort` first: it is the documented depth control for adaptive thinking, and
+    // it is what a client sends when the user picks a tier in its own UI.
+    [parseEffort(outputConfigObj?.effort), "output_config.effort"],
     [parseEffort(body.reasoning_effort), "reasoning_effort"],
     [parseEffort(body.effort), "effort"],
     [parseEffort(reasoningObj?.effort), "reasoning.effort"],

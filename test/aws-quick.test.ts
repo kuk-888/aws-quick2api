@@ -184,29 +184,72 @@ describe("Model catalog & parameter resolution", () => {
     assert.equal(resolveModelSelection("claude-opus-5-5", { enable_thinking: true }).effortSource, "enable_thinking");
   });
 
+  it("understands adaptive thinking and output_config.effort", () => {
+    // Claude Code's tier selector does not speak `budget_tokens` any more: it sends
+    // `thinking: {type: "adaptive", display: "summarized"}` and, for an explicit tier,
+    // `output_config.effort`. Missing either one silently drops the user's choice.
+    const adaptive = resolveModelSelection("claude-opus-5-5", {
+      thinking: { type: "adaptive", display: "summarized" },
+    });
+    assert.equal(adaptive.selection.thinkingEffort, "high");
+    assert.equal(adaptive.effortSource, "thinking.adaptive");
+
+    const explicit = resolveModelSelection("claude-opus-5-5", {
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "max" },
+    });
+    assert.equal(explicit.selection.thinkingEffort, "max");
+    assert.equal(explicit.effortSource, "output_config.effort");
+
+    // `output_config.effort` is the canonical depth control, so it outranks legacy spellings
+    // when a client sends both.
+    assert.equal(
+      resolveModelSelection("claude-opus-5-5", { output_config: { effort: "max" }, reasoning_effort: "low" })
+        .selection.thinkingEffort,
+      "max",
+    );
+    assert.equal(
+      resolveModelSelection("claude-sonnet-5-5", { output_config: { effort: "xhigh" } }).selection.thinkingEffort,
+      "max",
+    );
+    // Sonnet 5.5's lowest thinking mode still thinks between tool calls, so it maps to a tier.
+    assert.equal(
+      resolveModelSelection("claude-sonnet-5-5", { thinking: { type: "between_tools" } }).selection.thinkingEffort,
+      "high",
+    );
+    // An unrecognised `type` must not be mistaken for a tier request.
+    const unknown = resolveModelSelection("claude-opus-5-5", { thinking: { type: "something_else" } });
+    assert.equal(unknown.selection.thinkingEffort, "off");
+    assert.equal(unknown.effortSource, "model-default");
+  });
+
   it("fingerprints request bodies without leaking content", () => {
     // The `[turn]` line exists so an operator can tell "the client never asked for thinking" apart
     // from "the gateway dropped it". It must therefore expose the signal fields and nothing else.
     const shape = describeRequestShape({
       model: "claude-opus-5-5",
-      max_tokens: 32000,
+      max_tokens: 128000,
       stream: true,
-      thinking: { type: "enabled", budget_tokens: 31999 },
+      thinking: { type: "adaptive", display: "summarized" },
+      output_config: { effort: "max" },
       messages: [{ role: "user", content: "SECRET_PROMPT_TEXT" }],
       system: "SECRET_SYSTEM_TEXT",
       metadata: { user_id: "u1", note: "SECRET_META_TEXT" },
     });
     assert.match(shape, /model=claude-opus-5-5/);
-    assert.match(shape, /max_tokens=32000/);
-    assert.match(shape, /thinking\{budget_tokens:31999,type:enabled\}/);
-    assert.match(shape, /metadata\{/);
+    assert.match(shape, /max_tokens=128000/);
+    assert.match(shape, /thinking\{display:summarized,type:adaptive\}/);
+    assert.match(shape, /output_config\{effort:max\}/);
+    // Key names of unstructured containers are shown so an unparsed field can never hide, but
+    // their values are not.
+    assert.match(shape, /\bmetadata\{note,user_id\}/);
+    assert.match(shape, /\bmessages\b/);
+    assert.match(shape, /\bsystem\b/);
     assert.doesNotMatch(shape, /SECRET_/);
-    assert.doesNotMatch(shape, /messages/);
-    assert.doesNotMatch(shape, /system/);
-    // A client that sends no thinking signal at all produces no signal key, which is the point:
+    // A client that sends no thinking signal at all produces no signal value, which is the point:
     // the absence is the evidence.
     const bare = describeRequestShape({ model: "claude-opus-5-5", messages: [] });
-    assert.equal(bare, "model=claude-opus-5-5");
+    assert.equal(bare, "messages model=claude-opus-5-5");
     assert.equal(describeRequestShape(null), "");
   });
 
