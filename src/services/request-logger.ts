@@ -8,7 +8,7 @@ import { classifyClient } from "../utils/user-agent.js";
  *
  * PRIVACY CONTRACT: this module must never hold prompt, system prompt, tool arguments, tool results,
  * model output, thinking text or any other conversation content. Only counts, sizes, timings,
- * identifiers and short one-way hashes are kept. `test/request-log-privacy.test.ts` enforces this.
+ * identifiers and short one-way hashes are kept. `test/aws-quick.test.ts` enforces this.
  */
 
 export type RequestProtocolTag =
@@ -37,6 +37,12 @@ export interface RequestTraceSummary {
   usedProxy?: boolean;
   /** Metadata-only boolean: true when the turn hit upstream content_filtered and recovered via defensive rephrase. Never holds prompt text. */
   contentFilterRecovered?: boolean;
+  /** Metadata-only boolean: true when warm_incremental failed/was evicted and fell back to cold replay. */
+  warmFallbackToCold?: boolean;
+  /** Metadata-only count: >0 when execution failed over across upstream accounts on this request. */
+  accountFailoverCount?: number;
+  /** Metadata-only boolean: true when the account had no custom Agent bound and ran on AWS Quick's default SYSTEM assistant. */
+  usedDefaultSystemAgent?: boolean;
   ttftMs: number | null;
   durationMs: number | null;
   toolCount: number;
@@ -66,6 +72,7 @@ export interface RequestTraceDetail extends RequestTraceSummary {
 
 interface MutableTraceRecord extends RequestTraceDetail {
   startedAtMs: number;
+  fullPromptChars: number;
   incrementalDeltaChars: number;
   toolResumeDeltaChars: number;
 }
@@ -130,6 +137,7 @@ export class RequestTraceLogger {
       emittedToolCallsCount: 0,
       hasThinking: false,
       upstreamSentChars: turn.fullTranscriptText.length + (turn.systemPrompt?.length ?? 0),
+      fullPromptChars: turn.fullTranscriptText.length + (turn.systemPrompt?.length ?? 0),
       transcriptTotalChars: turn.fullTranscriptText.length,
       outputChars: 0,
       messageCount: countMessages(turn.rawBody),
@@ -148,21 +156,42 @@ export class RequestTraceLogger {
 
   bindExecutionMeta(
     traceId: string | null,
-    meta: { slotId?: string; maskedKey: string; accountLabel?: string; execMode: ExecutionModeTag; usedProxy?: boolean; contentFilterRecovered?: boolean }
+    meta: {
+      slotId?: string;
+      maskedKey: string;
+      accountLabel?: string;
+      execMode: ExecutionModeTag;
+      usedProxy?: boolean;
+      contentFilterRecovered?: boolean;
+      warmFallbackToCold?: boolean;
+      accountFailoverCount?: number;
+      usedDefaultSystemAgent?: boolean;
+    }
   ): void {
     if (!traceId) return;
     const rec = this.records.get(traceId);
     if (!rec) return;
     if (meta.slotId) rec.slotId = meta.slotId;
+    else delete rec.slotId;
     rec.maskedKey = meta.maskedKey;
     if (meta.accountLabel) rec.accountLabel = meta.accountLabel;
+    else delete rec.accountLabel;
     rec.execMode = meta.execMode;
     if (meta.usedProxy) rec.usedProxy = true;
+    else delete rec.usedProxy;
     if (meta.contentFilterRecovered) rec.contentFilterRecovered = true;
+    if (meta.warmFallbackToCold) rec.warmFallbackToCold = true;
+    if (meta.accountFailoverCount && meta.accountFailoverCount > 0) {
+      rec.accountFailoverCount = meta.accountFailoverCount;
+    }
+    if (meta.usedDefaultSystemAgent) rec.usedDefaultSystemAgent = true;
+    else delete rec.usedDefaultSystemAgent;
     if (meta.execMode === "parked_tool_resume") {
       rec.upstreamSentChars = Math.max(4, rec.toolResumeDeltaChars);
     } else if (meta.execMode === "warm_incremental") {
       rec.upstreamSentChars = Math.max(1, rec.incrementalDeltaChars);
+    } else {
+      rec.upstreamSentChars = rec.fullPromptChars;
     }
   }
 
@@ -234,7 +263,7 @@ export class RequestTraceLogger {
   }
 
   private toPublic(r: MutableTraceRecord, now: number): RequestTraceDetail {
-    const { startedAtMs: _s, incrementalDeltaChars: _i, toolResumeDeltaChars: _t, ...rest } = r;
+    const { startedAtMs: _s, fullPromptChars: _f, incrementalDeltaChars: _i, toolResumeDeltaChars: _t, ...rest } = r;
     return {
       ...rest,
       durationMs: r.durationMs ?? (r.status === "running" ? now - r.startedAtMs : null)

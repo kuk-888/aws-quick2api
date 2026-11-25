@@ -191,19 +191,25 @@ async function callWebQbsProxy(
   let outer: unknown;
   try {
     outer = JSON.parse(rawText);
+    if (typeof outer === "string") {
+      outer = JSON.parse(outer);
+    }
   } catch {
-    return {};
+    throw new Error(`AWS Quick Web qbsproxy ${invocationPath} returned non-JSON response (session may be expired)`);
   }
   // qbsproxy returns either a JSON string containing `{ body: "..." }` or an object `{ body: "..." }`
-  const parsed = typeof outer === "string" ? (JSON.parse(outer) as { body?: string }) : (outer as { body?: string });
+  if (!outer || typeof outer !== "object" || Array.isArray(outer)) {
+    throw new Error(`AWS Quick Web qbsproxy ${invocationPath} returned non-JSON response (session may be expired)`);
+  }
+  const parsed = outer as { body?: string };
   if (typeof parsed?.body === "string") {
     try {
       return JSON.parse(parsed.body);
     } catch {
-      return {};
+      throw new Error(`AWS Quick Web qbsproxy ${invocationPath} returned malformed body payload`);
     }
   }
-  return parsed ?? {};
+  return parsed;
 }
 
 export async function fetchWebProfileUsage(

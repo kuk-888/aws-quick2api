@@ -67,30 +67,98 @@ export type QuickAttachment = QuickImageAttachment | QuickFileAttachment;
 
 /**
  * Build a compact inline wrapper prompt when an oversized (>46KB) conversation/context
- * has been uploaded out-of-band as a `.txt` attachment, preserving the recent tail inline
- * so the model immediately sees the latest user request while inspecting the file for earlier details.
+ * has been uploaded out-of-band as a `.txt` attachment. Preserves BOTH the opening of the
+ * latest user request (for "question first, logs after" inputs) and the trailing context inline
+ * so the model immediately sees the user's request regardless of placement.
  */
+function clampSurrogateEnd(str: string, end: number): number {
+  if (end > 0 && end < str.length) {
+    const code = str.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) return end - 1;
+  }
+  return end;
+}
+
+function clampSurrogateStart(str: string, start: number): number {
+  if (start > 0 && start < str.length) {
+    const code = str.charCodeAt(start);
+    if (code >= 0xdc00 && code <= 0xdfff) return start + 1;
+  }
+  return start;
+}
+
 export function buildOutOfBandContextPrompt(
   fullPrompt: string,
   filename: string,
-  maxTailChars = 3_500,
+  maxInlineChars = 3_500,
   isIncremental = false,
+  openingHintSource?: string,
 ): string {
   const totalChars = fullPrompt.length;
-  let tailStart = Math.max(0, totalChars - maxTailChars);
+  const label = isIncremental ? "incremental context" : "full conversation/context";
+  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Read the attached file for the full text/details, then respond directly to the user's request.]`;
+
+  if (totalChars <= maxInlineChars) {
+    return [header, "", fullPrompt.trim()].join("\n");
+  }
+
+  const headBudget = Math.min(1_100, Math.floor(maxInlineChars * 0.32));
+  const tailBudget = Math.max(800, maxInlineChars - headBudget);
+
+  let tailStart = Math.max(0, totalChars - tailBudget);
   if (tailStart > 0) {
     const nextNl = fullPrompt.indexOf("\n", tailStart);
     if (nextNl !== -1 && nextNl < tailStart + 400) {
       tailStart = nextNl + 1;
     }
+    tailStart = clampSurrogateStart(fullPrompt, tailStart);
   }
   const tailText = fullPrompt.slice(tailStart).trimStart();
-  const label = isIncremental ? "incremental context" : "full conversation/context";
-  return [
-    `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Read the attached file for earlier context/details, then respond directly to the latest request below.]`,
-    "",
-    tailText,
-  ].join("\n");
+
+  const useExplicitHint = Boolean(openingHintSource && openingHintSource.trim());
+  const headSource = useExplicitHint ? openingHintSource! : fullPrompt;
+  let headSnippet = "";
+  let headMergedContiguously = false;
+  if (headSource.length > headBudget) {
+    let headEnd = headBudget;
+    const prevNl = headSource.lastIndexOf("\n", headEnd);
+    if (prevNl > Math.floor(headBudget * 0.5)) {
+      headEnd = prevNl;
+    } else {
+      const nextNl = headSource.indexOf("\n", headEnd);
+      if (nextNl !== -1 && nextNl < headEnd + 250) headEnd = nextNl;
+    }
+    if (!useExplicitHint && headEnd >= tailStart) {
+      headEnd = tailStart;
+      headMergedContiguously = true;
+    }
+    headEnd = clampSurrogateEnd(headSource, headEnd);
+    headSnippet = headSource.slice(0, headEnd).trim();
+  } else {
+    headSnippet = headSource.trim();
+  }
+
+  // Deduplicate partial overlap when openingHintSource (latest user turn) overlaps the start of tailText
+  let includeHead = Boolean(headSnippet) && !tailText.includes(headSnippet);
+  if (includeHead && useExplicitHint && tailText.length >= 24) {
+    const tailProbe = tailText.slice(0, Math.min(80, tailText.length));
+    const overlapIdx = headSnippet.indexOf(tailProbe);
+    if (overlapIdx === 0) {
+      includeHead = false;
+    } else if (overlapIdx > 0) {
+      headSnippet = headSnippet.slice(0, clampSurrogateEnd(headSnippet, overlapIdx)).trimEnd();
+      headMergedContiguously = true;
+      includeHead = Boolean(headSnippet);
+    }
+  }
+
+  const bodyParts = includeHead
+    ? headMergedContiguously
+      ? [`[Opening of latest request]\n${headSnippet}`, tailText]
+      : [`[Opening of latest request]\n${headSnippet}`, "...", `[Trailing context]\n${tailText}`]
+    : [tailText];
+
+  return [header, "", ...bodyParts].join("\n");
 }
 
 const MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -191,10 +259,16 @@ async function resolveRawImagePayloads(
   signal?: AbortSignal,
 ): Promise<Array<{ buf: Buffer; mimeType: string }>> {
   if (!images || images.length === 0) return [];
-  const boundedImages = images.length > MAX_INLINE_IMAGES ? images.slice(-MAX_INLINE_IMAGES) : images;
+  if (images.length > MAX_INLINE_IMAGES) {
+    throw new GatewayError(
+      `Too many images in request (${images.length}; max supported per turn is ${MAX_INLINE_IMAGES}).`,
+      400,
+      "invalid_request_error",
+    );
+  }
   const resolved: Array<{ buf: Buffer; mimeType: string }> = [];
 
-  for (const img of boundedImages) {
+  for (const img of images) {
     let mimeType = "image/png";
     let rawBase64 = "";
 
@@ -270,9 +344,15 @@ async function resolveNormalizedFiles(
   signal?: AbortSignal,
 ): Promise<Array<{ filename: string; mimeType: string; buf: Buffer }>> {
   if (!files || files.length === 0) return [];
-  const bounded = files.slice(-MAX_INLINE_FILES);
+  if (files.length > MAX_INLINE_FILES) {
+    throw new GatewayError(
+      `Too many files in request (${files.length}; max supported per turn is ${MAX_INLINE_FILES}).`,
+      400,
+      "invalid_request_error",
+    );
+  }
   const out: Array<{ filename: string; mimeType: string; buf: Buffer }> = [];
-  for (const f of bounded) {
+  for (const f of files) {
     let buf: Buffer;
     let mimeType = f.mimeType.trim().toLowerCase() || "application/octet-stream";
     if (f.data) {
@@ -655,11 +735,9 @@ export function mapSdkError(err: unknown): GatewayError {
 const MAX_WS_PAYLOAD_UTF8_BYTES = 50_000;
 const WS_FRAME_ENVELOPE_MARGIN_BYTES = 3_500;
 const MAX_INLINE_CUSTOM_PROMPT_BYTES = 36_000;
-const DEFAULT_OVERFLOW_COMPACT_TOKENS = 850_000;
 
 /**
  * Fast bilingual token estimator (~3.8 chars/token for ASCII, ~1.5 chars/token for CJK/non-ASCII).
- * Used strictly as a safety net when an API caller forgets to compact near the 1M token ceiling.
  */
 export function estimatePromptTokens(text: string): number {
   if (!text) return 0;
@@ -670,71 +748,6 @@ export function estimatePromptTokens(text: string): number {
     else nonAscii += 1;
   }
   return Math.ceil(ascii / 3.8 + nonAscii / 1.5);
-}
-
-/**
- * Gateway-level overflow protection: untouched below `maxTokens`; above `maxTokens`, preserves
- * the opening context (head ~15%) and most recent turns (tail ~75%) on clean newline boundaries,
- * replacing the oversized middle with either a `quick-fast` summary or a clean omission marker.
- */
-export function compactOversizedPrompt(
-  prompt: string,
-  customPrompt: string | null,
-  maxTokens = DEFAULT_OVERFLOW_COMPACT_TOKENS,
-  middleSummary?: string,
-): {
-  prompt: string;
-  compacted: boolean;
-  originalTokens: number;
-  compactedTokens: number;
-  middleSample?: string;
-} {
-  const customTokens = customPrompt ? estimatePromptTokens(customPrompt) : 0;
-  const promptTokens = estimatePromptTokens(prompt);
-  const totalTokens = customTokens + promptTokens;
-  if (maxTokens <= 0 || totalTokens <= maxTokens) {
-    return { prompt, compacted: false, originalTokens: totalTokens, compactedTokens: totalTokens };
-  }
-
-  const targetPromptTokens = Math.max(8_000, maxTokens - customTokens - 4_000);
-  const ratio = Math.min(0.95, targetPromptTokens / Math.max(1, promptTokens));
-  const targetChars = Math.max(16_000, Math.floor(prompt.length * ratio));
-  let headEnd = Math.floor(targetChars * 0.16);
-  let tailStart = Math.max(headEnd + 1, prompt.length - Math.floor(targetChars * 0.80));
-
-  // Snap to nearby newline boundaries so we never chop mid-line or mid-surrogate-pair
-  const headNl = prompt.lastIndexOf("\n", headEnd);
-  if (headNl > Math.floor(headEnd * 0.7)) headEnd = headNl + 1;
-  const tailNl = prompt.indexOf("\n", tailStart);
-  if (tailNl !== -1 && tailNl < tailStart + Math.floor(targetChars * 0.05)) tailStart = tailNl + 1;
-
-  const head = prompt.slice(0, headEnd).trimEnd();
-  const middle = prompt.slice(headEnd, tailStart);
-  const tail = prompt.slice(tailStart).trimStart();
-  const omittedTokens = estimatePromptTokens(middle);
-
-  // Build a bounded <=36KB digest of the omitted middle for optional fast summarization
-  let middleSample: string | undefined;
-  if (middle.length > 200) {
-    const half = 16_000;
-    middleSample =
-      middle.length <= half * 2
-        ? middle
-        : `${middle.slice(0, half)}\n\n[... ${middle.length - half * 2} chars omitted ...]\n\n${middle.slice(middle.length - half)}`;
-  }
-
-  const bridge = middleSummary?.trim()
-    ? `\n\n[Gateway Auto-Compacted Summary of Earlier Context (~${omittedTokens.toLocaleString()} tokens compressed)]\n${middleSummary.trim()}\n[End of Summary]\n\n`
-    : `\n\n[Gateway Auto-Compacted: earlier middle context (~${omittedTokens.toLocaleString()} tokens) omitted to stay safely within the 1M token window]\n\n`;
-
-  const compactedPrompt = `${head}${bridge}${tail}`;
-  return {
-    prompt: compactedPrompt,
-    compacted: true,
-    originalTokens: totalTokens,
-    compactedTokens: customTokens + estimatePromptTokens(compactedPrompt),
-    ...(middleSample ? { middleSample } : {}),
-  };
 }
 
 /**
@@ -947,18 +960,22 @@ export function isPseudo200UsageLimitPrefix(text: string): boolean {
 
 export const DEFAULT_CONTENT_FILTER_REPHRASE_MODEL = "quick-fast";
 export const DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT = [
-  "NEVER answer the request. Rewrite it to pass content moderation while preserving the user's exact topic, tech stack, language, code, and facts. Output ONLY the rewritten request.",
-  "1. Replace adversarial or trigger words (exploit, bypass, hook, attack) with neutral, educational phrasing, and describe sensitive mechanisms abstractly rather than repeating raw trigger terms. Never ask to write flawed or bypass code; ask to explain the pitfall in prose, show the safe/standard implementation, and write validation tests.",
-  "2. Preserve `[USER]:` / `[ASSISTANT]:` markers and prior turns verbatim; rewrite only the final `[USER]:` turn.",
+  "Rewrite the user's request into clear, neutral, standard engineering phrasing in the exact same language, domain, and format so it aligns with content moderation and safety guidelines. NEVER answer the request; output ONLY the rewritten request.",
+  "1. Stay strictly within the user's actual domain (frontend, backend, DevOps, QA, writing, etc.), tech stack, and requested deliverables—do NOT add unrequested security audits, lectures, or extra tests that the user did not ask for.",
+  "2. Replace aggressive or trigger wording (e.g. attack, exploit, bypass, crack, hijack, steal, inject, kill, payload, bombard) with neutral technical equivalents (e.g. benchmark/verify, handle edge case, skip cache/constraint, terminate process, pass/render data). Omit all exploit payloads, reverse-shell strings, or cloud metadata URLs.",
+  "3. If the user asked to write vulnerable/broken code or demonstrate an exploit, drop that part and explicitly ask the responder NOT to output vulnerable code or exploit demos—only explain the pitfall in prose (if relevant) and provide the standard, safe/correct implementation (plus any tests the user requested using synthetic placeholders).",
+  "4. Preserve `[USER]:` / `[ASSISTANT]:` markers and prior turns verbatim; rewrite only the final `[USER]:` turn.",
 ].join("\n");
 
 /**
  * High-precision patterns matching false-positive prompt-injection accusations and AWS Quick
- * built-in device/role-lock refusals (never matches generic apologies like plain "I'm sorry").
+ * built-in device/role-lock refusals (never matches generic apologies like plain "I'm sorry"
+ * or legitimate educational/defensive discussions of "prompt injection").
  */
 export const SOFT_REFUSAL_PATTERNS: readonly RegExp[] = [
-  /\bprompt\s+injection(?:\s+attack)?\b/i,
-  /\bsocial\s+engineering\b/i,
+  /\b(?:this|that|your)\s+(?:message|input|prompt|request|text)\s+(?:is|contains|looks?\s+like|appears?\s+to\s+be|has\s+been\s+flagged\s+as)\s+(?:an?\s+)?(?:indirect\s+)?prompt\s+injection(?:\s+(?:attack|attempt))?\b/i,
+  /\bI(?:'ve|'m|\s+have|\s+must|\s+need\s+to)?\s+(?:flag(?:ged|ging)?|detect(?:ed)?|stop(?:ping)?\s+and\s+flag)\s+(?:this|that|your\s+(?:message|input|prompt|request)|an?\s+(?:indirect\s+)?prompt\s+injection)\b/i,
+  /\b(?:this|that|your)\s+(?:message|input|prompt|request)\s+(?:is|looks?\s+like|appears?\s+to\s+be)\s+(?:a\s+)?social\s+engineering(?:\s+attack)?\b/i,
   /\bI\s+need\s+to\s+stop\s+and\s+flag\b/i,
   /\bWhat\s+I\s+will\s+not\s+do\b/i,
   /\binjected\s+system\s+prompts?\b/i,
@@ -1023,19 +1040,14 @@ export class QuickExecutionEngine {
   private readonly usageTracker: UsageTracker;
   private readonly modelListFetcher?: (apiKey: string) => Promise<SDKModel[]>;
   private readonly webSocketFactory?: (url: string, options?: Record<string, unknown>) => WebSocket;
-  private readonly incognito: boolean;
-  private readonly autoDeleteSession: boolean;
   private readonly autoEnsureCodingAgent: boolean;
   private readonly showRoutedModelInThinking: boolean;
-  private readonly suppressLateRoutedThinkingInStream: boolean;
   private readonly webSearchEnabled: boolean;
-  private readonly sanitizeAwsUiTags: boolean;
   private readonly workingSessionIds = new Map<string, string>();
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly activeWsBySlot = new Map<string, number>();
   private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
   private readonly autoEnsureFailedSlots = new Map<string, { failedAt: number; count: number }>();
-  private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
 
   private warmKey(
     scope: string | undefined,
@@ -1363,14 +1375,9 @@ export class QuickExecutionEngine {
     this.usageTracker = options.usageTracker;
     this.modelListFetcher = options.modelListFetcher;
     this.webSocketFactory = options.webSocketFactory;
-    this.incognito = process.env.INCOGNITO !== "false";
-    this.autoDeleteSession = process.env.AUTO_DELETE_SESSION === "true";
     this.autoEnsureCodingAgent = process.env.AUTO_ENSURE_CODING_AGENT !== "false";
     this.showRoutedModelInThinking = process.env.SHOW_ROUTED_MODEL_IN_THINKING !== "false";
-    this.suppressLateRoutedThinkingInStream =
-      process.env.SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM === "true";
     this.webSearchEnabled = process.env.WEB_SEARCH_ENABLED !== "false";
-    this.sanitizeAwsUiTags = process.env.SANITIZE_AWS_UI_TAGS !== "false";
   }
 
   runtimeStats() {
@@ -2047,22 +2054,45 @@ export class QuickExecutionEngine {
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
       contentFilterRecovered?: boolean;
+      warmFallbackToCold?: boolean;
+      accountFailoverCount?: number;
+      usedDefaultSystemAgent?: boolean;
     }) => void,
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
-    // Pre-lease input validation (P1-E): reject empty prompts and private/SSRF image/file URLs
-    // BEFORE acquiring an upstream account slot so malformed requests never consume pool capacity.
+    // Pre-lease input validation (P1-E): reject empty prompts, attachment count overflows, and
+    // private/SSRF image/file URLs BEFORE acquiring an upstream account slot so malformed requests
+    // never consume pool capacity or trigger upstream uploads/DNS lookups.
     const allImages = [...(turn.images || []), ...(turn.incrementalImages || [])];
     const allFiles = [...(turn.files || []), ...(turn.incrementalFiles || [])];
     if (!turn.fullTranscriptText?.trim() && allImages.length === 0 && allFiles.length === 0) {
       throw new GatewayError("Empty prompt", 400, "invalid_request_error");
     }
+    const currentTurnImages = turn.incrementalImages ?? turn.images ?? [];
+    if (currentTurnImages.length > MAX_INLINE_IMAGES) {
+      throw new GatewayError(
+        `Too many images in request (${currentTurnImages.length}; max supported per turn is ${MAX_INLINE_IMAGES}).`,
+        400,
+        "invalid_request_error",
+      );
+    }
+    const currentTurnFiles = turn.incrementalFiles ?? turn.files ?? [];
+    if (currentTurnFiles.length > MAX_INLINE_FILES) {
+      throw new GatewayError(
+        `Too many files in request (${currentTurnFiles.length}; max supported per turn is ${MAX_INLINE_FILES}).`,
+        400,
+        "invalid_request_error",
+      );
+    }
+    const checkedRemoteUrls = new Set<string>();
     for (const img of allImages) {
-      if ("url" in img && img.url && !img.url.startsWith("data:")) {
+      if ("url" in img && img.url && !img.url.startsWith("data:") && !checkedRemoteUrls.has(img.url)) {
+        checkedRemoteUrls.add(img.url);
         await assertSafeRemoteImageUrl(img.url);
       }
     }
     for (const f of allFiles) {
-      if (f.url && !f.url.startsWith("data:")) {
+      if (f.url && !f.url.startsWith("data:") && !checkedRemoteUrls.has(f.url)) {
+        checkedRemoteUrls.add(f.url);
         await assertSafeRemoteImageUrl(f.url);
       }
     }
@@ -2095,7 +2125,6 @@ export class QuickExecutionEngine {
       let yieldedOutput = false;
       let hasEmittedClientText = false;
       let hasEmittedThinking = false;
-      let retriedSoftRefusal = false;
       let retriedContentFilterRephrase = false;
       let lastExecMode: ExecutionModeTag | undefined;
       let capturedFilterCtx:
@@ -2127,11 +2156,12 @@ export class QuickExecutionEngine {
       };
       const wrappedMeta: typeof onExecMeta = (meta) => {
         lastExecMode = meta.execMode;
-        onExecMeta?.(meta);
+        onExecMeta?.({
+          ...meta,
+          ...(attempt > 0 ? { accountFailoverCount: attempt } : {}),
+        });
       };
-      const isInternalCall = Boolean(
-        turn.rawBody?.__internalSummary || turn.rawBody?.__internalRephrase,
-      );
+      const isInternalCall = Boolean(turn.rawBody?.__internalRephrase);
       const allowContentFilterRephrase =
         poolSettings.autoRephraseOnContentFilter === true && !isInternalCall;
 
@@ -2203,49 +2233,6 @@ export class QuickExecutionEngine {
         return;
       } catch (err) {
         let gwErr = mapSdkError(err);
-
-        // Seamless soft-refusal recovery (only before any text/tool_calls have been sent to client).
-        if (
-          gwErr.code === "soft_refusal_retry" &&
-          !hasEmittedClientText &&
-          !retriedSoftRefusal &&
-          !isInternalCall &&
-          !turn.signal?.aborted
-        ) {
-          retriedSoftRefusal = true;
-          closeCapturedFilterWs();
-          try {
-            if (turn.stream && hasEmittedThinking) {
-              yield {
-                type: "thinking",
-                text: "\n[False-positive refusal detected before answer; retrying cleanly...]\n",
-              };
-            }
-            for await (const ev of this.executeTurnWithLease(
-              turn,
-              lease,
-              isIncognito,
-              wrappedMeta,
-              effectiveChatAgentId,
-              keyPool,
-              { isSoftRefusalRetry: true, forceColdReplay: true },
-            )) {
-              if (ev.type === "text" || ev.type === "tool_calls") {
-                yieldedOutput = true;
-                hasEmittedClientText = true;
-              } else if (ev.type === "thinking") {
-                yieldedOutput = true;
-                hasEmittedThinking = true;
-              }
-              yield ev;
-            }
-            lease.markSuccess();
-            return;
-          } catch (retryErr) {
-            err = retryErr;
-            gwErr = mapSdkError(retryErr);
-          }
-        }
 
         // Opt-in defensive auto-rephrase on upstream `content_filtered` (strictly keeps the user's
         // requested model — NEVER silently downgrades e.g. quick-smart to quick-balanced).
@@ -2346,14 +2333,21 @@ export class QuickExecutionEngine {
           !turn.signal?.aborted &&
           gwErr.code !== "content_filter" &&
           gwErr.code !== "content_filtered" &&
-          gwErr.code !== "soft_refusal_retry" &&
           !preClass.isQuotaErr &&
           !preClass.isConnLimitErr &&
           !preClass.isRateLimitErr &&
           !preClass.isAuthErr
         ) {
           try {
-            for await (const ev of this.executeTurnWithLease(turn, lease, isIncognito, wrappedMeta, effectiveChatAgentId, keyPool)) {
+            for await (const ev of this.executeTurnWithLease(
+              turn,
+              lease,
+              isIncognito,
+              wrappedMeta,
+              effectiveChatAgentId,
+              keyPool,
+              { warmFallbackToCold: true },
+            )) {
               if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
                 yieldedOutput = true;
               }
@@ -2470,6 +2464,9 @@ export class QuickExecutionEngine {
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
       contentFilterRecovered?: boolean;
+      warmFallbackToCold?: boolean;
+      accountFailoverCount?: number;
+      usedDefaultSystemAgent?: boolean;
     }) => void,
     chatAgentId?: string,
     keyPool?: UpstreamKeyPool,
@@ -2477,7 +2474,7 @@ export class QuickExecutionEngine {
       overridePromptText?: string;
       forceColdReplay?: boolean;
       isRephraseRetry?: boolean;
-      isSoftRefusalRetry?: boolean;
+      warmFallbackToCold?: boolean;
       editBranch?: {
         ws: WebSocket;
         outpostId: string;
@@ -2526,7 +2523,6 @@ export class QuickExecutionEngine {
     const warmHit =
       !editBranch &&
       !turnOpts?.forceColdReplay &&
-      !(isIncognito && this.autoDeleteSession) &&
       turn.priorPrefixHash &&
       turn.incrementalUserText !== undefined
         ? this.lookupWarmThread(turn.scope, turn.conversationKey, lease.slotId, isIncognito, turn.priorPrefixHash, chatAgentId)
@@ -2551,9 +2547,7 @@ export class QuickExecutionEngine {
     const isWeb = cred.mode === "web" && !!cred.web;
     const isOAuthAccount = cred.mode === "oauth" && Boolean(cred.oauth);
     const effectiveProxy = lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-    const isInternalHelperCall = Boolean(
-      turn.rawBody?.__internalSummary || turn.rawBody?.__internalRephrase,
-    );
+    const isInternalHelperCall = Boolean(turn.rawBody?.__internalRephrase);
     let workingSessionId = isInternalHelperCall
       ? crypto.randomUUID()
       : this.workingSessionIds.get(lease.slotId);
@@ -2634,8 +2628,8 @@ export class QuickExecutionEngine {
         }
       }
 
-      // 2) Process images: OAuth accounts upload >=2 images or >20KB high-res out-of-band;
-      //    single tiny images (<20KB), non-OAuth accounts, or transport errors fall back to sharp inline compression.
+      // 2) Process images: OAuth accounts upload >=2 images or >20KB high-res out-of-band (propagating upload errors
+      //    explicitly without silent inline downgrade); single tiny images (<20KB) or non-OAuth use sharp inline compression.
       if (sourceImages.length > 0) {
         let uploadedHighRes = false;
         const resolvedImgs = await resolveRawImagePayloads(sourceImages, turn.signal);
@@ -2663,18 +2657,7 @@ export class QuickExecutionEngine {
               atts.push(...imgAtts);
               uploadedHighRes = true;
             } catch (imgErr) {
-              const reason = imgErr instanceof Error ? imgErr.message : String(imgErr || "unknown");
-              if (/blocked by aws quick dlp policy/i.test(reason)) {
-                throw new GatewayError(redactSecrets(reason), 400, "content_filtered");
-              }
-              console.warn(
-                JSON.stringify({
-                  event: "oauth_image_attachment_fallback_to_inline",
-                  slotId: lease.slotId,
-                  images: resolvedImgs.length,
-                  reason: redactSecrets(reason).slice(0, 200),
-                }),
-              );
+              throw mapAttachmentUploadError(imgErr, "Failed to upload image attachment(s) to AWS Quick");
             }
           }
         }
@@ -2759,34 +2742,17 @@ export class QuickExecutionEngine {
       execMode,
       usedProxy: Boolean(lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY),
       ...(turnOpts?.isRephraseRetry ? { contentFilterRecovered: true } : {}),
+      ...(turnOpts?.warmFallbackToCold ? { warmFallbackToCold: true } : {}),
+      ...(!chatAgentId && !isInternalHelperCall ? { usedDefaultSystemAgent: true } : {}),
     });
 
-    // Layer 2: Gateway overflow protection when caller forgets to compact near the 1M token limit.
-    const overflowLimit = (() => {
-      const raw = process.env.AUTO_COMPACT_OVERFLOW_TOKENS;
-      if (raw === undefined || raw.trim() === "") return DEFAULT_OVERFLOW_COMPACT_TOKENS;
-      const n = Number(raw);
-      return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_OVERFLOW_COMPACT_TOKENS;
-    })();
-    if (!isWarmIncremental && overflowLimit > 0 && !(turn.rawBody as Record<string, unknown> | undefined)?.__internalSummary) {
-      const initialCompact = compactOversizedPrompt(prompt, customPrompt, overflowLimit);
-      if (initialCompact.compacted) {
-        let middleSummary: string | undefined;
-        if (process.env.AUTO_COMPACT_SUMMARY !== "false" && initialCompact.middleSample) {
-          middleSummary = await this.summarizeOverflowMiddle(initialCompact.middleSample, lease, turn.signal, chatAgentId).catch(() => undefined);
-        }
-        prompt = middleSummary
-          ? compactOversizedPrompt(prompt, customPrompt, overflowLimit, middleSummary).prompt
-          : initialCompact.prompt;
-      }
-    }
     const allowedToolNames = new Set<string>();
     for (const t of turn.tools) {
       if (t.name) allowedToolNames.add(t.name);
       if (t.wireName) allowedToolNames.add(t.wireName);
     }
     const toolFilter = toolBridgePrompt ? new StreamingToolCallFilter(allowedToolNames) : null;
-    const uiTagSanitizer = this.sanitizeAwsUiTags ? new StreamingUiTagSanitizer() : null;
+    const uiTagSanitizer = new StreamingUiTagSanitizer();
 
     const encodeFrame = isWeb ? encodeGatewayJsonFrame : encodeCloudInputFrame;
     const decodeFrame = isWeb ? decodeGatewayFrame : decodeCloudOutputFrame;
@@ -2820,21 +2786,13 @@ export class QuickExecutionEngine {
             uploadTimeoutSignal,
           );
           attachments = [...attachments, fileAtt];
-          prompt = buildOutOfBandContextPrompt(prompt, fileName, 3_500, isWarmIncremental);
+          const openingHint =
+            turnOpts?.overridePromptText === undefined && turn.incrementalUserText
+              ? normalizeSystemReminderTagsForUpstream(stripHighRiskClientHeaders(turn.incrementalUserText))
+              : undefined;
+          prompt = buildOutOfBandContextPrompt(prompt, fileName, 3_500, isWarmIncremental, openingHint);
         } catch (uploadErr) {
-          const reason = uploadErr instanceof Error ? uploadErr.message : String(uploadErr || "unknown");
-          // Never bypass an explicit AWS Quick DLP policy block by resending the blocked payload via inline chunks.
-          if (/blocked by aws quick dlp policy/i.test(reason)) {
-            throw new GatewayError(redactSecrets(reason), 400, "content_filtered");
-          }
-          console.warn(
-            JSON.stringify({
-              event: "oauth_attachment_fallback_to_chunking",
-              slotId: lease.slotId,
-              bytes: estimatedTotalBytes,
-              reason: redactSecrets(reason).slice(0, 200),
-            }),
-          );
+          throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick");
         }
       }
     }
@@ -3098,11 +3056,17 @@ export class QuickExecutionEngine {
 
     let pendingRoutedThinking: string | null = null;
     let sawRealThinking = false;
+    let lastUpstreamTotalTokens = 0;
+    let lastUpstreamContextWindow = 0;
+    let lastUpstreamContextPercent = 0;
     let pendingTurnUsage: {
       inputTokens: number;
       outputTokens: number;
       cacheReadTokens: number;
       cacheWriteTokens: number;
+      totalTokens?: number;
+      contextWindow?: number;
+      contextPercent?: number;
       resolvedModel?: string;
     } | null = null;
     const flushPendingRoutedThinking = () => {
@@ -3125,6 +3089,9 @@ export class QuickExecutionEngine {
           outputTokens: u.outputTokens,
           cacheReadTokens: u.cacheReadTokens,
           cacheWriteTokens: u.cacheWriteTokens,
+          ...(u.totalTokens !== undefined ? { totalTokens: u.totalTokens } : {}),
+          ...(u.contextWindow !== undefined ? { contextWindow: u.contextWindow } : {}),
+          ...(u.contextPercent !== undefined ? { contextPercent: u.contextPercent } : {}),
         },
       });
       push({
@@ -3134,61 +3101,23 @@ export class QuickExecutionEngine {
           outputTokens: u.outputTokens,
           cacheReadTokens: u.cacheReadTokens,
           cacheWriteTokens: u.cacheWriteTokens,
+          ...(u.totalTokens !== undefined ? { totalTokens: u.totalTokens } : {}),
+          ...(u.contextWindow !== undefined ? { contextWindow: u.contextWindow } : {}),
+          ...(u.contextPercent !== undefined ? { contextPercent: u.contextPercent } : {}),
           ...(u.resolvedModel ? { resolvedModel: u.resolvedModel } : {}),
-          ...(isIncognito && this.autoDeleteSession ? { sessionDeleted: true } : {}),
         },
       });
     };
 
-    const abortSoftRefusalRetry = () => {
-      clearPing();
-      clearPostUsageTimer();
-      clearAuxTimers();
-      ended = true;
-      push({
-        type: "__error",
-        error: new GatewayError(
-          "Upstream model returned a false-positive refusal.",
-          400,
-          "soft_refusal_retry",
-        ),
-      });
-      try {
-        ws.close();
-      } catch { }
-    };
-
-    const allowSoftRefusalGuard =
-      !isInternalRephraseCall &&
-      !turn.rawBody?.__internalSummary &&
-      !turnOpts?.isSoftRefusalRetry &&
-      !turnOpts?.isRephraseRetry;
-
-    const emitGuardedText = (chunk: string): boolean => {
-      if (!chunk) return true;
+    const emitGuardedText = (chunk: string): void => {
+      if (!chunk) return;
       if (!usageLimitChecked) {
         usageLimitPrefixBuf += chunk;
         const mightBePseudoLimit =
           usageLimitPrefixBuf.length <= 160 &&
           (isPseudo200UsageLimitPrefix(usageLimitPrefixBuf) || isPseudo200UsageLimitText(usageLimitPrefixBuf));
         if (mightBePseudoLimit) {
-          return true;
-        }
-        // Lightweight warmup buffer (<= 260 chars or until first sentence boundary / `<tool_call>`):
-        // catches false-positive prompt-injection or AWS Quick device-lock refusals before flushing
-        // any text to the client so we can transparently retry cleanly without polluting warmThreads.
-        if (allowSoftRefusalGuard && !usageLimitPrefixBuf.includes("<tool_call>")) {
-          if (isLikelySoftRefusal(usageLimitPrefixBuf)) {
-            usageLimitPrefixBuf = "";
-            pendingRoutedThinking = null;
-            pendingTurnUsage = null;
-            abortSoftRefusalRetry();
-            return false;
-          }
-          const hitBoundary = /[。！？.!?\n]/.test(usageLimitPrefixBuf);
-          if (!hitBoundary && usageLimitPrefixBuf.length < 260) {
-            return true;
-          }
+          return;
         }
         usageLimitChecked = true;
         flushPendingRoutedThinking();
@@ -3198,13 +3127,12 @@ export class QuickExecutionEngine {
         assistantOutputText += flushed;
         push({ type: "text", text: flushed });
         flushPendingTurnUsage();
-        return true;
+        return;
       }
       flushPendingRoutedThinking();
       hasEmittedText = true;
       assistantOutputText += chunk;
       push({ type: "text", text: chunk });
-      return true;
     };
 
     const finalizeTurn = (realThreadId: string, allowParkWs = true) => {
@@ -3220,13 +3148,6 @@ export class QuickExecutionEngine {
           abortPseudo200QuotaLimit();
           return;
         }
-        if (allowSoftRefusalGuard && isLikelySoftRefusal(usageLimitPrefixBuf)) {
-          usageLimitPrefixBuf = "";
-          pendingRoutedThinking = null;
-          pendingTurnUsage = null;
-          abortSoftRefusalRetry();
-          return;
-        }
         usageLimitChecked = true;
         flushPendingRoutedThinking();
         const flushed = usageLimitPrefixBuf;
@@ -3240,17 +3161,11 @@ export class QuickExecutionEngine {
         flushPendingRoutedThinking();
         flushPendingTurnUsage();
       }
-      const shouldAutoDelete = isIncognito && this.autoDeleteSession;
-      if (shouldAutoDelete && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(encodeFrame({ type: "session_delete", payload: { session_id: realThreadId } }));
-        } catch { }
-      }
       let stopReason: "stop" | "tool_calls" = "stop";
       let emittedToolCalls: Array<{ id: string; name: string }> = [];
       if (toolFilter) {
         const { remainingText, toolCalls } = toolFilter.flush();
-        const cleanRem = remainingText && uiTagSanitizer ? uiTagSanitizer.feed(remainingText) : remainingText;
+        const cleanRem = remainingText ? uiTagSanitizer.feed(remainingText) : remainingText;
         if (cleanRem) {
           hasEmittedText = true;
           assistantOutputText += cleanRem;
@@ -3262,17 +3177,21 @@ export class QuickExecutionEngine {
           stopReason = "tool_calls";
         }
       }
-      if (uiTagSanitizer) {
-        const tailText = uiTagSanitizer.flush();
-        if (tailText) {
-          hasEmittedText = true;
-          assistantOutputText += tailText;
-          push({ type: "text", text: tailText });
-        }
+      const tailText = uiTagSanitizer.flush();
+      if (tailText) {
+        hasEmittedText = true;
+        assistantOutputText += tailText;
+        push({ type: "text", text: tailText });
       }
       let parkedForReuse = false;
       const effectiveFinishThreadId = activeKernelThreadId || realThreadId;
-      if (!shouldAutoDelete && turn.currentInputPrefixHash && !isLikelySoftRefusal(assistantOutputText)) {
+      // Prevent AWS Quick cloud threads from accumulating past their context cliff: rotate cleanly
+      // to a fresh thread on the next turn once upstream occupancy crosses 80% of real `context_window`.
+      const effectiveContextWindow = lastUpstreamContextWindow > 0 ? lastUpstreamContextWindow : 1_000_000;
+      const nearUpstreamContextLimit =
+        lastUpstreamContextPercent >= 80 ||
+        lastUpstreamTotalTokens >= Math.floor(effectiveContextWindow * 0.8);
+      if (turn.currentInputPrefixHash && !isLikelySoftRefusal(assistantOutputText) && !nearUpstreamContextLimit) {
         const nextHashes: string[] = [];
         if (stopReason === "stop" && assistantOutputText.trim().length > 0) {
           nextHashes.push(extendHashWithAssistantTurn(turn.currentInputPrefixHash, assistantOutputText));
@@ -3308,13 +3227,6 @@ export class QuickExecutionEngine {
       push({ type: "done", stopReason });
       if (parkedForReuse) {
         // Keep dedicated WebSocket open & pinged for next turn (mirrors official Quick desktop app).
-      } else if (shouldAutoDelete) {
-        const t = setTimeout(() => {
-          try {
-            ws.close();
-          } catch { }
-        }, 1000);
-        t.unref?.();
       } else {
         try {
           ws.close();
@@ -3513,8 +3425,7 @@ export class QuickExecutionEngine {
 
         const canEmitRoutedThinking = () =>
           this.showRoutedModelInThinking &&
-          !emittedRoutedModel &&
-          !(turn.stream && this.suppressLateRoutedThinkingInStream && hasEmittedText);
+          !emittedRoutedModel;
         const emitOrDeferRoutedThinking = (modelName: string) => {
           emittedRoutedModel = true;
           const rephraseTag = turnOpts?.isRephraseRetry ? " · rephrased" : "";
@@ -3555,9 +3466,9 @@ export class QuickExecutionEngine {
           const delta = String(payload.delta || "");
           if (delta) {
             const afterTools = toolFilter ? toolFilter.feed(delta) : delta;
-            const emitText = afterTools && uiTagSanitizer ? uiTagSanitizer.feed(afterTools) : afterTools;
+            const emitText = afterTools ? uiTagSanitizer.feed(afterTools) : afterTools;
             if (emitText) {
-              if (!emitGuardedText(emitText)) return;
+              emitGuardedText(emitText);
             }
           }
         } else if (evType === "thinking_delta") {
@@ -3567,6 +3478,13 @@ export class QuickExecutionEngine {
             usageLimitChecked = true;
             sawRealThinking = true;
             flushPendingRoutedThinking();
+            if (usageLimitPrefixBuf) {
+              const flushed = usageLimitPrefixBuf;
+              usageLimitPrefixBuf = "";
+              hasEmittedText = true;
+              assistantOutputText += flushed;
+              push({ type: "text", text: flushed });
+            }
             push({ type: "thinking", text: delta });
             flushPendingTurnUsage();
           }
@@ -3575,6 +3493,9 @@ export class QuickExecutionEngine {
           const outputTokens = Number(payload.output_tokens || 0);
           const cacheReadTokens = Number(payload.cache_read_tokens || 0);
           const cacheWriteTokens = Number(payload.cache_write_tokens || 0);
+          const rawTotalTokens = Number(payload.total_tokens || 0);
+          const contextWindow = Number(payload.context_window || 0);
+          const rawContextPercent = Number(payload.context_percent || 0);
           const served = String(payload.resolved_model_id || payload.served_model_id || "");
           if (served) {
             resolvedModelId = served;
@@ -3582,15 +3503,42 @@ export class QuickExecutionEngine {
               emitOrDeferRoutedThinking(served);
             }
           }
-          pendingTurnUsage = {
-            inputTokens,
-            outputTokens,
-            cacheReadTokens,
-            cacheWriteTokens,
-            ...(resolvedModelId ? { resolvedModel: resolvedModelId } : {}),
-          };
-          if (usageLimitChecked) {
-            flushPendingTurnUsage();
+          if (contextWindow > 0) {
+            lastUpstreamContextWindow = contextWindow;
+          }
+          const computedTotal =
+            rawTotalTokens > 0
+              ? rawTotalTokens
+              : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+          const isAllZeroUsage =
+            computedTotal === 0 &&
+            inputTokens === 0 &&
+            outputTokens === 0 &&
+            cacheReadTokens === 0 &&
+            cacheWriteTokens === 0;
+          // AWS Quick occasionally emits an empty all-zero `turn_usage` frame (e.g. on guardrail/empty turns);
+          // never let an all-zero frame overwrite real non-zero usage metrics from the same turn.
+          if (!isAllZeroUsage) {
+            const effectiveWin = lastUpstreamContextWindow > 0 ? lastUpstreamContextWindow : 1_000_000;
+            const computedPercent =
+              rawContextPercent > 0
+                ? Math.round(rawContextPercent * 10) / 10
+                : Math.round((computedTotal / effectiveWin) * 1000) / 10;
+            lastUpstreamTotalTokens = Math.max(lastUpstreamTotalTokens, computedTotal);
+            lastUpstreamContextPercent = Math.max(lastUpstreamContextPercent, computedPercent);
+            pendingTurnUsage = {
+              inputTokens,
+              outputTokens,
+              cacheReadTokens,
+              cacheWriteTokens,
+              totalTokens: computedTotal,
+              ...(lastUpstreamContextWindow > 0 ? { contextWindow: lastUpstreamContextWindow } : {}),
+              contextPercent: computedPercent,
+              ...(resolvedModelId ? { resolvedModel: resolvedModelId } : {}),
+            };
+            if (usageLimitChecked) {
+              flushPendingTurnUsage();
+            }
           }
           // Guard against AWS Quick occasionally omitting `message_complete` after very long outputs (30K+ output tokens).
           // Only armed once actual output has started and cancelled immediately if any subsequent delta/event arrives.
@@ -3609,12 +3557,6 @@ export class QuickExecutionEngine {
           evType === "session_end"
         ) {
           finalizeTurn(String(ev.thread_id || threadId));
-          return;
-        } else if (evType === "session_deleted") {
-          clearPostUsageTimer();
-          try {
-            ws.close();
-          } catch { }
           return;
         } else if (evType === "error" || evType === "guardrail_blocked") {
           clearPing();
@@ -3776,75 +3718,10 @@ export class QuickExecutionEngine {
         ws.off("message", onWsMessage);
         ws.off("error", onWsError);
         ws.off("close", onWsClose);
-        if (!(ended && isIncognito && this.autoDeleteSession)) {
-          try {
-            ws.close();
-          } catch { }
-        }
+        try {
+          ws.close();
+        } catch { }
       }
-    }
-  }
-
-  /**
-   * Best-effort 15s `quick-fast` summary of an omitted middle section when a caller exceeds
-   * `AUTO_COMPACT_OVERFLOW_TOKENS` (~850K tokens). Falls back cleanly to head+tail trim on any error.
-   */
-  private async summarizeOverflowMiddle(
-    middleSample: string,
-    lease: ReturnType<UpstreamKeyPool["leaseKey"]>,
-    parentSignal?: AbortSignal,
-    chatAgentId?: string,
-  ): Promise<string | undefined> {
-    const cacheKey = crypto.createHash("sha256").update(middleSample).digest("hex");
-    const now = Date.now();
-    const cached = this.overflowSummaryCache.get(cacheKey);
-    if (cached && cached.expiresAt > now) {
-      return cached.summary;
-    }
-    if (cached) this.overflowSummaryCache.delete(cacheKey);
-
-    const ac = new AbortController();
-    const onParentAbort = () => ac.abort();
-    parentSignal?.addEventListener("abort", onParentAbort, { once: true });
-    const timeout = setTimeout(() => ac.abort(), 15_000);
-    timeout.unref?.();
-    try {
-      const summaryTurn: ParsedProtocolTurn = {
-        scope: "internal-compact",
-        requestedModel: "quick-fast",
-        stream: false,
-        systemPrompt: "You are a concise context compactor. Summarize the key facts, decisions, code identifiers, file paths, and open tasks from this earlier conversation excerpt in <= 400 words.",
-        fullTranscriptText: middleSample,
-        images: [],
-        tools: [],
-        toolChoice: "none",
-        trailingToolResults: [],
-        estimatedInputTokens: estimatePromptTokens(middleSample),
-        conversationKey: `compact-${crypto.randomUUID()}`,
-        rawBody: { __internalSummary: true },
-        signal: ac.signal,
-      };
-      let out = "";
-      const subLease = { ...lease, release: () => { }, markSuccess: () => { } };
-      for await (const ev of this.executeTurnWithLease(summaryTurn, subLease, true, undefined, chatAgentId)) {
-        if (ev.type === "text") out += ev.text;
-      }
-      const trimmed = out.trim();
-      if (trimmed) {
-        while (this.overflowSummaryCache.size >= 32) {
-          const oldest = this.overflowSummaryCache.keys().next().value;
-          if (!oldest) break;
-          this.overflowSummaryCache.delete(oldest);
-        }
-        this.overflowSummaryCache.set(cacheKey, { summary: trimmed, expiresAt: Date.now() + 30 * 60 * 1000 });
-        return trimmed;
-      }
-      return undefined;
-    } catch {
-      return undefined;
-    } finally {
-      clearTimeout(timeout);
-      parentSignal?.removeEventListener("abort", onParentAbort);
     }
   }
 

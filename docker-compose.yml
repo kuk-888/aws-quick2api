@@ -12,8 +12,9 @@ services:
       - no-new-privileges:true
     ports:
       - "127.0.0.1:3456:3456"
-    env_file:
-      - .env
+    # Note: Do NOT use `env_file: [.env]` here — Docker passes env_file entries via Linux execve
+    # environment variables (128KB per-var limit), which breaks startup with 60+ OAuth accounts.
+    # Instead, mount `./.env:/app/.env` below and let the Node gateway read `/app/.env` directly.
     environment:
       # Override HOST to 0.0.0.0 inside container so host port mapping works
       HOST: "0.0.0.0"

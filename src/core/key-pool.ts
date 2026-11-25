@@ -697,27 +697,32 @@ export class UpstreamKeyPool {
       // If no account has inflight capacity (or all are briefly cooling down), check wait budget.
       const remainingMs = deadline - Date.now();
       const maxQueue = Math.max(4, usableSlots.length * this.maxInflightPerSlot);
-      if (remainingMs <= 0 || (!hasWaited && this.slotWaiters.length >= maxQueue)) {
-        // Only fall through to pickFromPool if all accounts are in long cooldown AND at least one
-        // has inflight headroom (< maxInflightPerSlot); pickFromPool also enforces < maxInflightPerSlot.
-        const anyBelowCap = usableSlots.some((s) => s.activeInflight < this.maxInflightPerSlot);
-        if (anyBelowCap && remainingMs <= 0 && usableSlots.every((s) => s.cooldownUntil > Date.now())) {
-          return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
+      // Use minimum cooldown across ALL usable slots (including currently full ones) when deciding
+      // whether to fast-fail 429: a full slot with a brief 2.5s connLimit can release before deadline.
+      const soonestAnyCooldownMs = usableSlots.reduce((min, s) => {
+        if (s.cooldownUntil > now) {
+          return Math.min(min, s.cooldownUntil - now);
         }
+        return min;
+      }, Number.POSITIVE_INFINITY);
+      const soonestCooldownMs = usableSlots.reduce((min, s) => {
+        if (s.cooldownUntil > now && s.activeInflight < this.maxInflightPerSlot) {
+          return Math.min(min, s.cooldownUntil - now);
+        }
+        return min;
+      }, Number.POSITIVE_INFINITY);
+      const allCoolingBeyondBudget =
+        usableSlots.every((s) => s.cooldownUntil > now) && soonestAnyCooldownMs > Math.max(0, remainingMs);
+
+      if (remainingMs <= 0 || allCoolingBeyondBudget || (!hasWaited && this.slotWaiters.length >= maxQueue)) {
         throw new GatewayError(
-          "All upstream AWS Quick accounts are currently at concurrency capacity. Please retry in a few seconds.",
+          "All upstream AWS Quick accounts are currently rate-limited or at capacity. Please retry in a few seconds.",
           429,
           "rate_limit_exceeded",
         );
       }
 
       // Wait until a compatible lease is released, a short cooldown expires, or the wait budget runs out.
-      const soonestCooldownMs = usableSlots.reduce((min, s) => {
-        if (s.cooldownUntil > now && s.activeInflight < this.maxInflightPerSlot) {
-          return Math.min(min, s.cooldownUntil - now);
-        }
-        return min;
-      }, remainingMs);
       const stepWaitMs = Math.max(25, Math.min(remainingMs, soonestCooldownMs));
 
       await new Promise<void>((resolve) => {
@@ -827,19 +832,9 @@ export class UpstreamKeyPool {
       throw new GatewayError("No enabled upstream AWS Quick credentials available.", 503, "no_enabled_keys");
     }
 
-    let candidates = enabledSlots.filter((s) => s.cooldownUntil === 0);
-    // All enabled accounts in transient 429 cooldown -> still run the exhaustion check below,
-    // then pick the one whose cooldown expires soonest (strictly respecting maxInflightPerSlot).
-    const allCoolingDown = candidates.length === 0;
-    if (allCoolingDown) {
-      candidates = [...enabledSlots].sort((a, b) => a.cooldownUntil - b.cooldownUntil);
-    }
-
-    // Filter out accounts whose target pool is exhausted without allowed fallback
-    const nonExhausted = candidates.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
-    if (nonExhausted.length > 0) {
-      candidates = nonExhausted;
-    } else if (!candidates.some((s) => s.quota?.onDemandSpend.enabled)) {
+    // Filter out accounts whose target pool is exhausted before checking cooldowns
+    const nonExhausted = enabledSlots.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
+    if (nonExhausted.length === 0) {
       throw new GatewayError(
         `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
         429,
@@ -847,16 +842,13 @@ export class UpstreamKeyPool {
       );
     }
 
-    if (allCoolingDown) {
-      const belowCap = candidates.filter((s) => s.activeInflight < this.maxInflightPerSlot);
-      if (belowCap.length === 0) {
-        throw new GatewayError(
-          "All upstream AWS Quick accounts are currently at concurrency capacity. Please retry in a few seconds.",
-          429,
-          "rate_limit_exceeded",
-        );
-      }
-      return this.bindAndLease(belowCap[0]!, conversationKey);
+    let candidates = nonExhausted.filter((s) => s.cooldownUntil === 0);
+    if (candidates.length === 0) {
+      throw new GatewayError(
+        "All upstream AWS Quick accounts are currently cooling down. Please retry shortly.",
+        429,
+        "rate_limit_exceeded",
+      );
     }
 
     const underCap = candidates.filter((s) => s.activeInflight < this.maxInflightPerSlot);

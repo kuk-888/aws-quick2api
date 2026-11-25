@@ -2727,6 +2727,15 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const shortAgentId = s.chatAgentId
         ? (s.chatAgentId.length > 16 ? (s.chatAgentId.slice(0, 8) + "…" + s.chatAgentId.slice(-4)) : s.chatAgentId)
         : "";
+      const globalAgentId = (window.__globalChatAgentId || "").trim();
+      const shortGlobalAgent = globalAgentId
+        ? (globalAgentId.length > 16 ? (globalAgentId.slice(0, 8) + "…" + globalAgentId.slice(-4)) : globalAgentId)
+        : "";
+      const agentHintHtml = shortAgentId
+        ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Agent: ' + esc(s.chatAgentId) + '">Agent: ' + esc(shortAgentId) + '</div>'
+        : shortGlobalAgent
+          ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Global Agent: ' + esc(globalAgentId) + '">Agent: ' + esc(tr("全局 ", "Global ") + shortGlobalAgent) + '</div>'
+          : '<div style="margin-top:3px;"><span class="tag" style="font-size:10px;color:var(--warn);border-color:color-mix(in srgb,var(--warn) 42%,transparent);" title="' + esc(tr("该账号未绑定自定义 Agent，请求将使用 AWS Quick 官方默认助手，可能触发设备锁/身份限制", "No custom Agent bound; requests use AWS Quick default assistant")) + '">' + esc(tr("未绑 Agent (默认助手)", "Unbound Agent")) + '</span></div>';
       return '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
           '<span style="font-weight:600;">' + esc(title) + '</span>' +
           renderAuthTag(s) +
@@ -2734,7 +2743,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         '</div>' +
         (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
         (s.maskedProxy ? '<div class="mono" style="font-size:10.5px;color:var(--ok);margin-top:2px;">Proxy: ' + esc(s.maskedProxy) + '</div>' : '') +
-        (shortAgentId ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="Agent: ' + esc(s.chatAgentId) + '">Agent: ' + esc(shortAgentId) + '</div>' : '');
+        agentHintHtml;
     };
     const buildCompactQuotaHtml = (s, isSyncing) => {
       if (isSyncing) {
@@ -2812,6 +2821,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
       const usage = data.gatewaySessionUsage || data;
       const settings = data.settings || {};
+      window.__globalChatAgentId = settings.chatAgentId || "";
       const affinities = data.affinities || [];
       const tot = usage.totals || {};
 
@@ -3232,15 +3242,42 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               ? '<span class="tag" style="font-size:10.5px;color:var(--warn);">' + esc(tr("云端留存", "Cloud Saved")) + '</span>'
               : (r.execMode ? '<span class="tag" style="font-size:10.5px;">' + esc(execModeLabel(r.execMode)) + '</span>' : '');
 
+        const m = r.metrics || {};
+        const ctxWin = Number(m.contextWindow || 0);
+        const ctxTot = Number(m.totalTokens || 0) || ((m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadTokens || 0) + (m.cacheWriteTokens || 0));
+        const ctxPct = typeof m.contextPercent === "number"
+          ? m.contextPercent
+          : (ctxWin > 0 && ctxTot > 0 ? Math.round((ctxTot / ctxWin) * 1000) / 10 : null);
+        const fmtCtxWinShort = (w) => {
+          const n = Number(w || 0);
+          if (!n) return "";
+          if (n >= 1000000 && n % 1000000 === 0) return (n / 1000000) + "M";
+          if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+          if (n >= 1000) return Math.round(n / 1000) + "K";
+          return String(n);
+        };
+
         const badges = [];
+        if (ctxPct != null && (ctxWin > 0 || ctxTot > 0)) {
+          const ctxStyle = ctxPct >= 80
+            ? 'color:var(--err);border-color:color-mix(in srgb,var(--err) 45%,transparent);font-weight:600;'
+            : ctxPct >= 65
+              ? 'color:var(--warn);border-color:color-mix(in srgb,var(--warn) 42%,transparent);font-weight:600;'
+              : 'color:var(--fg-muted);';
+          const ctxTitle = ctxPct.toFixed(1) + '%' + (ctxWin > 0 ? (' / ' + fmtCtxWinShort(ctxWin)) : '') + (ctxTot > 0 ? (' (' + fmtTok(ctxTot) + ')') : '');
+          const ctxLabel = tr("水位 ", "Ctx ") + ctxPct.toFixed(1) + '%' + (ctxPct >= 80 ? tr(" · 换线程", " · Rotate") : '');
+          badges.push('<span class="tag mono" style="' + ctxStyle + '" title="' + esc(ctxTitle) + '">' + esc(ctxLabel) + '</span>');
+        }
         if (r.contentFilterRecovered) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("防误拦重述", "Rephrased")) + '</span>');
+        if (r.warmFallbackToCold) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("热转冷重放", "Warm→Cold")) + '</span>');
+        if (r.accountFailoverCount > 0) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("切号×", "Failover ×") + r.accountFailoverCount) + '</span>');
+        if (r.usedDefaultSystemAgent) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("未绑Agent", "Default Agent")) + '</span>');
+        if (r.status === "error") badges.push('<span class="tag" style="color:var(--err);border-color:color-mix(in srgb,var(--err) 40%,transparent);">' + esc(tr("异常", "Error") + " " + (r.httpStatus || "")) + '</span>');
         if (r.usedProxy) badges.push('<span class="tag">' + esc(tr("代理", "Proxy")) + '</span>');
         if (r.hasThinking) badges.push('<span class="tag">' + esc(tr("思考", "Thinking")) + '</span>');
         if (r.emittedToolCallsCount > 0) badges.push('<span class="tag">' + esc(tr("调工具×", "Tools ×")) + r.emittedToolCallsCount + '</span>');
         if (r.toolCount > 0 && r.emittedToolCallsCount === 0) badges.push('<span class="tag" style="opacity:0.7;">' + esc(tr("挂", "")) + r.toolCount + esc(tr("工具", " tools")) + '</span>');
 
-        const m = r.metrics || {};
-        if (m.sessionDeleted) badges.push('<span class="tag">' + esc(tr('已删会话', 'Deleted')) + '</span>');
         const routedShort = m.resolvedModel ? String(m.resolvedModel).replace(/^us\.anthropic\./, "") : "";
         const routedCls = routedShort.toLowerCase().includes("opus")
           ? "routed-opus"
@@ -3327,10 +3364,42 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const row = (k, v) => '<div class="kv-item"><span>' + k + '</span><strong class="mono">' + v + '</strong></div>';
       const tools = d.toolNames || [];
 
+      const fmtCtxWin = (w) => {
+        const n = Number(w || 0);
+        if (!n) return "";
+        if (n >= 1000000 && n % 1000000 === 0) return (n / 1000000) + "M";
+        if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+        if (n >= 1000) return Math.round(n / 1000) + "K";
+        return String(n);
+      };
+      const ctxWin = Number(m.contextWindow || 0);
+      const ctxTot = Number(m.totalTokens || 0) || ((m.inputTokens || 0) + (m.outputTokens || 0) + (m.cacheReadTokens || 0) + (m.cacheWriteTokens || 0));
+      const ctxPct = typeof m.contextPercent === "number"
+        ? m.contextPercent
+        : (ctxWin > 0 && ctxTot > 0 ? Math.round((ctxTot / ctxWin) * 1000) / 10 : null);
+      const ctxRowHtml = (ctxWin > 0 && ctxPct != null)
+        ? row(
+            esc(tr('上游上下文水位', 'Upstream Context')),
+            '<span style="color:' + (ctxPct >= 80 ? 'var(--err)' : ctxPct >= 65 ? 'var(--warn)' : 'inherit') + ';">' +
+              esc(ctxPct.toFixed(1) + '% / ' + fmtCtxWin(ctxWin) + ' (' + fmtTok(ctxTot) + ')' + (ctxPct >= 80 ? tr(' · 下轮自动换新线程', ' · rotates next turn') : '')) +
+            '</span>'
+          )
+        : '';
+
+      const fallbackEvents = [];
+      if (d.contentFilterRecovered) fallbackEvents.push(tr('防误拦重述恢复（同模型）', 'Defensive rephrase recovery (same model)'));
+      if (d.warmFallbackToCold) fallbackEvents.push(tr('热会话失效回退冷重放', 'Warm thread fell back to cold replay'));
+      if (d.accountFailoverCount > 0) fallbackEvents.push(tr('跨号故障切换 ×' + d.accountFailoverCount, 'Account failover ×' + d.accountFailoverCount));
+      if (d.usedDefaultSystemAgent) fallbackEvents.push(tr('未绑定 Custom Agent（回落默认助手）', 'No custom Agent (default SYSTEM assistant)'));
+      const fallbackHtml = fallbackEvents.length
+        ? row(esc(tr('回退与异常处理', 'Fallbacks & Notices')), '<span style="color:var(--warn);">' + esc(fallbackEvents.join(' · ')) + '</span>')
+        : '';
+
       $("drBody").innerHTML =
         '<div class="kv-grid">' +
           '<div class="kv-item"><span>' + esc(tr('执行模式 & 网络实发', 'Execution Mode & Payload')) + '</span><strong>' + esc(execModeLabel(d.execMode)) + '</strong><span style="margin-top:2px;">' + esc(savedNote) + '</span></div>' +
           '<div class="kv-item"><span>' + esc(tr('首包 TTFT / 总耗时 & Tokens', 'TTFT / Total & Tokens')) + '</span><strong class="mono">' + ttft + ' / ' + dur + '</strong><span class="mono" style="margin-top:2px;">' + esc(tr('新发入 ', 'In ')) + fmtTok(m.inputTokens) + esc(tr(' · 缓存读 ', ' · Cache ')) + fmtTok(m.cacheReadTokens) + esc(tr(' · 输出 ', ' · Out ')) + fmtTok(m.outputTokens) + '</span></div>' +
+          ctxRowHtml +
           row(esc(tr('消息数 / 附图', 'Messages / Images')), fmt(d.messageCount || 0) + ' / ' + fmt(d.imageCount || 0)) +
           row(esc(tr('输出字数 / 思考 / 工具调用', 'Output Chars / Thinking / Tool Calls')), fmt(d.outputChars || 0) + ' / ' + (d.hasThinking ? tr('有', 'Yes') : tr('无', 'No')) + ' / ' + (d.emittedToolCallsCount || 0)) +
           row(esc(tr('会话指纹', 'Conversation Hash')), esc(fp.conversation || '—')) +
@@ -3339,7 +3408,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           row(esc(tr('客户端', 'Client')), esc(d.client || '—')) +
           row('User-Agent', esc(d.userAgent || '—')) +
           row(esc(tr('结束原因', 'Stop Reason')), esc(d.stopReason || '—')) +
-          (d.contentFilterRecovered ? row(esc(tr('内容过滤恢复', 'Content Filter Recovery')), esc(tr('已自动防御性重述恢复（同模型无降级）', 'Auto-recovered via defensive rephrase (same model)'))) : '') +
+          fallbackHtml +
         '</div>' +
         (d.errorMessage ? '<div><span class="field-lbl" style="color:var(--err);">' + esc(tr('错误信息', 'Error Message')) + '</span><pre class="code-block mono" style="border-color:var(--err);color:var(--err);">' + esc(d.errorMessage) + '</pre></div>' : '') +
         '<div style="font-size:12px;color:var(--fg-muted);">' + esc(tr('指纹是单向短哈希，仅用于判断两次请求是否属于同一对话前缀，无法还原内容。', 'Hashes are one-way 8-char fingerprints used only to match conversation prefixes; content cannot be reconstructed.')) + '</div>';

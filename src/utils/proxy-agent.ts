@@ -372,7 +372,7 @@ export function getProxyAgent(proxyUrl: string | undefined): https.Agent | undef
 
 function isTransientProxyNetworkError(err: unknown): boolean {
   const code = String((err as { code?: unknown } | null)?.code || "").toUpperCase();
-  if (code === "ECONNRESET" || code === "ECONNABORTED" || code === "EPIPE" || code === "ETIMEDOUT") {
+  if (code === "ECONNRESET" || code === "ECONNABORTED" || code === "EPIPE") {
     return true;
   }
   const msg = (err instanceof Error ? err.message : String(err || "")).toLowerCase();
@@ -456,7 +456,7 @@ function doProxiedHttpsRequest(
 /**
  * Perform an HTTPS fetch optionally routed through a per-credential HTTP/HTTPS/SOCKS5 proxy.
  * Falls back to native global `fetch` when no per-credential proxy is configured.
- * Automatically retries up to 2 times on transient residential-proxy TCP/handshake resets
+ * Automatically retries up to 1 time by default on transient residential-proxy TCP/handshake resets
  * (`ECONNRESET`, `EPIPE`, `socket hang up`, SOCKS5 handshake close).
  */
 export async function fetchViaOptionalProxy(
@@ -479,7 +479,7 @@ export async function fetchViaOptionalProxy(
   }
   const u = new URL(url);
   const agent = getProxyAgent(effectiveProxy);
-  const maxRetries = Math.max(0, options?.maxRetries ?? 2);
+  const maxRetries = Math.max(0, options?.maxRetries ?? 1);
   const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 300);
 
   let lastErr: unknown;

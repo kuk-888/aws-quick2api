@@ -10,6 +10,8 @@ English | **[简体中文](./README.md)**
 
 Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Linux, Docker, macOS, and Windows without installing the official desktop app, and ships with a built-in Web Console (`aws-quick-admin`).
 
+💬 Discussions & feedback: join the [Telegram Community Group](https://t.me/+-2B2GA8qESpjYWZl) or open a [GitHub Issue](https://github.com/kuk-888/aws-quick2api/issues).
+
 > **Disclaimer**: Independent third-party open-source project, not affiliated with or endorsed by Amazon Web Services (AWS). Contains no proprietary AWS binaries or assets. Authenticate with your own legitimate account. For personal development and protocol interoperability only—do not resell or run as a commercial relay.
 
 ---
@@ -188,16 +190,16 @@ See [.env.example](./.env.example) for the full template:
 
 - **Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`)**: Not enforced upstream; accepted for client compatibility and reported via response headers.
 - **`response_format` (`json_object` / `json_schema`) & `n > 1`**: Not supported; returns an explicit `400` error.
-- **Attachments**: Image inputs (PNG/JPG/WebP/GIF, up to 10 most recent per turn) and PDF/document inputs (Anthropic `document`, OpenAI Chat `file`, Responses `input_file`) are supported. With OAuth credentials, multi-image turns (≥2 images or >20 KB) and binary files like PDFs upload natively out-of-band at full resolution (up to 10 MB per file); non-OAuth credentials and single tiny images automatically fall back to `sharp` compression/inline text. Audio attachments are not supported yet.
+- **Attachments**: Image inputs (PNG/JPG/WebP/GIF, up to 10 per turn; exceeding returns `400`) and PDF/document inputs (Anthropic `document`, OpenAI Chat `file`, Responses `input_file`; up to 5 per turn; exceeding returns `400`) are supported. With OAuth credentials, multi-image turns (≥2 images or >20 KB) and binary files like PDFs upload natively out-of-band at full resolution (up to 10 MB per file; upload failures return explicit errors without silent downgrade); non-OAuth credentials and single tiny images use `sharp` inline compression. Audio attachments are not supported yet.
 - **Non-chat endpoints**: Embeddings, image generation, TTS, and Whisper are not supported.
 
 ---
 
 ## Community
 
-For bug reports and feature requests, please open an issue on [GitHub Issues](https://github.com/kuk-888/aws-quick2api/issues).
-
-Thanks to the [LINUX DO](https://linux.do) community for providing an open and friendly technical exchange platform.
+- For bug reports and feature requests, please open an issue on [GitHub Issues](https://github.com/kuk-888/aws-quick2api/issues).
+- Join our [Telegram Community Group](https://t.me/+-2B2GA8qESpjYWZl) for discussions and support.
+- Thanks to the [LINUX DO](https://linux.do) community for providing an open and friendly technical exchange platform.
 
 ---
 

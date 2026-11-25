@@ -958,6 +958,7 @@ export async function uploadOAuthBinaryAttachment(
   const dlpUrl = `https://${cred.wsHost}/integration/quick-work/attachment-dlp-status?attachmentId=${encodeURIComponent(attachmentId)}`;
   let dlpReady = false;
   let refreshedOnDlp401 = false;
+  let consecutiveNetErrs = 0;
   for (let poll = 0; poll < MAX_DLP_POLL_ATTEMPTS; poll += 1) {
     if (signal?.aborted) throw new Error("Attachment DLP poll aborted by client.");
     let dlpRes: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
@@ -974,9 +975,12 @@ export async function uploadOAuthBinaryAttachment(
           ...(signal ? { signal } : {}),
         },
         proxyUrl,
+        { maxRetries: 0 },
       );
+      consecutiveNetErrs = 0;
     } catch (err) {
-      if (signal?.aborted || poll + 1 >= MAX_DLP_POLL_ATTEMPTS) throw err;
+      consecutiveNetErrs += 1;
+      if (signal?.aborted || consecutiveNetErrs >= 3 || poll + 1 >= MAX_DLP_POLL_ATTEMPTS) throw err;
       const jitterMs = 750 + Math.floor(Math.random() * 750);
       await sleepWithAbort(jitterMs, signal);
       continue;

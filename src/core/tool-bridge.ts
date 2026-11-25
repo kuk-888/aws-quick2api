@@ -334,13 +334,23 @@ function buildNormalizedToolCall(
   if (allowedToolNames && allowedToolNames.size > 0 && !allowedToolNames.has(name)) {
     return null;
   }
-  const rawArgs = parsed.arguments ?? parsed.input ?? {};
-  const argsObject: Record<string, unknown> =
-    typeof rawArgs === "string"
-      ? (tryParseJsonObject(rawArgs) ?? {})
-      : rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)
-        ? (rawArgs as Record<string, unknown>)
-        : {};
+  const rawArgs = parsed.arguments ?? parsed.input;
+  let argsObject: Record<string, unknown>;
+  if (rawArgs === undefined || rawArgs === null) {
+    argsObject = {};
+  } else if (typeof rawArgs === "string") {
+    if (!rawArgs.trim()) {
+      argsObject = {};
+    } else {
+      const parsedArgs = tryParseJsonObject(rawArgs);
+      if (!parsedArgs) return null;
+      argsObject = parsedArgs;
+    }
+  } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    argsObject = rawArgs as Record<string, unknown>;
+  } else {
+    return null;
+  }
   return {
     id: `call_${crypto.randomBytes(8).toString("hex")}`,
     name,

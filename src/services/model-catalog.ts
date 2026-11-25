@@ -1,4 +1,5 @@
 import type { ModelSelection, QuickThinkingEffort, SDKModel } from "../aws-quick/types.js";
+import { GatewayError } from "../core/types.js";
 
 export const DEFAULT_MODEL = "quick-balanced";
 
@@ -78,14 +79,35 @@ function parseEffort(raw: unknown): QuickThinkingEffort | undefined {
   return undefined;
 }
 
+function stripModelPrefixes(input: string): { stripped: string; hadPrefix: boolean } {
+  let s = input.trim();
+  const before = s;
+  while (true) {
+    const next = s
+      .replace(/^\[[^\]]+\][-_/]?/i, "")
+      .replace(/^(?:amazon-quick|aws-quick|quick|aws|anthropic)\//i, "")
+      .trim();
+    if (next === s) break;
+    s = next;
+  }
+  return { stripped: s, hadPrefix: s !== before };
+}
+
 function matchKnownModel(requestedModel: string | undefined): {
   found: SDKModel | undefined;
   bracketParams?: string;
   suffixEffort?: QuickThinkingEffort;
 } {
-  const raw = (requestedModel || "").trim() || DEFAULT_MODEL;
+  const raw = (requestedModel ?? "").trim();
+  if (!raw) {
+    return { found: AWS_QUICK_MODELS[1]! };
+  }
   // Strip leading gateway/provider prefixes BEFORE bracket-param parsing so `[aws]-quick-smart` doesn't collide with `[effort=high]`
-  const strippedRaw = raw.replace(/^(?:(?:amazon-)?quick\/|aws-quick\/|\[(?:quick|aws)\]-)+/i, "").trim() || DEFAULT_MODEL;
+  const { stripped: strippedRaw, hadPrefix } = stripModelPrefixes(raw);
+  if (!strippedRaw) {
+    // Prefix-only strings such as `quick/` or `[aws]-` must NOT silently fall back to DEFAULT_MODEL
+    return { found: hadPrefix ? undefined : AWS_QUICK_MODELS[1]! };
+  }
   const match = /^([^\[]+?)(?:\[(.*)\])?$/.exec(strippedRaw);
   let baseRaw = (match?.[1] || strippedRaw).trim().toLowerCase();
 
@@ -109,6 +131,12 @@ function matchKnownModel(requestedModel: string | undefined): {
         baseId = hypMatch[1]!.trim();
       }
     }
+  }
+
+  // Map `auto` / `default` (including prefixed/effort variants like `quick/auto[effort=high]`)
+  // to the actual default model (`quick-balanced`) so DISABLED_MODELS and sub-key allowlists cannot be bypassed.
+  if (baseId === "auto" || baseId === "default") {
+    return { found: AWS_QUICK_MODELS[1]!, bracketParams: match?.[2], suffixEffort };
   }
 
   const directMatch = AWS_QUICK_MODELS.find((m) => m.id === baseId);
@@ -135,13 +163,6 @@ function matchKnownModel(requestedModel: string | undefined): {
  */
 export function resolveKnownModelId(requestedModel: string | undefined): string | null {
   if (!requestedModel || !requestedModel.trim()) return null;
-  let stripped = requestedModel.trim().toLowerCase();
-  stripped = stripped.replace(/^\[[^\]]+\][-_/]?/, "");
-  stripped = stripped.replace(/^(?:amazon-quick|aws-quick|quick|aws|anthropic)\//, "");
-  const base = stripped.split("[")[0]?.replace(/\([^)]*\)$/, "").trim() ?? "";
-  // Map `auto` / `default` to the actual default model (`quick-balanced`) so DISABLED_MODELS
-  // and sub-key allowlists cannot be bypassed via `model: "auto"` or `model: "default"`.
-  if (base === "auto" || base === "default") return AWS_QUICK_MODELS[1]!.id;
   return matchKnownModel(requestedModel).found?.id ?? null;
 }
 
@@ -151,9 +172,12 @@ export function resolveModelSelection(
   _modelSchema?: SDKModel,
 ): { selection: ModelSelection; canonicalId: string } {
   const { found: matched, bracketParams, suffixEffort } = matchKnownModel(requestedModel);
-  const found = matched ?? AWS_QUICK_MODELS[1]!;
+  if (!matched) {
+    throw new GatewayError(`Model '${requestedModel}' not found.`, 404, "model_not_found", "model");
+  }
+  const found = matched;
 
-  let effort: QuickThinkingEffort = suffixEffort ?? found.thinkingEffort;
+  let explicitModelEffort: QuickThinkingEffort | undefined = suffixEffort;
 
   // Check bracket param e.g. quick-balanced[effort=high]
   if (bracketParams) {
@@ -161,46 +185,62 @@ export function resolveModelSelection(
       const [k, v] = part.split("=").map((s) => s.trim());
       if (k === "effort" || k === "thinking_effort") {
         const parsed = parseEffort(v);
-        if (parsed) effort = parsed;
+        if (parsed) explicitModelEffort = parsed;
       }
     }
   }
 
-  // Check OpenAI reasoning_effort / Responses reasoning.effort / Anthropic & GLM thinking / Qwen enable_thinking
+  let effort: QuickThinkingEffort = explicitModelEffort ?? found.thinkingEffort;
+
+  // Check OpenAI reasoning_effort / Responses reasoning.effort / Anthropic output_config.effort & thinking / Qwen enable_thinking
   const reasoningObj = body.reasoning && typeof body.reasoning === "object"
     ? (body.reasoning as { effort?: unknown })
+    : undefined;
+  const outputConfigObj = body.output_config && typeof body.output_config === "object"
+    ? (body.output_config as { effort?: unknown })
     : undefined;
   const thinkingObj = body.thinking && typeof body.thinking === "object"
     ? (body.thinking as { type?: string; budget_tokens?: number })
     : undefined;
-  const thinkingEffortFromObj: QuickThinkingEffort | undefined =
+  const explicitBodyEffort =
+    parseEffort(body.reasoning_effort) ||
+    parseEffort(body.effort) ||
+    parseEffort(reasoningObj?.effort) ||
+    parseEffort(outputConfigObj?.effort);
+  const thinkingDisabled = thinkingObj?.type === "disabled" || body.enable_thinking === false;
+  const implicitThinkingEffort: QuickThinkingEffort | undefined =
     thinkingObj?.type === "enabled"
       ? typeof thinkingObj.budget_tokens === "number" && thinkingObj.budget_tokens < 2048
         ? "low"
         : typeof thinkingObj.budget_tokens === "number" && thinkingObj.budget_tokens < 8192
           ? "medium"
+          : typeof thinkingObj.budget_tokens === "number" && thinkingObj.budget_tokens >= 16384
+            ? "max"
+            : "high"
+      : thinkingObj?.type === "adaptive"
+        ? found.agentMode === "balanced"
+          ? "medium"
           : "high"
-      : thinkingObj?.type === "disabled"
-        ? "off"
-        : undefined;
-  const enableThinkingEffort: QuickThinkingEffort | undefined =
-    body.enable_thinking === true
-      ? found.agentMode === "balanced"
-        ? "medium"
-        : "high"
-      : body.enable_thinking === false
-        ? "off"
-        : undefined;
+        : body.enable_thinking === true
+          ? found.agentMode === "balanced"
+            ? "medium"
+            : "high"
+          : undefined;
 
-  const bodyEffort =
-    parseEffort(body.reasoning_effort) ||
-    parseEffort(body.effort) ||
-    parseEffort(reasoningObj?.effort) ||
-    thinkingEffortFromObj ||
-    enableThinkingEffort;
+  // Precedence:
+  // 1) Explicit disable (`thinking.type="disabled"` / `enable_thinking=false`) -> `"off"`
+  // 2) Explicit body effort (`output_config.effort` / `reasoning_effort` / `effort` / `reasoning.effort`)
+  // 3) Explicit model ID effort (`quick-smart-max` / `quick-smart[effort=max]`) — never downgraded by
+  //    generic client defaults like Claude Code's `thinking: { type: "adaptive" }` or `budget_tokens: 10000`
+  // 4) Implicit thinking effort (`thinking.enabled` / `thinking.adaptive` / `enable_thinking=true`)
+  // 5) Model default (`found.thinkingEffort`)
+  const resolvedBodyEffort: QuickThinkingEffort | undefined = thinkingDisabled
+    ? "off"
+    : explicitBodyEffort ??
+      (explicitModelEffort ? undefined : implicitThinkingEffort);
 
-  if (bodyEffort && found.agentMode !== "fast") {
-    effort = found.agentMode === "advanced" && bodyEffort === "off" ? "high" : bodyEffort;
+  if (resolvedBodyEffort && found.agentMode !== "fast") {
+    effort = found.agentMode === "advanced" && resolvedBodyEffort === "off" ? "high" : resolvedBodyEffort;
   }
 
   return {

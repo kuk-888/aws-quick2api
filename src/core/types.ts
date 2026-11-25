@@ -100,11 +100,15 @@ export interface TurnTokenMetrics {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  /** Total tokens reported by AWS Quick (`total_tokens`, or sum of input/output/cache). */
+  totalTokens?: number;
+  /** Upstream model context window reported by AWS Quick `turn_usage` (e.g. `1000000`). */
+  contextWindow?: number;
+  /** Upstream context occupancy percentage (0–100, 1 decimal place). */
+  contextPercent?: number;
   reasoningTokens?: number;
   /** Actual upstream model routed by AWS Quick (e.g. `us.anthropic.claude-sonnet-5-5`). */
   resolvedModel?: string;
-  /** Whether an explicit `session_delete` RPC was sent after this turn (only when AUTO_DELETE_SESSION=true). */
-  sessionDeleted?: boolean;
 }
 
 export type GatewayStreamEvent =
@@ -166,7 +170,7 @@ export interface GatewayConfig {
   sessionAffinityTtlMs: number;
   /** Automatically disable/trip accounts that run out of quota or return 401/402. */
   autoDisableExhaustedKeys: boolean;
-  /** Privacy mode: when true, enables AWS Quick incognito + auto session_delete (default true). */
+  /** Privacy mode: when true, enables native AWS Quick incognito mode (default true). */
   incognitoMode: boolean;
   envFilePath?: string;
   /** Directory for persistent runtime state (`gateway-keys.json`, `admin-session.key`, `usage-ledger.json`). */

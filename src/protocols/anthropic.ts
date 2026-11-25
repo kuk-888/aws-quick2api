@@ -435,6 +435,86 @@ export function formatAnthropicError(err: GatewayError): Record<string, unknown>
   };
 }
 
+const ANTHROPIC_USAGE_WATERMARKS = new Map<
+  string,
+  { lastEstimated: number; highWaterPrompt: number; updatedAt: number }
+>();
+const MAX_USAGE_WATERMARK_ENTRIES = 512;
+const USAGE_WATERMARK_TTL_MS = 60 * 60 * 1000;
+
+function peekAnthropicStartInputTokens(turn: ParsedProtocolTurn): number {
+  const estimated = Math.max(1, Math.floor(turn.estimatedInputTokens || 0));
+  const convKey = turn.conversationKey?.trim();
+  if (!convKey) return estimated;
+  const prev = ANTHROPIC_USAGE_WATERMARKS.get(convKey);
+  if (!prev || Date.now() - prev.updatedAt > USAGE_WATERMARK_TTL_MS) return estimated;
+  if (estimated < prev.lastEstimated * 0.85) return estimated;
+  return Math.max(estimated, prev.highWaterPrompt + Math.max(0, estimated - prev.lastEstimated));
+}
+
+/**
+ * Stabilizes Anthropic prompt usage reporting so Claude Code's context-window meter never shrinks
+ * mid-session due to out-of-band `.txt` attachment uploads or warm->cold failover dips, while
+ * immediately resetting when the client explicitly compacts (`/compact` drops estimated tokens >15%).
+ */
+export function stabilizeAnthropicUsage(
+  metrics: TurnTokenMetrics,
+  turn: ParsedProtocolTurn,
+): {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+} {
+  const rawInput = Math.max(0, Math.floor(metrics.inputTokens || 0));
+  const cacheRead = Math.max(0, Math.floor(metrics.cacheReadTokens || 0));
+  const cacheWrite = Math.max(0, Math.floor(metrics.cacheWriteTokens || 0));
+  const outputTokens = Math.max(1, Math.floor(metrics.outputTokens || 0));
+  const estimated = Math.max(1, Math.floor(turn.estimatedInputTokens || 0));
+  const upstreamTotal = rawInput + cacheRead + cacheWrite;
+
+  let floorTotal = estimated;
+  const convKey = turn.conversationKey?.trim();
+  const now = Date.now();
+  if (convKey) {
+    const prev = ANTHROPIC_USAGE_WATERMARKS.get(convKey);
+    if (prev && now - prev.updatedAt <= USAGE_WATERMARK_TTL_MS) {
+      const clientCompacted = estimated < prev.lastEstimated * 0.85;
+      if (!clientCompacted) {
+        const deltaGrowth = Math.max(0, estimated - prev.lastEstimated);
+        floorTotal = Math.max(floorTotal, prev.highWaterPrompt + deltaGrowth);
+      }
+    }
+  }
+
+  const effectiveTotal = Math.max(upstreamTotal, floorTotal);
+  const effectiveInput =
+    effectiveTotal > upstreamTotal ? rawInput + (effectiveTotal - upstreamTotal) : rawInput;
+
+  if (convKey) {
+    if (ANTHROPIC_USAGE_WATERMARKS.has(convKey)) {
+      ANTHROPIC_USAGE_WATERMARKS.delete(convKey);
+    }
+    while (ANTHROPIC_USAGE_WATERMARKS.size >= MAX_USAGE_WATERMARK_ENTRIES) {
+      const oldest = ANTHROPIC_USAGE_WATERMARKS.keys().next().value;
+      if (!oldest) break;
+      ANTHROPIC_USAGE_WATERMARKS.delete(oldest);
+    }
+    ANTHROPIC_USAGE_WATERMARKS.set(convKey, {
+      lastEstimated: estimated,
+      highWaterPrompt: effectiveTotal,
+      updatedAt: now,
+    });
+  }
+
+  return {
+    input_tokens: effectiveInput,
+    output_tokens: outputTokens,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheWrite,
+  };
+}
+
 export const anthropicMessagesAdapter: ProtocolAdapter = {
   errorFormat: "anthropic",
   parse: (body, headers, signal) => parseAnthropicMessagesRequest(body, headers, signal),
@@ -462,12 +542,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
       content,
       stop_reason: stopReason,
       stop_sequence: null,
-      usage: {
-        input_tokens: metrics.inputTokens,
-        output_tokens: metrics.outputTokens,
-        cache_read_input_tokens: metrics.cacheReadTokens,
-        cache_creation_input_tokens: metrics.cacheWriteTokens
-      }
+      usage: stabilizeAnthropicUsage(metrics, turn),
     };
   },
   async *streamSse(events, turn) {
@@ -517,7 +592,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
           stop_reason: null,
           stop_sequence: null,
           usage: {
-            input_tokens: turn.estimatedInputTokens,
+            input_tokens: peekAnthropicStartInputTokens(turn),
             output_tokens: 0,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0
@@ -610,12 +685,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
           yield sse("message_delta", {
             type: "message_delta",
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: {
-              input_tokens: metrics.inputTokens,
-              output_tokens: metrics.outputTokens,
-              cache_read_input_tokens: metrics.cacheReadTokens,
-              cache_creation_input_tokens: metrics.cacheWriteTokens
-            }
+            usage: stabilizeAnthropicUsage(metrics, turn),
           });
           yield sse("message_stop", { type: "message_stop" });
         }
@@ -626,12 +696,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
         yield sse("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },
-          usage: {
-            input_tokens: metrics.inputTokens,
-            output_tokens: metrics.outputTokens,
-            cache_read_input_tokens: metrics.cacheReadTokens,
-            cache_creation_input_tokens: metrics.cacheWriteTokens
-          }
+          usage: stabilizeAnthropicUsage(metrics, turn),
         });
         yield sse("message_stop", { type: "message_stop" });
       }

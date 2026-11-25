@@ -8,7 +8,7 @@ import {
   serializeOAuthCredential,
   startOAuthPkceFlow,
 } from "../aws-quick/oauth-client.js";
-import { getSharedOutpost, parseQuickCredential } from "../aws-quick/outpost-singleton.js";
+import { parseQuickCredential, withSharedOutpostLock } from "../aws-quick/outpost-singleton.js";
 import { listWebCloudSessions } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
 import {
@@ -23,7 +23,7 @@ import { isRecord } from "../protocols/common.js";
 import { openAiChatAdapter } from "../protocols/openai.js";
 import type { ClientGatewayKeyManager } from "../services/client-keys.js";
 import type { ModelAccessController } from "../services/model-access.js";
-import { listLiveModels } from "../services/model-catalog.js";
+import { listLiveModels, resolveKnownModelId } from "../services/model-catalog.js";
 import type { UsageLedger, LedgerRange } from "../services/usage-ledger.js";
 import type { AccountQuotaReport } from "../services/quota-service.js";
 import type { RequestTraceLogger } from "../services/request-logger.js";
@@ -444,6 +444,9 @@ export async function tryHandleWebAdminRoute(
       messages: [{ role: "user", content: body.prompt }]
     };
     const turn = openAiChatAdapter.parse(chatBody, {}, abortSignal);
+    if (!resolveKnownModelId(turn.requestedModel)) {
+      throw new GatewayError(`Model '${turn.requestedModel}' not found.`, 404, "model_not_found", "model");
+    }
     turn.scope = "admin_playground";
     const lang = resolveAdminLang(req);
     const traceId = traceLogger.startTrace("playground", turn, { keyName: lang === "zh" ? "后台拨测台" : "Playground" });
@@ -703,26 +706,30 @@ export async function tryHandleWebAdminRoute(
     return true;
   }
 
-  const listCloudMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)\/cloud-sessions$/.exec(route);
-  if (listCloudMatch && req.method === "GET") {
-    const slotId = listCloudMatch[1]!;
-    const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
-    if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+  const listCloudSessionsForTarget = async (target: ReturnType<typeof keyPool.allManagedKeys>[number]) => {
     const cred = parseQuickCredential(target.rawKey);
-    let sessions;
     if (cred.mode === "oauth" && cred.oauth) {
-      sessions = await listOAuthCloudSessions(cred.oauth, 100, target.proxyUrl);
-    } else if (cred.mode === "web" && cred.web) {
-      sessions = await listWebCloudSessions(cred.web, 100, target.proxyUrl);
-    } else {
-      const outpost = await getSharedOutpost();
+      return listOAuthCloudSessions(cred.oauth, 100, target.proxyUrl);
+    }
+    if (cred.mode === "web" && cred.web) {
+      return listWebCloudSessions(cred.web, 100, target.proxyUrl);
+    }
+    return withSharedOutpostLock(async (outpost) => {
       if (cred.mode === "token" && cred.jwt) {
         outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
       } else {
         outpost.setImportedToken(null);
       }
-      sessions = await outpost.listCloudSessions(100);
-    }
+      return outpost.listCloudSessions(100);
+    });
+  };
+
+  const listCloudMatch = /^\/v1\/admin\/keys\/([a-f0-9]+)\/cloud-sessions$/.exec(route);
+  if (listCloudMatch && req.method === "GET") {
+    const slotId = listCloudMatch[1]!;
+    const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
+    if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+    const sessions = await listCloudSessionsForTarget(target);
     keyPool.updateSlotQuotaCache(target.rawKey, undefined, undefined, undefined, {
       cloudSessionCount: sessions.length,
     });
@@ -731,21 +738,7 @@ export async function tryHandleWebAdminRoute(
   }
 
   const clearCloudForTarget = async (target: ReturnType<typeof keyPool.allManagedKeys>[number]) => {
-    const cred = parseQuickCredential(target.rawKey);
-    let list;
-    if (cred.mode === "oauth" && cred.oauth) {
-      list = await listOAuthCloudSessions(cred.oauth, 100, target.proxyUrl);
-    } else if (cred.mode === "web" && cred.web) {
-      list = await listWebCloudSessions(cred.web, 100, target.proxyUrl);
-    } else {
-      const outpost = await getSharedOutpost();
-      if (cred.mode === "token" && cred.jwt) {
-        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
-      } else {
-        outpost.setImportedToken(null);
-      }
-      list = await outpost.listCloudSessions(100);
-    }
+    const list = await listCloudSessionsForTarget(target);
     const deleted = await engine.deleteCloudSessionsForKey(target.rawKey, list.map((s) => s.id), target.proxyUrl);
     const remaining = Math.max(0, list.length - deleted.length);
     keyPool.updateSlotQuotaCache(target.rawKey, undefined, undefined, undefined, {

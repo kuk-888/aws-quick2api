@@ -196,16 +196,16 @@ docker compose pull && docker compose up -d
 
 - **采样参数（`temperature` / `top_p` / `max_tokens` / `stop` / `seed`）**：上游不强制执行；网关兼容接收并通过响应头声明。
 - **`response_format`（`json_object` / `json_schema`）与 `n > 1`**：暂不支持，返回明确 `400` 错误。
-- **附件**：支持图片（PNG/JPG/WebP/GIF，单轮最多保留最近 10 张）与 PDF/文档（Anthropic `document`、OpenAI Chat `file`、Responses `input_file`）。OAuth 凭证下多图（≥2 张或 >20KB）与 PDF 等二进制文件直接走原生带外附件通道高清无损上传（单文件上限 10MB），非 OAuth 凭证或单张小图自动回退 `sharp` 等比压缩内联。暂不支持音频。
+- **附件**：支持图片（PNG/JPG/WebP/GIF，单轮最多 10 张，超限返回明确 `400`）与 PDF/文档（Anthropic `document`、OpenAI Chat `file`、Responses `input_file`，单轮最多 5 份，超限返回明确 `400`）。OAuth 凭证下多图（≥2 张或 >20KB）与 PDF 等二进制文件直接走原生带外附件通道高清无损上传（单文件上限 10MB，上传失败显性报错不静默降级），非 OAuth 凭证或单张小图使用 `sharp` 等比压缩内联。暂不支持音频。
 - **非对话接口**：不支持 Embeddings、文生图、TTS 与 Whisper。
 
 ---
 
 ## 社区
 
-问题反馈与功能建议欢迎提交 [GitHub Issues](https://github.com/kuk-888/aws-quick2api/issues)。
-
-感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
+- 问题反馈与功能建议欢迎提交 [GitHub Issues](https://github.com/kuk-888/aws-quick2api/issues)。
+- 交流与使用反馈欢迎加入 [Telegram 交流群](https://t.me/+-2B2GA8qESpjYWZl)。
+- 感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
 
 ---
 

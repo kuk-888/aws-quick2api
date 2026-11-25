@@ -18,7 +18,7 @@ import {
   openAiResponsesAdapter
 } from "./protocols/openai.js";
 import { ClientGatewayKeyManager } from "./services/client-keys.js";
-import { ModelAccessController, normalizeBaseModelId } from "./services/model-access.js";
+import { ModelAccessController } from "./services/model-access.js";
 import { formatOpenAiModelList, listLiveModels, resolveKnownModelId } from "./services/model-catalog.js";
 import { fetchAllAccountQuotas } from "./services/quota-service.js";
 import { RequestTraceLogger, type RequestProtocolTag } from "./services/request-logger.js";
@@ -260,23 +260,40 @@ async function pipeSseStream(
 
   let first: IteratorResult<string>;
   if (opts.flushEarly && opts.flushEarlyAfter) {
-    // Wait until an upstream slot lease is actually acquired before committing HTTP 200 + keepalive.
-    // Pre-lease errors (429 pool full, 503 no keys, 400 empty/SSRF) propagate cleanly as real HTTP statuses
-    // so SDKs like Claude Code can apply native HTTP 429 retry/backoff!
+    // Wait for lease acquisition AND give upstream 15s to either emit the first chunk or return
+    // a real post-lease HTTP error (400/401/403/429/502). Only if upstream is genuinely slow (>15s)
+    // do we commit HTTP 200 + `: keepalive\n\n` so Cloudflare (100s 524) never drops the stream.
     let settled = false;
+    let delayedFlushTimer: NodeJS.Timeout | null = null;
+    const clearDelayedFlush = () => {
+      if (delayedFlushTimer) {
+        clearTimeout(delayedFlushTimer);
+        delayedFlushTimer = null;
+      }
+    };
+    res.once("close", clearDelayedFlush);
     const nextPromise = iterator.next();
     void opts.flushEarlyAfter.then(() => {
-      if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
-        commitHeaders();
-        res.write(": keepalive\n\n");
-        startKeepAlive();
-      }
+      if (settled || headersCommitted || res.writableEnded || res.destroyed) return;
+      delayedFlushTimer = setTimeout(() => {
+        delayedFlushTimer = null;
+        if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
+          commitHeaders();
+          res.write(": keepalive\n\n");
+          startKeepAlive();
+        }
+      }, 15_000);
+      delayedFlushTimer.unref?.();
     });
     try {
       first = await nextPromise;
       settled = true;
+      clearDelayedFlush();
+      res.off("close", clearDelayedFlush);
     } catch (err) {
       settled = true;
+      clearDelayedFlush();
+      res.off("close", clearDelayedFlush);
       if (keepAlive) clearInterval(keepAlive);
       if (headersCommitted) {
         if (!res.writableEnded && !res.destroyed) {
@@ -291,23 +308,6 @@ async function pipeSseStream(
     }
     commitHeaders();
     startKeepAlive();
-  } else if (opts.flushEarly) {
-    // For huge multi-chunk (>50KB) streaming prompts, flush 200 OK + SSE keepalive immediately
-    // so reverse proxies like Cloudflare (100s 524 timeout) never drop the connection while chunking.
-    commitHeaders();
-    if (!res.writableEnded && !res.destroyed) res.write(": keepalive\n\n");
-    startKeepAlive();
-    try {
-      first = await iterator.next();
-    } catch (err) {
-      if (keepAlive) clearInterval(keepAlive);
-      if (!res.writableEnded && !res.destroyed) {
-        res.write(onErrorChunk(mapSdkError(err)));
-        res.end();
-      }
-      await iterator.return?.().catch(() => undefined);
-      return;
-    }
   } else {
     // Pull the first frame BEFORE committing to a 200: errors raised before any output
     // (no usable key, upstream 401/429, bad model) must surface as real HTTP statuses.
@@ -400,8 +400,10 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
 
   /** Reject unknown base model ids with 404 before any account-pool / spend-guard logic runs. Does not touch pool scheduling state. */
   async function assertModelExists(requestedModel: string): Promise<void> {
-    const baseId = normalizeBaseModelId(requestedModel || "auto");
-    if (!baseId || baseId === "auto" || baseId === "default") return;
+    const canonical = resolveKnownModelId(requestedModel);
+    if (!canonical) {
+      throw new GatewayError(`Model '${requestedModel}' not found.`, 404, "model_not_found", "model");
+    }
     const probeKey = keyPool.allManagedKeys().find((k) => k.enabled)?.rawKey;
     if (!probeKey) return;
     let catalog: Awaited<ReturnType<typeof listLiveModels>>;
@@ -410,7 +412,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     } catch {
       return;
     }
-    if (!catalog.some((m) => m.id.toLowerCase() === baseId)) {
+    if (!catalog.some((m) => m.id.toLowerCase() === canonical.toLowerCase())) {
       throw new GatewayError(`Model '${requestedModel}' not found.`, 404, "model_not_found", "model");
     }
   }
@@ -691,9 +693,10 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         }
         const catalogKey = keyPool.enabledKeyCount() > 0 ? keyPool.peekKeyForCatalog() : "";
         const rawModels = await listLiveModels(catalogKey, options.modelListFetcher);
-        const canonicalId = resolveKnownModelId(targetId) ?? normalizeBaseModelId(targetId);
-        modelAccess.assertModelAllowed(canonicalId);
-        clientKeys.assertModelPermitted(clientAuth, canonicalId);
+        const canonicalId = resolveKnownModelId(targetId);
+        if (!canonicalId) {
+          throw new GatewayError(`Model '${targetId}' not found.`, 404, "model_not_found", "model");
+        }
         const models = formatOpenAiModelList(rawModels);
         // Variant/alias ids such as `quick-balanced[effort=high]` or `quick/claude-opus-4-6-high` are accepted by POST; accept them here too.
         const found =
@@ -705,6 +708,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         if (!found) {
           throw new GatewayError(`Model '${targetId}' not found.`, 404, "model_not_found", "model");
         }
+        modelAccess.assertModelAllowed(canonicalId);
+        clientKeys.assertModelPermitted(clientAuth, canonicalId);
         sendJson(res, 200, anthropicModels ? anthropicModelEntry(found) : found, { allowCors: true });
         return;
       }
@@ -713,6 +718,16 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       if ((route === "/v1/messages/count_tokens" || route === "/messages/count_tokens") && req.method === "POST") {
         const clientAuth = authenticateProtocolClient(req, { checkQuotaCap: false });
         const body = await readJsonBody(req, res, Math.min(config.maxBodyBytes, 4 * 1024 * 1024));
+        const rawCountModel =
+          body && typeof body === "object" && "model" in body
+            ? (body as { model?: unknown }).model
+            : undefined;
+        if (typeof rawCountModel === "string" && rawCountModel.trim()) {
+          const canonicalModelId = resolveKnownModelId(rawCountModel) ?? rawCountModel;
+          await assertModelExists(canonicalModelId);
+          modelAccess.assertModelAllowed(canonicalModelId);
+          clientKeys.assertModelPermitted(clientAuth, canonicalModelId);
+        }
         if (clientAuth.kind === "gateway_key") {
           const limit = clientKeys.concurrencyLimitFor(clientAuth.keyId, config.clientKeyMaxConcurrent);
           if (limit > 0 && (activeByClientKey.get(clientAuth.keyId) ?? 0) >= limit) {
@@ -766,9 +781,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           : null;
         try {
           const canonicalModelId = resolveKnownModelId(turn.requestedModel) ?? turn.requestedModel;
+          await assertModelExists(canonicalModelId);
           modelAccess.assertModelAllowed(canonicalModelId);
           clientKeys.assertModelPermitted(clientAuth, canonicalModelId);
-          await assertModelExists(canonicalModelId);
           clientKeys.tryReserveRequest(clientKeyId);
         } catch (err) {
           const gwErr = mapSdkError(err);

@@ -24,12 +24,17 @@ import {
   serializeOAuthCredential,
 } from "../src/aws-quick/oauth-client.js";
 import { assertSafeWsHost, parseQuickCredential } from "../src/aws-quick/outpost-singleton.js";
-import { parseWebCurlOrCredential, serializeWebCredential } from "../src/aws-quick/web-client.js";
+import {
+  fetchWebProfileUsage,
+  listWebCloudSessions,
+  parseWebCurlOrCredential,
+  serializeWebCredential,
+} from "../src/aws-quick/web-client.js";
+import { createGatewayServer } from "../src/server.js";
 import {
   assertSafeRemoteImageUrl,
   buildQuickImageAttachments,
   classifyUpstreamError,
-  compactOversizedPrompt,
   estimatePromptTokens,
   isPrivateOrReservedIp,
   isPseudo200UsageLimitPrefix,
@@ -496,30 +501,11 @@ describe("Credential parser & ClientKeyStore", () => {
     );
   });
 
-  it("estimates tokens and compacts oversized prompts while leaving normal prompts untouched", () => {
+  it("estimates tokens accurately across ASCII and CJK text", () => {
     const small = "Hello world, this is a normal prompt.";
-    const untouched = compactOversizedPrompt(small, null, 850_000);
-    assert.equal(untouched.compacted, false);
-    assert.equal(untouched.prompt, small);
-
-    const head = "HEAD_ANCHOR_KEEP_ME\n" + "Opening context line.\n".repeat(40);
-    const middle = "MIDDLE_NOISE_LINE_0123456789\n".repeat(3000);
-    const tail = "RECENT_TURN_CONTEXT\n".repeat(40) + "TAIL_QUESTION_KEEP_ME";
-    const huge = head + middle + tail;
+    assert.ok(estimatePromptTokens(small) > 0 && estimatePromptTokens(small) < 30);
+    const huge = "MIDDLE_NOISE_LINE_0123456789\n".repeat(3000);
     assert.ok(estimatePromptTokens(huge) > 15_000);
-
-    const trimmed = compactOversizedPrompt(huge, null, 10_000);
-    assert.equal(trimmed.compacted, true);
-    assert.ok(trimmed.prompt.includes("HEAD_ANCHOR_KEEP_ME"));
-    assert.ok(trimmed.prompt.includes("TAIL_QUESTION_KEEP_ME"));
-    assert.ok(trimmed.prompt.includes("Gateway Auto-Compacted"));
-    assert.ok(trimmed.middleSample && trimmed.middleSample.length <= 33_000);
-
-    const summarized = compactOversizedPrompt(huge, null, 10_000, "Key fact: project uses PostgreSQL 17.");
-    assert.equal(summarized.compacted, true);
-    assert.ok(summarized.prompt.includes("Key fact: project uses PostgreSQL 17."));
-    assert.ok(summarized.prompt.includes("HEAD_ANCHOR_KEEP_ME"));
-    assert.ok(summarized.prompt.includes("TAIL_QUESTION_KEEP_ME"));
   });
 
   it("normalizes shorthand proxies and completes RFC 1928/1929 SOCKS5 auth handshake", async () => {
@@ -1200,15 +1186,16 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(staleSnapA.enabled, false);
     assert.equal(staleSnapA.autoDisabledKind, "quota");
 
-    // 9) [P0-3] allCoolingDown fallback never overflows a full slot
+    // 9) Fast-fail 429 when all usable accounts are in cooldown beyond the wait budget (no cooling-down fall-through)
     const fullCoolPool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 2 });
     const fc1 = fullCoolPool.leaseSpecificKey(kA);
     const fc2 = fullCoolPool.leaseSpecificKey(kA);
     fullCoolPool.reportConnLimit(kA, 2_000);
     fullCoolPool.reportRateLimit(kB);
-    const fcPicked = await fullCoolPool.leaseKeyWithWait("quick-smart", undefined, undefined, { maxWaitMs: 30 });
-    assert.equal(fcPicked.apiKey, kB);
-    fcPicked.release();
+    await assert.rejects(
+      () => fullCoolPool.leaseKeyWithWait("quick-smart", undefined, undefined, { maxWaitMs: 30 }),
+      (err: unknown) => (err as { status?: number; code?: string })?.status === 429 && (err as { code?: string })?.code === "rate_limit_exceeded",
+    );
     fc1.release();
     fc2.release();
 
@@ -1534,14 +1521,38 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(resolveKnownModelId("[aws]-quick-advanced"), "quick-advanced");
     assert.equal(resolveKnownModelId("amazon-quick/quick-balanced(medium)"), "quick-balanced");
     assert.equal(resolveKnownModelId("totally-unknown-model-999"), null);
+    assert.equal(resolveModelSelection("auto", {}).canonicalId, "quick-balanced");
+    assert.throws(
+      () => resolveModelSelection("totally-unknown-model-999", {}),
+      (err: unknown) => (err as { status?: number; code?: string })?.status === 404 && (err as { code?: string })?.code === "model_not_found",
+    );
 
-    // Out-of-band attachment wrapper prompt keeps tail inline and stays well under 50KB single frame
+    // Malformed tool-call arguments string must preserve raw block as text instead of coercing to `{}`
+    const badArgsRaw = '<tool_call>{"name":"read_file","arguments":"{not-valid-json"}</tool_call>';
+    const badArgsParsed = parseToolCallsFromText(badArgsRaw);
+    assert.equal(badArgsParsed.toolCalls.length, 0);
+    assert.ok(badArgsParsed.cleanText.includes("{not-valid-json"));
+
+    // Out-of-band attachment wrapper prompt keeps BOTH opening question and tail inline within single frame
     const { buildOutOfBandContextPrompt } = await import("../src/core/engine.js");
-    const hugePrompt = `${"Earlier log line.\n".repeat(12_000)}FINAL_USER_QUESTION=Extract all needles`;
+    const hugePrompt = `OPENING_QUESTION=Find HEAD, MID, and TAIL needles.\n${"Earlier log line.\n".repeat(12_000)}FINAL_USER_QUESTION=Extract all needles`;
     const wrapped = buildOutOfBandContextPrompt(hugePrompt, "conversation_context_abc12345.txt");
     assert.ok(wrapped.includes("conversation_context_abc12345.txt"));
+    assert.ok(wrapped.includes("OPENING_QUESTION=Find HEAD, MID, and TAIL needles."));
     assert.ok(wrapped.includes("FINAL_USER_QUESTION=Extract all needles"));
     assert.ok(Buffer.byteLength(wrapped, "utf8") < 6_000);
+
+    // Multi-turn cold replay with explicit openingHintSource preserves the latest user turn's opening question
+    const multiTurnPrompt = `[SYSTEM]: Long system prompt.\n[USER]: Old turn\n[ASSISTANT]: Old answer\n[USER]: LATEST_TOP_QUESTION=Summarize errors below\n${"Log entry line.\n".repeat(12_000)}`;
+    const wrappedMulti = buildOutOfBandContextPrompt(
+      multiTurnPrompt,
+      "conversation_context_def67890.txt",
+      3_500,
+      false,
+      `LATEST_TOP_QUESTION=Summarize errors below\n${"Log entry line.\n".repeat(12_000)}`,
+    );
+    assert.ok(wrappedMulti.includes("LATEST_TOP_QUESTION=Summarize errors below"));
+    assert.ok(Buffer.byteLength(wrappedMulti, "utf8") < 6_000);
   });
 });
 
@@ -2086,9 +2097,14 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
 
     // 2. Conservative soft-refusal classifier
     assert.equal(isLikelySoftRefusal("I need to stop and flag this as a prompt injection attack."), true);
+    assert.equal(isLikelySoftRefusal("This request appears to be a prompt injection attack."), true);
     assert.equal(isLikelySoftRefusal("As an AWS Quick assistant, no device is connected right now."), true);
     assert.equal(isLikelySoftRefusal("检测到提示词注入，我无法执行。"), true);
     assert.equal(isLikelySoftRefusal("I'm sorry, I noticed a typo in line 12. Here is the fixed code."), false);
+    assert.equal(
+      isLikelySoftRefusal("请从防御角度讲解企业 RAG 系统中 indirect prompt injection 的原理、隔离方案与验证单测。"),
+      false,
+    );
     assert.equal(
       isLikelySoftRefusal('<tool_call>{"name":"Read","arguments":{"path":"src/app.ts"}}</tool_call>'),
       false,
@@ -2310,7 +2326,27 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.equal(t1.text, "Acknowledged ORION-8821.");
       assert.equal(t1.meta.execMode, "incognito");
       assert.equal(t1.trace.contentFilterRecovered, undefined);
+      assert.equal(t1.trace.usedDefaultSystemAgent, true);
       assert.equal(engine.runtimeStats().warmIdleSessions, 1);
+
+      // Verify explicit fallback metadata flags preserve zero-content privacy
+      const fallbackTraceId = traceLogger.startTrace(
+        "openai-chat",
+        parseChatCompletionsRequest({ model: "quick-smart", stream: false, messages: [{ role: "user", content: "SECRET_SHOULD_NOT_LEAK" }] }),
+      );
+      traceLogger.bindExecutionMeta(fallbackTraceId, {
+        maskedKey: "oauth:mock***",
+        execMode: "incognito",
+        warmFallbackToCold: true,
+        accountFailoverCount: 2,
+        usedDefaultSystemAgent: true,
+      });
+      traceLogger.finishSuccess(fallbackTraceId, "stop");
+      const fbDetail = traceLogger.getDetail(fallbackTraceId)!;
+      assert.equal(fbDetail.warmFallbackToCold, true);
+      assert.equal(fbDetail.accountFailoverCount, 2);
+      assert.equal(fbDetail.usedDefaultSystemAgent, true);
+      assert.ok(!JSON.stringify(fbDetail).includes("SECRET_SHOULD_NOT_LEAK"));
 
       // Turn 2: Warm turn hits content_filtered -> isolated helper rephrases -> native edit_message on SAME warm WS & SAME smart model
       const t2 = await runTurn([
@@ -2383,5 +2419,772 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       await engine.disposeAll();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     }
+  });
+
+  it("preserves real HTTP 403/429 during server.ts 15s delayed flushEarly without leaking timers", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-flush-"));
+    const cfg = loadConfigFromEnv({
+      HOST: "127.0.0.1",
+      PORT: "0",
+      GATEWAY_TOKEN: "sk-aq-test-real-token-9876543210",
+      QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+      GATEWAY_KEYS_FILE: path.join(tmpDir, "gateway-keys.json"),
+      USAGE_LEDGER_FILE: path.join(tmpDir, "usage-ledger.json"),
+      ADMIN_AUTH_FILE: path.join(tmpDir, "admin-auth.json"),
+      ENV_FILE_PATH: path.join(tmpDir, ".env"),
+      ENABLE_DASHBOARD: "false",
+    });
+    const gw = createGatewayServer({ config: cfg });
+    let nextBehavior: "403" | "429" | "ok" = "403";
+
+    // Stub executeTurnWithPool to invoke onExecMeta (resolving leaseReadyPromise -> arming the 15s delayedFlushTimer),
+    // then fail within <15s (403/429) or emit a normal response.
+    (gw.engine as unknown as { executeTurnWithPool: typeof gw.engine.executeTurnWithPool }).executeTurnWithPool =
+      async function* (_turn, _pool, onExecMeta) {
+        onExecMeta?.({
+          slotId: "mock-slot",
+          maskedKey: "token:mock***",
+          execMode: "incognito",
+        });
+        await new Promise((r) => setTimeout(r, 20));
+        if (nextBehavior === "403") {
+          throw new GatewayError("Upstream model forbidden for this account.", 403, "forbidden");
+        }
+        if (nextBehavior === "429") {
+          throw new GatewayError("Upstream rate limit reached.", 429, "rate_limit_exceeded");
+        }
+        yield { type: "text", text: "Hello after delayed flush check." };
+        yield { type: "done", stopReason: "stop" };
+      };
+
+    await new Promise<void>((resolve) => gw.server.listen(0, "127.0.0.1", resolve));
+    const addr = gw.server.address();
+    assert.ok(addr && typeof addr === "object");
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const makeReq = async () =>
+        fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "x-api-key": "sk-aq-test-real-token-9876543210",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "quick-balanced",
+            max_tokens: 256,
+            stream: true,
+            // Anthropic + tools triggers flushEarly=true with flushEarlyAfter=leaseReadyPromise
+            tools: [{ name: "Read", description: "Read file", input_schema: { type: "object", properties: {} } }],
+            messages: [{ role: "user", content: "hello" }],
+          }),
+        });
+
+      // 1) Post-lease 403 before 15s -> must return real HTTP 403 JSON, NOT HTTP 200 SSE
+      nextBehavior = "403";
+      const r403 = await makeReq();
+      assert.equal(r403.status, 403);
+      assert.ok((r403.headers.get("content-type") || "").includes("application/json"));
+      const b403 = (await r403.json()) as { type?: string; error?: { message?: string } };
+      assert.equal(b403.type, "error");
+      assert.match(b403.error?.message || "", /forbidden/i);
+
+      // 2) Post-lease 429 before 15s -> must return real HTTP 429 JSON + retry-after header
+      nextBehavior = "429";
+      const r429 = await makeReq();
+      assert.equal(r429.status, 429);
+      assert.ok(r429.headers.get("retry-after"));
+      const b429 = (await r429.json()) as { type?: string; error?: { message?: string } };
+      assert.equal(b429.type, "error");
+      assert.match(b429.error?.message || "", /rate limit/i);
+
+      // 3) Normal stream before 15s -> HTTP 200 SSE with content & clean timer cancellation
+      nextBehavior = "ok";
+      const rOk = await makeReq();
+      assert.equal(rOk.status, 200);
+      assert.ok((rOk.headers.get("content-type") || "").includes("text/event-stream"));
+      const sseBody = await rOk.text();
+      assert.ok(sseBody.includes("Hello after delayed flush check."));
+    } finally {
+      await gw.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves raw text for malformed tool_call arguments across streaming filter, unclosed tags, and mixed blocks", () => {
+    // 1) StreamingToolCallFilter chunked input with malformed string arguments -> 0 toolCalls, raw preserved
+    const filter = new StreamingToolCallFilter(new Set(["read_file"]));
+    let emitted = "";
+    const badStream = 'Checking <tool_call>{"name":"read_file","arguments":"{not-valid-json"}</tool_call>';
+    for (let i = 0; i < badStream.length; i += 7) {
+      emitted += filter.feed(badStream.slice(i, i + 7));
+    }
+    const flushed = filter.flush();
+    assert.equal(flushed.toolCalls.length, 0);
+    assert.ok((emitted + flushed.remainingText).includes('{"name":"read_file","arguments":"{not-valid-json"}'));
+
+    // 2) Unclosed <tool_call> with malformed string arguments -> raw preserved
+    const unclosed = parseToolCallsFromText('Intro <tool_call>{"name":"read_file","arguments":"{broken"}');
+    assert.equal(unclosed.toolCalls.length, 0);
+    assert.ok(unclosed.cleanText.includes('"{broken"'));
+
+    // 3) Valid non-object JSON string arguments (array) and malformed `input` string -> raw preserved
+    const arrayArgs = parseToolCallsFromText('<tool_call>{"name":"read_file","arguments":"[1,2,3]"}</tool_call>');
+    assert.equal(arrayArgs.toolCalls.length, 0);
+    assert.ok(arrayArgs.cleanText.includes("[1,2,3]"));
+
+    const badInput = parseToolCallsFromText('<tool_call>{"name":"read_file","input":"{bad"}</tool_call>');
+    assert.equal(badInput.toolCalls.length, 0);
+    assert.ok(badInput.cleanText.includes("{bad"));
+
+    // 4) Empty/whitespace string arguments -> normalized to `{}`
+    const emptyArgs = parseToolCallsFromText('<tool_call>{"name":"ping","arguments":"   "}</tool_call>');
+    assert.equal(emptyArgs.toolCalls.length, 1);
+    assert.deepEqual(emptyArgs.toolCalls[0]?.argsObject, {});
+
+    // 5) Mixed valid + malformed <tool_call> blocks -> valid extracted, malformed kept verbatim
+    const mixed = parseToolCallsFromText(
+      '<tool_call>{"name":"read_file","arguments":{"path":"a.ts"}}</tool_call>\n' +
+      '<tool_call>{"name":"read_file","arguments":"{corrupt"}</tool_call>',
+    );
+    assert.equal(mixed.toolCalls.length, 1);
+    assert.deepEqual(mixed.toolCalls[0]?.argsObject, { path: "a.ts" });
+    assert.ok(mixed.cleanText.includes("{corrupt"));
+  });
+
+  it("throws explicit errors when web-client qbsproxy returns non-JSON or malformed body payloads", async () => {
+    const mockCred = {
+      accountId: "123456789012",
+      mbtc: "mock-csrf-token",
+      cookie: "session=mock",
+      wsHost: "quick.aws.com",
+    };
+    const origFetch = globalThis.fetch;
+    let mockStatus = 200;
+    let mockBody = "";
+
+    globalThis.fetch = (async () =>
+      new Response(mockBody, {
+        status: mockStatus,
+        headers: { "content-type": "text/html" },
+      })) as typeof fetch;
+
+    try {
+      // 1) HTML login page (expired session) -> rejects with non-JSON error without leaking HTML
+      mockStatus = 200;
+      mockBody = "<!DOCTYPE html><html><body>AWS Sign-In SECRET_HTML_MARKER</body></html>";
+      await assert.rejects(
+        () => fetchWebProfileUsage(mockCred),
+        (err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          return /returned non-JSON response/i.test(msg) && !msg.includes("SECRET_HTML_MARKER");
+        },
+      );
+
+      // 2) Double-encoded non-JSON string -> rejects with non-JSON error
+      mockBody = JSON.stringify("<html>session expired</html>");
+      await assert.rejects(
+        () => listWebCloudSessions(mockCred, 10),
+        /returned non-JSON response/i,
+      );
+
+      // 3) Valid outer JSON with malformed inner `body` string -> rejects with malformed body payload error
+      mockBody = JSON.stringify({ body: "{not-valid-inner-json" });
+      await assert.rejects(
+        () => fetchWebProfileUsage(mockCred),
+        /returned malformed body payload/i,
+      );
+
+      // 4) Valid double-encoded `{ body: JSON.stringify(...) }` succeeds cleanly
+      mockBody = JSON.stringify(JSON.stringify({ body: JSON.stringify({ frames: [{ type: "session_list", payload: { sessions: [{ id: "s1", title: "Demo", created_at: 1, updated_at: 2, message_count: 3 }] } }] }) }));
+      const sessions = await listWebCloudSessions(mockCred, 10);
+      assert.equal(sessions.length, 1);
+      assert.equal(sessions[0]?.id, "s1");
+
+      // 5) Valid non-object JSON primitives (`null`, `123`, `[]`) must throw instead of silently coercing to `{}`
+      for (const primitive of ["null", "123", "true", "[]"]) {
+        mockBody = primitive;
+        await assert.rejects(
+          () => fetchWebProfileUsage(mockCred),
+          /returned non-JSON response/i,
+        );
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("covers all 9 P1 & P2 audit fixes: connLimit wait, dashboard order, thinking_delta flush, soft-refusal EN, OOB prompt, pre-lease limits, catalog aliases, sub-key 404, logger failover reset, non-object tool args", async () => {
+    const {
+      buildOutOfBandContextPrompt,
+      isLikelySoftRefusal,
+      QuickExecutionEngine,
+    } = await import("../src/core/engine.js");
+    const { resolveKnownModelId } = await import("../src/services/model-catalog.js");
+    const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+
+    // P1-1: Full-concurrency slot with brief connLimit cooldown (<= maxWaitMs) must WAIT, not fast-fail 429
+    {
+      const cfg = loadConfigFromEnv({
+        QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1MSJ9.sig1",
+      });
+      const pool = new UpstreamKeyPool({ ...cfg, maxInflightPerSlot: 1 });
+      const k1 = pool.allManagedKeys()[0]!.rawKey;
+      const held = pool.leaseSpecificKey(k1);
+      pool.reportConnLimit(k1, 80);
+      setTimeout(() => held.release(), 30);
+      const t0 = Date.now();
+      const acquired = await pool.leaseKeyWithWait("quick-balanced", undefined, undefined, { maxWaitMs: 600 });
+      assert.equal(acquired.apiKey, k1);
+      assert.ok(Date.now() - t0 >= 65, "should wait for both release and brief connLimit expiry");
+      acquired.release();
+    }
+
+    // P1-2: Dashboard HTML assigns window.__globalChatAgentId BEFORE rendering account tables
+    {
+      const html = renderDashboardHtml("/dashboard", "test-nonce");
+      const assignIdx = html.indexOf('window.__globalChatAgentId = settings.chatAgentId || "";');
+      const overviewIdx = html.indexOf('$("overviewAccountsBody").innerHTML');
+      const credTableIdx = html.indexOf("renderCredTable();");
+      assert.ok(assignIdx > 0 && overviewIdx > assignIdx && credTableIdx > assignIdx);
+    }
+
+    // P1-3: thinking_delta arriving after buffered text_delta ("You") must flush prefix in-order before thinking
+    {
+      const sendCloudOut = (sock: import("ws").WebSocket, ev: Record<string, unknown>) => {
+        const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+        const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+        sock.send(
+          encodeEventStream(
+            { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+            payload,
+          ),
+        );
+      };
+      const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+      await new Promise<void>((resolve) => wss.once("listening", resolve));
+      const addr = wss.address();
+      assert.ok(addr && typeof addr === "object");
+      const wsPort = addr.port;
+      wss.on("connection", (sock) => {
+        sendCloudOut(sock, { type: "connected", payload: { user: { email: "mock@example.com" } } });
+        sock.on("message", (raw) => {
+          const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+          const b64 = outer.payload?.payload;
+          if (!b64) return;
+          const inner = JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as {
+            type?: string;
+            payload?: Record<string, unknown>;
+          };
+          if (inner.type === "session_connect") {
+            sendCloudOut(sock, { type: "session_established", payload: {} });
+            return;
+          }
+          if (inner.type === "user_message") {
+            const tid = String(inner.payload?.thread_id || "t1");
+            sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "You" } });
+            sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "checking" } });
+            sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: " are all set." } });
+            sendCloudOut(sock, { type: "message_complete", thread_id: tid, payload: {} });
+          }
+        });
+      });
+
+      const cfg = loadConfigFromEnv({
+        QUICK_TOKENS: serializeOAuthCredential({
+          accessToken: "mock-at",
+          refreshToken: "mock-rt",
+          clientId: "mock-cid-p1-3",
+          clientSecret: "mock-cs",
+          expiresAt: Date.now() + 3600_000,
+          wsHost: "api.us-east-1.quick.aws.com",
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+        }),
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      });
+      const pool = new UpstreamKeyPool(cfg);
+      const engine = new QuickExecutionEngine({
+        config: cfg,
+        usageTracker: new UsageTracker(),
+        webSocketFactory: () => new WsClient(`ws://127.0.0.1:${wsPort}`),
+      });
+      try {
+        const turn = parseChatCompletionsRequest({
+          model: "quick-balanced",
+          stream: true,
+          messages: [{ role: "user", content: "Check order" }],
+        });
+        let text = "";
+        let thinking = "";
+        for await (const ev of engine.executeTurnWithPool(turn, pool)) {
+          if (ev.type === "text") text += ev.text;
+          if (ev.type === "thinking") thinking += ev.text;
+        }
+        assert.equal(text, "You are all set.");
+        assert.ok(thinking.includes("checking"));
+      } finally {
+        await engine.disposeAll();
+        await new Promise<void>((resolve) => wss.close(() => resolve()));
+      }
+    }
+
+    // P1-4: SOFT_REFUSAL_PATTERNS does not false-positive on English defensive prompt-injection / social-engineering prose
+    {
+      assert.equal(isLikelySoftRefusal("How to detect indirect prompt injection in enterprise RAG pipelines."), false);
+      assert.equal(isLikelySoftRefusal("To flag prompt injection attempts, add an input delimiter and validator."), false);
+      assert.equal(isLikelySoftRefusal("When retrieved context contains prompt injection, treat it as untrusted data."), false);
+      assert.equal(isLikelySoftRefusal("Social engineering awareness training helps teams spot phishing emails."), false);
+      assert.equal(isLikelySoftRefusal("I detected a prompt injection in your request and cannot proceed."), true);
+      assert.equal(isLikelySoftRefusal("This message looks like social engineering, so I must refuse."), true);
+    }
+
+    // P1-5: buildOutOfBandContextPrompt avoids UTF-16 surrogate splits & 2401..3749 duplication
+    {
+      const medPrompt = "A".repeat(2_800);
+      const wrappedMed = buildOutOfBandContextPrompt(medPrompt, "ctx.txt", 3_500);
+      assert.ok(!wrappedMed.includes("\n...\n"), "should not emit bogus ellipsis when fullPrompt fits maxInlineChars");
+      assert.equal(wrappedMed.split("A".repeat(500)).length - 1, 5, "should not duplicate overlapping middle");
+
+      const emojiPrompt = "😀".repeat(3_000);
+      const wrappedEmoji = buildOutOfBandContextPrompt(emojiPrompt, "emoji.txt", 3_500);
+      const hasLoneSurrogate = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(wrappedEmoji);
+      assert.equal(hasLoneSurrogate, false, "must never split UTF-16 surrogate pairs");
+
+      const latestTurn2800 = `TOP_ANCHOR_99 ${"log_entry_item ".repeat(185)}TAIL_ANCHOR_99`;
+      const multiPrompt = `${"OLD_HISTORY\n".repeat(4_000)}[USER]: ${latestTurn2800}`;
+      const wrappedOverlap = buildOutOfBandContextPrompt(multiPrompt, "multi.txt", 3_500, false, latestTurn2800);
+      assert.ok(wrappedOverlap.includes("TOP_ANCHOR_99"));
+      assert.ok(wrappedOverlap.includes("TAIL_ANCHOR_99"));
+      assert.equal(wrappedOverlap.split("TOP_ANCHOR_99").length - 1, 1);
+      assert.equal(wrappedOverlap.split("TAIL_ANCHOR_99").length - 1, 1);
+    }
+
+    // P1-6: >10 images / >5 files rejected with 400 PRE-LEASE even when pool has 0 enabled keys
+    {
+      const emptyCfg = loadConfigFromEnv({ QUICK_TOKENS: "" });
+      const emptyPool = new UpstreamKeyPool(emptyCfg);
+      const engine = new QuickExecutionEngine({ config: emptyCfg, usageTracker: new UsageTracker() });
+      const tinyB64 = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+      const turn11Imgs = parseChatCompletionsRequest({
+        model: "quick-fast",
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "hi" },
+              ...Array.from({ length: 11 }, () => ({ type: "image_url", image_url: { url: tinyB64 } })),
+            ],
+          },
+        ],
+      });
+      await assert.rejects(
+        async () => {
+          for await (const _ of engine.executeTurnWithPool(turn11Imgs, emptyPool)) {}
+        },
+        (err: unknown) => (err as { status?: number })?.status === 400,
+      );
+
+      const turn6Files = parseResponsesRequest({
+        model: "quick-fast",
+        input: [
+          {
+            role: "user",
+            content: [
+              { type: "input_text", text: "read" },
+              ...Array.from({ length: 6 }, (_, i) => ({
+                type: "input_file",
+                filename: `f${i}.pdf`,
+                file_data: "data:application/pdf;base64,JVBERi0xLjQ=",
+              })),
+            ],
+          },
+        ],
+      });
+      await assert.rejects(
+        async () => {
+          for await (const _ of engine.executeTurnWithPool(turn6Files, emptyPool)) {}
+        },
+        (err: unknown) => (err as { status?: number })?.status === 400,
+      );
+    }
+
+    // P1-8: Prefix-only strings reject with 404; prefixed/effort default aliases work consistently
+    {
+      for (const bad of ["quick/", "aws-quick/", "amazon-quick/", "[aws]-", "[quick]-", "[custom]-"]) {
+        assert.equal(resolveKnownModelId(bad), null, `${bad} must resolve to null`);
+        assert.throws(
+          () => resolveModelSelection(bad, {}),
+          (err: unknown) => (err as { status?: number; code?: string })?.status === 404 && (err as { code?: string })?.code === "model_not_found",
+        );
+      }
+      assert.equal(resolveKnownModelId("quick/auto"), "quick-balanced");
+      assert.equal(resolveModelSelection("quick/auto", {}).canonicalId, "quick-balanced");
+      assert.equal(resolveKnownModelId("auto[effort=high]"), "quick-balanced");
+      assert.equal(resolveModelSelection("auto[effort=high]", {}).selection.thinkingEffort, "high");
+      assert.equal(resolveKnownModelId("auto(high)"), "quick-balanced");
+      assert.equal(resolveModelSelection("auto(high)", {}).selection.thinkingEffort, "high");
+      assert.equal(resolveKnownModelId("default[effort=medium]"), "quick-balanced");
+      assert.equal(resolveModelSelection("default[effort=medium]", {}).selection.thinkingEffort, "medium");
+      assert.equal(resolveModelSelection("[custom]-quick-smart[effort=high]", {}).selection.thinkingEffort, "high");
+    }
+
+    // P1-9 & P2: Restricted sub-key gets 404 for unknown models (not 403) across POST, GET /models/:id, and count_tokens
+    {
+      const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-subkey-404-"));
+      const cfg = loadConfigFromEnv({
+        HOST: "127.0.0.1",
+        PORT: "0",
+        GATEWAY_TOKEN: "sk-aq-master-real-token-1234567890",
+        QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+        GATEWAY_KEYS_FILE: path.join(tmpDir, "gateway-keys.json"),
+        USAGE_LEDGER_FILE: path.join(tmpDir, "usage-ledger.json"),
+        ADMIN_AUTH_FILE: path.join(tmpDir, "admin-auth.json"),
+        ENV_FILE_PATH: path.join(tmpDir, ".env"),
+        ENABLE_DASHBOARD: "false",
+      });
+      const gw = createGatewayServer({ config: cfg });
+      const created = gw.clientKeys.createKey({
+        name: "restricted-sub",
+        allowAllModels: false,
+        allowedModels: ["quick-fast"],
+      });
+      await new Promise<void>((resolve) => gw.server.listen(0, "127.0.0.1", resolve));
+      const addr = gw.server.address();
+      assert.ok(addr && typeof addr === "object");
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+      const subHeaders = {
+        Authorization: `Bearer ${created.rawToken}`,
+        "x-api-key": created.rawToken,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+      };
+      try {
+        const postUnk = await fetch(`${baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: subHeaders,
+          body: JSON.stringify({ model: "totally-unknown-999", messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(postUnk.status, 404);
+
+        const postForbidden = await fetch(`${baseUrl}/v1/chat/completions`, {
+          method: "POST",
+          headers: subHeaders,
+          body: JSON.stringify({ model: "quick-smart", messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(postForbidden.status, 403);
+
+        const getUnk = await fetch(`${baseUrl}/v1/models/totally-unknown-999`, { headers: subHeaders });
+        assert.equal(getUnk.status, 404);
+
+        const getForbidden = await fetch(`${baseUrl}/v1/models/quick-smart`, { headers: subHeaders });
+        assert.equal(getForbidden.status, 403);
+
+        const countUnk = await fetch(`${baseUrl}/v1/messages/count_tokens`, {
+          method: "POST",
+          headers: subHeaders,
+          body: JSON.stringify({ model: "totally-unknown-999", messages: [{ role: "user", content: "hi" }] }),
+        });
+        assert.equal(countUnk.status, 404);
+      } finally {
+        await gw.close();
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+
+    // P2: RequestTraceLogger resets per-attempt fields on failover and restores full upstreamSentChars on warm->cold fallback
+    {
+      const logger = new RequestTraceLogger(20);
+      const turn = parseChatCompletionsRequest({
+        model: "quick-balanced",
+        messages: [
+          { role: "user", content: "X".repeat(1_000) },
+          { role: "assistant", content: "Y".repeat(1_000) },
+          { role: "user", content: "short" },
+        ],
+      });
+      const tid = logger.startTrace("openai-chat", turn);
+      const initialFull = logger.getDetail(tid)!.upstreamSentChars;
+      logger.bindExecutionMeta(tid, {
+        slotId: "slotA",
+        maskedKey: "oauth:aaa***",
+        accountLabel: "AccA",
+        execMode: "warm_incremental",
+        usedProxy: true,
+        usedDefaultSystemAgent: true,
+      });
+      assert.equal(logger.getDetail(tid)!.usedDefaultSystemAgent, true);
+      assert.equal(logger.getDetail(tid)!.usedProxy, true);
+      assert.ok(logger.getDetail(tid)!.upstreamSentChars < 50);
+
+      logger.bindExecutionMeta(tid, {
+        slotId: "slotB",
+        maskedKey: "oauth:bbb***",
+        execMode: "incognito",
+        warmFallbackToCold: true,
+        accountFailoverCount: 1,
+      });
+      const after = logger.getDetail(tid)!;
+      assert.equal(after.slotId, "slotB");
+      assert.equal(after.accountLabel, undefined);
+      assert.equal(after.usedProxy, undefined);
+      assert.equal(after.usedDefaultSystemAgent, undefined);
+      assert.equal(after.warmFallbackToCold, true);
+      assert.equal(after.accountFailoverCount, 1);
+      assert.equal(after.upstreamSentChars, initialFull);
+    }
+
+    // P2: tool-bridge rejects non-string non-object arguments (arrays/numbers) instead of coercing to `{}`
+    {
+      const arrRaw = parseToolCallsFromText('<tool_call>{"name":"read_file","arguments":[1,2,3]}</tool_call>');
+      assert.equal(arrRaw.toolCalls.length, 0);
+      assert.ok(arrRaw.cleanText.includes("[1,2,3]"));
+
+      const numRaw = parseToolCallsFromText('<tool_call>{"name":"read_file","arguments":42}</tool_call>');
+      assert.equal(numRaw.toolCalls.length, 0);
+      assert.ok(numRaw.cleanText.includes("42"));
+    }
+  });
+
+  it("supports Anthropic output_config.effort=max / adaptive / high budget_tokens, docker-compose without env_file, and monotonic Anthropic usage floor", async () => {
+    const { stabilizeAnthropicUsage } = await import("../src/protocols/anthropic.js");
+
+    // 1) Anthropic effort mapping: output_config.effort, thinking.adaptive, high budget_tokens >= 16384 -> max,
+    //    AND model-ID explicit effort (`quick-smart-max` / `quick-smart[effort=max]`) is NEVER downgraded by
+    //    generic client defaults like `thinking: { type: "adaptive" }` or `budget_tokens: 10000`.
+    assert.equal(resolveModelSelection("quick-smart", { output_config: { effort: "max" } }).selection.thinkingEffort, "max");
+    assert.equal(
+      resolveModelSelection("quick-smart", { thinking: { type: "adaptive" }, output_config: { effort: "max" } }).selection.thinkingEffort,
+      "max",
+    );
+    assert.equal(resolveModelSelection("quick-smart-max", { thinking: { type: "adaptive" } }).selection.thinkingEffort, "max");
+    assert.equal(
+      resolveModelSelection("quick-smart-max", { thinking: { type: "enabled", budget_tokens: 10_000 } }).selection.thinkingEffort,
+      "max",
+    );
+    assert.equal(
+      resolveModelSelection("quick-smart[effort=max]", { thinking: { type: "adaptive" } }).selection.thinkingEffort,
+      "max",
+    );
+    assert.equal(
+      resolveModelSelection("quick-smart-max", { output_config: { effort: "low" } }).selection.thinkingEffort,
+      "low",
+    );
+    assert.equal(resolveModelSelection("quick-smart", { thinking: { type: "adaptive" } }).selection.thinkingEffort, "high");
+    assert.equal(resolveModelSelection("quick-balanced", { thinking: { type: "adaptive" } }).selection.thinkingEffort, "medium");
+    assert.equal(
+      resolveModelSelection("quick-smart", { thinking: { type: "enabled", budget_tokens: 10_000 } }).selection.thinkingEffort,
+      "high",
+    );
+    assert.equal(
+      resolveModelSelection("quick-smart", { thinking: { type: "enabled", budget_tokens: 31_999 } }).selection.thinkingEffort,
+      "max",
+    );
+    assert.equal(
+      resolveModelSelection("quick-smart-think", { thinking: { type: "disabled" }, output_config: { effort: "max" } }).selection.thinkingEffort,
+      "off",
+    );
+    assert.equal(resolveModelSelection("quick-fast", { output_config: { effort: "max" } }).selection.thinkingEffort, "off");
+
+    // 2) docker-compose.yml must not declare `env_file:` + >200KB 100-account .env loads cleanly via loadDotEnv()
+    const composeText = readFileSync(path.resolve(process.cwd(), "docker-compose.yml"), "utf8");
+    assert.ok(!/^\s*env_file\s*:/m.test(composeText), "docker-compose.yml must rely on mounted .env volume, not env_file");
+    assert.ok(composeText.includes("./.env:/app/.env"));
+
+    const bigEnvDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-bigenv-"));
+    try {
+      const tokens100 = Array.from({ length: 100 }, (_, i) =>
+        serializeOAuthCredential({
+          accessToken: `at-${i}-${"a".repeat(600)}`,
+          refreshToken: `rt-${i}-${"b".repeat(600)}`,
+          clientId: `cid-${i}`,
+          clientSecret: `cs-${i}-${"c".repeat(200)}`,
+          expiresAt: Date.now() + 3_600_000,
+          wsHost: "api.us-east-1.quick.aws.com",
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+        }),
+      );
+      const envPath = path.join(bigEnvDir, ".env");
+      const envContent = `QUICK_TOKENS=${tokens100.join(",")}\n`;
+      assert.ok(Buffer.byteLength(envContent, "utf8") > 200_000, "test .env should exceed Linux 128KB single-env limit");
+      writeFileSync(envPath, envContent, "utf8");
+      const { loadDotEnv } = await import("../src/core/config.js");
+      const origQuickTokens = process.env.QUICK_TOKENS;
+      delete process.env.QUICK_TOKENS;
+      try {
+        loadDotEnv(envPath);
+        const parsedCfg = loadConfigFromEnv(process.env, envPath);
+        assert.equal(parsedCfg.quickTokens.length, 100);
+      } finally {
+        if (origQuickTokens === undefined) delete process.env.QUICK_TOKENS;
+        else process.env.QUICK_TOKENS = origQuickTokens;
+      }
+    } finally {
+      rmSync(bigEnvDir, { recursive: true, force: true });
+    }
+
+    // 4) Wire-level mock WS: verify Anthropic quick-smart-max + adaptive sends thinking_effort="max",
+    //    dynamic 80% rotation based on upstream `context_window` (e.g. 165K / 200K = 82.5% rotates even < 800K),
+    //    trailing all-zero `turn_usage` frame NEVER wipes out real usage metrics, and traceLogger records contextPercent.
+    {
+      const { QuickExecutionEngine } = await import("../src/core/engine.js");
+      const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+      const { UsageTracker } = await import("../src/services/usage-tracker.js");
+      const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+      const sendCloudOut = (sock: import("ws").WebSocket, ev: Record<string, unknown>) => {
+        const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+        sock.send(
+          encodeEventStream(
+            { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+            Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+          ),
+        );
+      };
+      const seenPayloads: Array<Record<string, unknown>> = [];
+      const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+      await new Promise<void>((resolve) => wss.once("listening", resolve));
+      const wsPort = (wss.address() as { port: number }).port;
+      wss.on("connection", (sock) => {
+        sendCloudOut(sock, { type: "connected", payload: { user: { email: "mock@example.com" } } });
+        sock.on("message", (raw) => {
+          const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+          if (!outer.payload?.payload) return;
+          const inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as {
+            type?: string;
+            payload?: Record<string, unknown>;
+          };
+          if (inner.type === "session_connect") {
+            sendCloudOut(sock, { type: "session_established", payload: {} });
+          } else if (inner.type === "user_message") {
+            seenPayloads.push(inner.payload || {});
+            const tid = String(inner.payload?.thread_id || "t1");
+            sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "Rotated cleanly." } });
+            sendCloudOut(sock, {
+              type: "turn_usage",
+              thread_id: tid,
+              payload: {
+                input_tokens: 15_000,
+                output_tokens: 5_000,
+                cache_read_tokens: 145_000,
+                cache_write_tokens: 0,
+                total_tokens: 165_000,
+                context_window: 200_000,
+                resolved_model_id: "us.anthropic.claude-opus-5-5",
+              },
+            });
+            // Trailing all-zero turn_usage frame must be ignored and never wipe out real metrics
+            sendCloudOut(sock, {
+              type: "turn_usage",
+              thread_id: tid,
+              payload: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                total_tokens: 0,
+                context_window: 200_000,
+                resolved_model_id: "us.anthropic.claude-opus-5-5",
+              },
+            });
+            sendCloudOut(sock, { type: "message_complete", thread_id: tid, payload: {} });
+          }
+        });
+      });
+
+      const cfg = loadConfigFromEnv({
+        QUICK_TOKENS: serializeOAuthCredential({
+          accessToken: "mock-at",
+          refreshToken: "mock-rt",
+          clientId: "mock-cid-800k",
+          clientSecret: "mock-cs",
+          expiresAt: Date.now() + 3_600_000,
+          wsHost: "api.us-east-1.quick.aws.com",
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+        }),
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      });
+      const pool = new UpstreamKeyPool(cfg);
+      const logger = new RequestTraceLogger(20);
+      const engine = new QuickExecutionEngine({
+        config: cfg,
+        usageTracker: new UsageTracker(),
+        webSocketFactory: () => new WsClient(`ws://127.0.0.1:${wsPort}`),
+      });
+      try {
+        const anthTurn = parseAnthropicMessagesRequest({
+          model: "quick-smart-max",
+          max_tokens: 1024,
+          thinking: { type: "adaptive" },
+          messages: [{ role: "user", content: "Test max effort + dynamic 80% context_window rotation" }],
+        });
+        const traceId = logger.startTrace("anthropic-messages", anthTurn);
+        let lastUsageMetrics: import("../src/core/types.js").TurnTokenMetrics | undefined;
+        for await (const ev of engine.executeTurnWithPool(anthTurn, pool)) {
+          if (ev.type === "usage") {
+            lastUsageMetrics = ev.metrics;
+            logger.recordUsage(traceId, ev.metrics);
+          }
+        }
+        assert.equal(seenPayloads.length, 1);
+        assert.equal(seenPayloads[0]?.thinking_effort, "max", "quick-smart-max + adaptive must send thinking_effort=max on wire");
+        assert.equal(lastUsageMetrics?.totalTokens, 165_000, "trailing all-zero turn_usage must not overwrite real usage");
+        assert.equal(lastUsageMetrics?.contextWindow, 200_000);
+        assert.equal(lastUsageMetrics?.contextPercent, 82.5);
+        assert.equal(logger.getDetail(traceId)?.metrics?.contextPercent, 82.5);
+        assert.equal(logger.listSummaries(5)[0]?.metrics?.contextPercent, 82.5);
+        assert.equal(engine.runtimeStats().warmIdleSessions, 0, "warm thread >= 80% of real context_window must NOT be parked");
+        assert.equal(engine.runtimeStats().warmIncrementalSessions, 0, "warm thread >= 80% of real context_window must rotate on next turn");
+        const dashHtml = renderDashboardHtml("/dashboard", "n");
+        assert.ok(dashHtml.includes("上游上下文水位"));
+        assert.ok(dashHtml.includes('tr("水位 ", "Ctx ")'));
+        assert.ok(dashHtml.includes('tr(" · 换线程", " · Rotate")'));
+      } finally {
+        await engine.disposeAll();
+        await new Promise<void>((resolve) => wss.close(() => resolve()));
+      }
+    }
+
+    // 3) Anthropic context usage anti-shrinkage floor & explicit /compact reset
+    const convKey = `issue11-monotonic-${Date.now()}`;
+    const mkTurn = (estimatedInputTokens: number) => ({
+      ...parseAnthropicMessagesRequest({ model: "quick-smart", max_tokens: 128, messages: [{ role: "user", content: "hi" }] }),
+      conversationKey: convKey,
+      estimatedInputTokens,
+    });
+
+    // Turn 1: upstream reports higher AWS total (42,400 >= 10,000) -> pass through accurately
+    const u1 = stabilizeAnthropicUsage(
+      { inputTokens: 400, outputTokens: 200, cacheReadTokens: 42_000, cacheWriteTokens: 0 },
+      mkTurn(10_000),
+    );
+    assert.equal(u1.input_tokens + u1.cache_read_input_tokens + u1.cache_creation_input_tokens, 42_400);
+
+    // Turn 2: client grew (+18,000), but upstream dipped to 1,900 (e.g. .txt attachment / failover) -> must NOT shrink
+    const u2 = stabilizeAnthropicUsage(
+      { inputTokens: 900, outputTokens: 150, cacheReadTokens: 1_000, cacheWriteTokens: 0 },
+      mkTurn(28_000),
+    );
+    assert.equal(u2.input_tokens + u2.cache_read_input_tokens + u2.cache_creation_input_tokens, 60_400);
+
+    // Turn 3: upstream catches up to 80,500 -> report exact real upstream total
+    const u3 = stabilizeAnthropicUsage(
+      { inputTokens: 500, outputTokens: 180, cacheReadTokens: 80_000, cacheWriteTokens: 0 },
+      mkTurn(32_000),
+    );
+    assert.equal(u3.input_tokens + u3.cache_read_input_tokens + u3.cache_creation_input_tokens, 80_500);
+
+    // Turn 4: client ran `/compact` (estimated dropped from 32,000 to 6,000, >15% drop) -> watermark resets cleanly
+    const u4 = stabilizeAnthropicUsage(
+      { inputTokens: 200, outputTokens: 100, cacheReadTokens: 15_000, cacheWriteTokens: 0 },
+      mkTurn(6_000),
+    );
+    assert.equal(u4.input_tokens + u4.cache_read_input_tokens + u4.cache_creation_input_tokens, 15_200);
   });
 });

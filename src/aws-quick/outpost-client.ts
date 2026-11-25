@@ -151,6 +151,7 @@ export class OutpostHandle {
     this.inFlightSession = (async () => {
       const resp = await fetch(`http://127.0.0.1:${this.port}/auth/sncs-session`, {
         headers: { Authorization: `Bearer ${this.instanceToken}` },
+        signal: AbortSignal.timeout(15_000),
       });
       if (!resp.ok) {
         const text = await resp.text().catch(() => '');
@@ -182,6 +183,7 @@ export class OutpostHandle {
     if (this.cachedOutpostId) return this.cachedOutpostId;
     const resp = await fetch(`http://127.0.0.1:${this.port}/local/outpost-id`, {
       headers: { Authorization: `Bearer ${this.instanceToken}` },
+      signal: AbortSignal.timeout(15_000),
     });
     if (!resp.ok) {
       throw new Error(`Outpost /local/outpost-id failed (${resp.status})`);
@@ -204,6 +206,7 @@ export class OutpostHandle {
         Authorization: `Bearer ${session.jwt}`,
         'x-amzn-qs-internal-trace-id': crypto.randomUUID(),
       },
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify({
         eventType: 'invokeAgent',
         eventBody: {
@@ -242,6 +245,7 @@ export class OutpostHandle {
         Authorization: `Bearer ${session.jwt}`,
         'x-amzn-qs-internal-trace-id': crypto.randomUUID(),
       },
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify({
         eventType: 'invokeAgent',
         eventBody: {

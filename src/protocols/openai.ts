@@ -4,7 +4,6 @@ import {
   type NormalizedFile,
   type NormalizedImage,
   type NormalizedTool,
-  type NormalizedToolCall,
   type NormalizedToolResult,
   type ParsedProtocolTurn,
   type ToolChoiceMode,
