@@ -146,6 +146,26 @@ describe("Model catalog & parameter resolution", () => {
     const r4 = resolveModelSelection("claude-sonnet-5-5", { thinking: { type: "enabled" } });
     assert.equal(r4.selection.thinkingEffort, "high");
 
+    // Anthropic `thinking.budget_tokens` spans the whole ladder, so a Claude Code "max" budget
+    // reaches AWS Quick as `max` instead of being capped at `high`.
+    const budgetCases = [
+      [1024, "low"],
+      [2048, "medium"],
+      [4096, "medium"],
+      [8192, "high"],
+      [16000, "high"],
+      [16384, "max"],
+      [31999, "max"],
+    ] as const;
+    for (const [budget, expected] of budgetCases) {
+      assert.equal(
+        resolveModelSelection("claude-opus-5-5", { thinking: { type: "enabled", budget_tokens: budget } }).selection.thinkingEffort,
+        expected,
+        `budget_tokens=${budget}`,
+      );
+    }
+    assert.equal(resolveModelSelection("claude-opus-5-5", { thinking: { type: "disabled", budget_tokens: 31999 } }).selection.thinkingEffort, "off");
+
     assert.equal(resolveModelSelection("quick-balanced-think").selection.thinkingEffort, "medium");
     assert.equal(resolveModelSelection("quick-smart-think").selection.thinkingEffort, "high");
     assert.equal(resolveModelSelection("quick-advanced").selection.agentMode, "advanced");
