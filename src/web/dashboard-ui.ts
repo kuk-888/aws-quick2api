@@ -2577,7 +2577,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             '<div style="font-size:10.5px;color:var(--err);margin-top:2px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(s.lastSyncError) + '</div>';
         }
         return '<div style="font-size:11.5px;color:var(--fg-muted);">' + esc(tr("未同步", "Not synced")) + '</div>' +
-          '<div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("点击右上角同步额度", "Click Sync Quota")) + '</div>';
+          '<div style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(tr("点击该行「刷新额度」", "Click Sync Quota on this row")) + '</div>';
       }
       const resetStr = q.daysRemainingInCycle != null ? (q.daysRemainingInCycle + tr("天重置", "d reset")) : "";
       const trialStr = q.trialDaysRemaining != null ? (tr("试用 ", "Trial ") + q.trialDaysRemaining + tr("天", "d")) : "";
@@ -2806,6 +2806,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             (s.autoDisabledReason ? '<div style="font-size:10.5px;color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(s.autoDisabledReason) + '">' + esc(formatShortDisableReason(s.autoDisabledReason, s.autoDisabledKind, s.autoRecoverAt)) + '</div>' : '') +
           '</td>' +
           '<td class="ops-cell"><div class="ops-grid-2">' +
+            '<button class="btn-xs" data-click="syncOneQuota" data-arg="' + esc(s.slotId) + '"' + (isSyncing ? ' disabled' : '') + ' title="' + esc(tr('仅刷新该凭证的额度与云端会话数（额度已补充会自动恢复调度）', 'Refresh quota for this credential only (auto re-enables it once quota is back)')) + '">' + esc(isSyncing ? tr('刷新中', 'Syncing') : tr('刷新额度', 'Sync Quota')) + '</button>' +
             '<button class="btn-xs" data-click="jumpToAccountLogs" data-arg="' + esc(s.slotId) + '" title="' + esc(tr('查看该账号的实时请求日志', 'View request logs for this account')) + '">' + esc(tr('请求日志', 'Logs')) + '</button>' +
             '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '" title="' + esc(tr('修改账号备注名称', 'Edit account label')) + '">' + esc(tr('修改备注', 'Label')) + '</button>' +
             '<button class="btn-xs" data-click="editProxy" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.maskedProxy || '') + '" title="' + esc(tr('配置该账号的独立出口代理', 'Configure per-account proxy')) + '">' + esc(tr('出口代理', 'Proxy')) + '</button>' +
@@ -3799,6 +3800,35 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         notify(r.recovered ? tr("重新检测通过，已恢复调度。", "Recheck passed; scheduling resumed.") : (tr("重新检测后仍不可用：", "Still unavailable: ") + ((r.slot && r.slot.autoDisabledReason) || tr("请查看状态说明", "Check status"))), !r.recovered);
         await loadConsoleData("?force=1");
       } catch (e) { notify(e.message, true); }
+    };
+
+    // Per-credential quota sync: refreshes just this slot (no batch, no recovery sweep of other
+    // accounts) and auto-re-enables it when the fresh telemetry shows quota is back.
+    window.syncOneQuota = async (slotId) => {
+      if (busySyncIds.has(slotId)) return;
+      busySyncIds.add(slotId);
+      renderCredTable();
+      try {
+        const data = await loadConsoleData("?force=1&slotIds=" + encodeURIComponent(slotId));
+        const report = data && Array.isArray(data.accounts) ? data.accounts[0] : undefined;
+        if (report && report.status === "ok") {
+          const slot = (data.keyPool || []).find((s) => s.slotId === slotId);
+          const q = slot && slot.quota ? slot.quota : null;
+          const pct = q && q.premiumApiPool && q.premiumApiPool.usedPercent != null
+            ? Number(q.premiumApiPool.usedPercent).toFixed(1) + "%"
+            : tr("未提供", "n/a");
+          notify(tr("已刷新该凭证额度：月度已用 ", "Quota refreshed: monthly usage ") + pct);
+        } else {
+          const reason = String((report && report.error) || tr("未知错误", "Unknown error")).slice(0, 120);
+          notify(tr("刷新该凭证额度失败：", "Failed to refresh this credential: ") + reason, true);
+          await loadConsoleData("");
+        }
+      } catch (e) {
+        notify(e.message, true);
+      } finally {
+        busySyncIds.delete(slotId);
+        renderCredTable();
+      }
     };
 
     window.clearKeyCd = async (slotId) => {

@@ -409,6 +409,16 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.doesNotThrow(() => new vm.Script(match[1]!));
   });
 
+  it("exposes a per-credential quota refresh action in the console", () => {
+    const html = renderDashboardHtml("/dashboard", "test-nonce");
+    assert.ok(html.includes('data-click="syncOneQuota"'), "credential rows should offer a single-slot quota refresh");
+    assert.ok(html.includes("window.syncOneQuota"), "the per-row action should be wired to a handler");
+    assert.ok(html.includes("?force=1&slotIds="), "single-slot refresh should scope the quota call to one slot");
+    // Row buttons must stay outside the batch `data-sync-quota` group, whose labels/disabled state
+    // loadConsoleData rewrites on every console refresh.
+    assert.ok(!/data-click="syncOneQuota"[^>]*data-sync-quota/.test(html));
+  });
+
   it("enforces one-time initial admin password setup and min length", () => {
     const auth = new AdminAuthManager({ adminPassword: undefined });
     assert.equal(auth.isPasswordConfigured(), false);
