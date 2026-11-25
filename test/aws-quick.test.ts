@@ -168,8 +168,8 @@ describe("Model catalog & parameter resolution", () => {
 });
 
 describe("Thinking-effort tiers (verbatim passthrough + probe)", () => {
-  it("passes every tier through verbatim and advertises xhigh/max on the reasoning models", () => {
-    const expected = ["off", "low", "medium", "high", "xhigh", "max"] as const;
+  it("folds every tier above high onto max and advertises it on the reasoning models", () => {
+    const expected = ["off", "low", "medium", "high", "max"] as const;
     for (const tier of expected) {
       assert.equal(resolveModelSelection(`claude-opus-5-5[effort=${tier}]`).selection.thinkingEffort, tier);
       assert.equal(resolveModelSelection("claude-opus-5-5", { reasoning_effort: tier }).selection.thinkingEffort, tier);
@@ -179,18 +179,18 @@ describe("Thinking-effort tiers (verbatim passthrough + probe)", () => {
       agentMode: "smart",
       thinkingEffort: "max",
     });
-    // Hyphen suffix and alias spellings stay separate tiers instead of being folded together.
+    // `xhigh` / `maximum` / `ultra` are aliases of `max`, not separate tiers AWS Quick would reject.
     assert.equal(resolveModelSelection("claude-opus-5-5-max").selection.thinkingEffort, "max");
-    assert.equal(resolveModelSelection("claude-opus-5-5-xhigh").selection.thinkingEffort, "xhigh");
-    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning: { effort: "xhigh" } }).selection.thinkingEffort, "xhigh");
+    assert.equal(resolveModelSelection("claude-opus-5-5-xhigh").selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning: { effort: "xhigh" } }).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "maximum" }).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "ultra" }).selection.thinkingEffort, "max");
     const effortParam = AWS_QUICK_MODELS.find((m) => m.id === "claude-opus-5-5")!.parameters![0]!;
-    assert.deepEqual(effortParam.values, ["off", "low", "medium", "high", "xhigh", "max"]);
+    assert.deepEqual(effortParam.values, ["off", "low", "medium", "high", "max"]);
   });
-
   it("keeps forwarding a probed tier until an account proves it rejects that tier", () => {
     const registry = new EffortCapabilityRegistry(undefined, { passthrough: true });
-    for (const tier of ["off", "low", "medium", "high", "xhigh", "max"] as const) {
+    for (const tier of ["off", "low", "medium", "high", "max"] as const) {
       assert.deepEqual(registry.resolveEffort("acct-a", tier), { effort: tier, downgraded: false });
       assert.equal(registry.stateFor("acct-a", tier), "unknown");
     }
@@ -198,8 +198,7 @@ describe("Thinking-effort tiers (verbatim passthrough + probe)", () => {
     registry.markUnsupported("acct-a", "max", "Invalid thinking_effort value: max");
     assert.equal(registry.stateFor("acct-a", "max"), "unsupported");
     assert.deepEqual(registry.resolveEffort("acct-a", "max"), { effort: "high", downgraded: true });
-    // Degrading one tier leaves the others alone, for this account and for everyone else.
-    assert.deepEqual(registry.resolveEffort("acct-a", "xhigh"), { effort: "xhigh", downgraded: false });
+    // Degrading `max` leaves the baseline tiers alone, for this account and for everyone else.
     assert.deepEqual(registry.resolveEffort("acct-b", "max"), { effort: "max", downgraded: false });
     assert.deepEqual(registry.resolveEffort("acct-a", "medium"), { effort: "medium", downgraded: false });
 
@@ -208,39 +207,36 @@ describe("Thinking-effort tiers (verbatim passthrough + probe)", () => {
     assert.deepEqual(registry.resolveEffort("acct-a", "high"), { effort: "high", downgraded: false });
   });
 
-  it("persists per-tier probe results and honors the passthrough kill switch", () => {
+  it("persists max probe results and honors the passthrough kill switch", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "effort-cap-"));
     try {
       const file = path.join(dir, "state.db");
       const registry = new EffortCapabilityRegistry(file, { passthrough: true });
       registry.markSupported("acct-ok", "max");
-      registry.markSupported("acct-ok", "xhigh");
       registry.markUnsupported("acct-bad", "max", "thinking effort \"max\" is invalid");
       registry.flush();
 
       const reloaded = new EffortCapabilityRegistry(file, { passthrough: true });
       assert.equal(reloaded.stateFor("acct-ok", "max"), "supported");
-      assert.equal(reloaded.stateFor("acct-ok", "xhigh"), "supported");
       assert.equal(reloaded.stateFor("acct-bad", "max"), "unsupported");
       assert.deepEqual(reloaded.resolveEffort("acct-bad", "max"), { effort: "high", downgraded: true });
+      assert.deepEqual(reloaded.resolveEffort("acct-ok", "max"), { effort: "max", downgraded: false });
       const snapshot = reloaded.snapshot();
       assert.equal(snapshot.maxEffortPassthrough, true);
       assert.equal(snapshot.fallbackEffort, "high");
-      assert.deepEqual(snapshot.probedTiers, ["xhigh", "max"]);
-      assert.equal(snapshot.supported, 2);
+      assert.deepEqual(snapshot.probedTiers, ["max"]);
+      assert.equal(snapshot.supported, 1);
       assert.equal(snapshot.unsupported, 1);
       assert.deepEqual(
         snapshot.accounts.map((entry) => [entry.account, entry.tier, entry.state]),
         [
           ["acct-ok", "max", "supported"],
-          ["acct-ok", "xhigh", "supported"],
           ["acct-bad", "max", "unsupported"],
         ],
       );
-      assert.equal(snapshot.accounts[2]!.evidence, 'thinking effort "max" is invalid');
+      assert.equal(snapshot.accounts[1]!.evidence, 'thinking effort "max" is invalid');
       const disabled = new EffortCapabilityRegistry(file, { passthrough: false });
       assert.deepEqual(disabled.resolveEffort("acct-ok", "max"), { effort: "high", downgraded: true });
-      assert.deepEqual(disabled.resolveEffort("acct-ok", "xhigh"), { effort: "high", downgraded: true });
       assert.deepEqual(disabled.resolveEffort("acct-ok", "low"), { effort: "low", downgraded: false });
     } finally {
       closeAllDatabases();
@@ -1968,11 +1964,11 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
     assert.ok(totalJsonBytes < 46_000, `Expected 9 images JSON (${totalJsonBytes}B) to fit under 46KB`);
 
     // Native thinking_effort="max" passthrough (this fork aliases quick-* onto the Claude 5.5 IDs
-    // and keeps `xhigh` as its own probed tier instead of folding it into `max`).
+    // and folds `xhigh` into `max`, matching the upstream vocabulary).
     assert.equal(resolveModelSelection("quick-smart-max", {}).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-smart[effort=max]", {}).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-smart(max)", {}).selection.thinkingEffort, "max");
-    assert.equal(resolveModelSelection("quick-balanced(xhigh)", {}).selection.thinkingEffort, "xhigh");
+    assert.equal(resolveModelSelection("quick-balanced(xhigh)", {}).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-smart-think", { reasoning_effort: "max" }).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-smart", { reasoning: { effort: "max" } }).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-fast", { reasoning_effort: "max" }).selection.thinkingEffort, "off");

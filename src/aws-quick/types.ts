@@ -1,10 +1,11 @@
 export type QuickAgentMode = "fast" | "balanced" | "smart" | "advanced";
 /**
  * Thinking-effort tiers forwarded to AWS Quick as `thinking_effort`, always verbatim.
- * `xhigh` / `max` are passed through optimistically: the gateway probes them on first use and
+ * `max` is the only tier above `high`; `xhigh` / `maximum` / `ultra` are accepted as request
+ * aliases for it. It is forwarded optimistically: the gateway probes it on first use and
  * auto-degrades a rejected tier to `high` for that account (see services/effort-capability.ts).
  */
-export type QuickThinkingEffort = "off" | "low" | "medium" | "high" | "xhigh" | "max";
+export type QuickThinkingEffort = "off" | "low" | "medium" | "high" | "max";
 
 export interface SDKModelParameter {
   id: string;

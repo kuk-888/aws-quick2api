@@ -5,9 +5,10 @@ import { openDatabaseFor } from "../storage/db.js";
 /**
  * Thinking tiers above `high` that are forwarded optimistically and probed per account.
  * Everything at or below `high` is a long-standing AWS Quick value, so it is never probed
- * and always travels verbatim.
+ * and always travels verbatim. `max` is the only tier above `high` (AWS Quick accepts it
+ * natively); `xhigh` / `maximum` / `ultra` are request aliases that resolve to it.
  *
- * Probe lifecycle for each tier:
+ * Probe lifecycle:
  *   - the turn completes         -> tier marked `supported`   (keep sending it)
  *   - upstream rejects the value -> tier marked `unsupported` (retry once with `high`,
  *                                   later turns go straight to `high`)
@@ -16,7 +17,7 @@ import { openDatabaseFor } from "../storage/db.js";
  * Results live in the `effort_capabilities` table of the state database, one row per
  * (account, tier) pair.
  */
-export const PROBED_TIERS: readonly QuickThinkingEffort[] = ["xhigh", "max"] as const;
+export const PROBED_TIERS: readonly QuickThinkingEffort[] = ["max"] as const;
 
 /** Kept for callers/tests that refer to the top tier by name. */
 export const MAX_EFFORT: QuickThinkingEffort = "max";

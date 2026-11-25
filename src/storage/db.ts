@@ -120,7 +120,8 @@ const MIGRATIONS: readonly string[] = [
   );
   `,
 
-  // v2 — thinking-effort capabilities became per tier (`xhigh` / `max` are probed separately).
+  // v2 — thinking-effort capabilities are keyed by tier, so more tiers above `high` can be probed
+  // later without another migration (today only `max` is). Legacy rows are backfilled as `max`.
   `
   CREATE TABLE IF NOT EXISTS effort_capabilities_v2 (
     account    TEXT NOT NULL,

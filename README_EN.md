@@ -107,7 +107,7 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 >
 > **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Parenthetical hints (e.g. `quick-balanced(Sonnet)`, `quick-smart(max)`) are accepted too, and reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, `-max` suffixes, or bracket syntax such as `claude-sonnet-5-5[effort=max]`.
 >
-> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `xhigh` → `max`. `xhigh` / `max` (`max` also accepts `ultra` / `maximum`) are forwarded to AWS Quick as-is and probed per account and per tier: the first turn at a tier that completes marks it supported; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in the SQLite `effort_capabilities` table, and uses `high` for that account and tier afterwards (other accounts and tiers keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
+> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `max`. `max` (also `xhigh` / `maximum` / `ultra` as aliases) is forwarded to AWS Quick as-is and probed per account: if the first `max` turn completes, the account is marked as supporting it; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in the SQLite `effort_capabilities` table, and uses `high` for that account afterwards (other accounts keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
 
 ---
 

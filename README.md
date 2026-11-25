@@ -115,7 +115,7 @@ flowchart LR
 >
 > **兼容别名**：旧 `quick-fast`、`quick-balanced`、`quick-smart` 仍可作为请求别名；`quick-balanced-think` 与 `quick-smart-think` 保留默认思考强度，`quick-advanced` 保留 Advanced 模式。兼容带括号说明的写法（如 `quick-balanced(Sonnet)`、`quick-smart(max)`），支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking`、`-max` 后缀或方括号语法（如 `claude-sonnet-5-5[effort=max]`）按请求覆盖思考强度。
 >
-> **思考强度档位**：`off` → `low` → `medium` → `high` → `xhigh` → `max`。`xhigh` / `max`（`max` 也接受 `ultra` / `maximum`）会原样透传给 AWS Quick，并按账号做一次探测：该账号首次使用某档位若正常完成即记为支持；若上游显式拒绝该取值，网关会在同一账号上自动降级为 `high` 重试一次，并把结果写入 SQLite 的 `effort_capabilities` 表，之后该账号该档位直接走 `high`（其它账号、其它档位仍会各自探测）。设 `THINKING_EFFORT_MAX_PASSTHROUGH=false` 可全局强制 `high`。
+> **思考强度档位**：`off` → `low` → `medium` → `high` → `max`。`max`（也接受 `xhigh` / `maximum` / `ultra` 作为别名）会原样透传给 AWS Quick，并按账号做一次探测：该账号首次 `max` 请求若正常完成即记为支持；若上游显式拒绝该取值，网关会在同一账号上自动降级为 `high` 重试一次，并把结果写入 SQLite 的 `effort_capabilities` 表，之后该账号直接走 `high`（其它账号仍会各自探测）。设 `THINKING_EFFORT_MAX_PASSTHROUGH=false` 可全局强制 `high`。
 
 ---
 
