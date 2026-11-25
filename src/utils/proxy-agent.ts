@@ -391,7 +391,7 @@ const MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024;
 function doProxiedHttpsRequest(
   u: URL,
   agent: https.Agent | undefined,
-  init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+  init: { method?: string; headers?: Record<string, string>; body?: string | Buffer | Uint8Array; signal?: AbortSignal },
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -400,13 +400,18 @@ function doProxiedHttpsRequest(
       settled = true;
       reject(err);
     };
+    const headers: Record<string, string> = { ...(init.headers || {}) };
+    if (init.body !== undefined && !Object.keys(headers).some((k) => k.toLowerCase() === "content-length")) {
+      const len = typeof init.body === "string" ? Buffer.byteLength(init.body, "utf8") : init.body.byteLength;
+      headers["Content-Length"] = String(len);
+    }
     const req = https.request(
       {
         hostname: u.hostname,
         port: u.port ? Number(u.port) : 443,
         path: `${u.pathname}${u.search}`,
         method: init.method || "GET",
-        headers: init.headers,
+        headers,
         agent,
         signal: init.signal,
       },
@@ -456,13 +461,21 @@ function doProxiedHttpsRequest(
  */
 export async function fetchViaOptionalProxy(
   url: string,
-  init: { method?: string; headers?: Record<string, string>; body?: string; signal?: AbortSignal },
+  init: { method?: string; headers?: Record<string, string>; body?: string | Buffer | Uint8Array; signal?: AbortSignal },
   proxyUrl?: string,
   options?: { maxRetries?: number; retryDelayMs?: number },
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<unknown> }> {
   const effectiveProxy = (proxyUrl || "").trim();
   if (!effectiveProxy) {
-    return fetch(url, init);
+    const fetchInit: RequestInit = {
+      ...(init.method ? { method: init.method } : {}),
+      ...(init.headers ? { headers: init.headers } : {}),
+      ...(init.body !== undefined
+        ? { body: typeof init.body === "string" ? init.body : Buffer.from(init.body) }
+        : {}),
+      ...(init.signal ? { signal: init.signal } : {}),
+    };
+    return fetch(url, fetchInit);
   }
   const u = new URL(url);
   const agent = getProxyAgent(effectiveProxy);

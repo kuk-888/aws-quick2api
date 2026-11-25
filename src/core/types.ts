@@ -30,6 +30,15 @@ export type NormalizedImage =
   | { url: string; dimension?: { width: number; height: number } }
   | { data: string; mimeType: string; dimension?: { width: number; height: number } };
 
+export interface NormalizedFile {
+  filename: string;
+  mimeType: string;
+  /** Base64-encoded raw bytes (without data: prefix). */
+  data?: string;
+  /** Remote http(s):// URL to fetch and upload out-of-band. */
+  url?: string;
+}
+
 export interface NormalizedToolCall {
   id: string;
   name: string;
@@ -67,6 +76,8 @@ export interface ParsedProtocolTurn {
   incrementalUserText?: string;
   images: NormalizedImage[];
   incrementalImages?: NormalizedImage[];
+  files?: NormalizedFile[];
+  incrementalFiles?: NormalizedFile[];
   tools: NormalizedTool[];
   /** Native cloud tools requested by caller (reserved for compatibility). */
   nativeSdkTools?: Array<"webSearch" | "webFetch">;
@@ -137,6 +148,12 @@ export interface GatewayConfig {
   autoEnsureCodingAgent?: boolean;
   /** Optional default instructions template used when auto-creating custom agents (`CUSTOM_AGENT_PROMPT`). */
   customAgentPrompt?: string;
+  /** Optional: automatically rephrase the latest user prompt into defensive engineering wording on upstream `content_filtered` and retry on the SAME requested model (`AUTO_REPHRASE_ON_CONTENT_FILTER`, default false). */
+  autoRephraseOnContentFilter?: boolean;
+  /** Optional custom instruction template used when auto-rephrasing after `content_filtered` (`CONTENT_FILTER_REPHRASE_PROMPT`). */
+  contentFilterRephrasePrompt?: string;
+  /** Optional helper model used strictly for short prompt rephrasing (`CONTENT_FILTER_REPHRASE_MODEL`, default `quick-fast`). Never replaces the user's answering model. */
+  contentFilterRephraseModel?: string;
   /** Optional per-credential AWS Quick custom agent IDs keyed by slotId (`KEY_CHAT_AGENT_IDS`). */
   keyChatAgentIds?: Record<string, string>;
   /** Optional per-credential import timestamps (epoch ms) keyed by slotId (`KEY_ADDED_AT`). */

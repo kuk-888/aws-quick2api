@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import {
   GatewayError,
+  type NormalizedFile,
   type NormalizedImage,
   type NormalizedTool,
   type NormalizedToolResult,
@@ -41,20 +42,84 @@ function parseAnthropicImageBlock(block: Record<string, unknown>): NormalizedIma
 /** Block types that are safe to drop: they carry no user-visible input the model must see. */
 const IGNORABLE_BLOCK_TYPES = new Set(["thinking", "redacted_thinking", "server_tool_use", "web_search_tool_result", "web_fetch_tool_result"]);
 
+const PLAIN_TEXT_DOC_MIMES = new Set([
+  "application/json",
+  "application/xml",
+  "application/javascript",
+  "application/typescript",
+  "application/x-yaml",
+  "application/yaml",
+]);
+
+function isTextDocumentMime(mime: string): boolean {
+  const m = mime.trim().toLowerCase().split(";")[0] || "";
+  return m.startsWith("text/") || PLAIN_TEXT_DOC_MIMES.has(m);
+}
+
+function extForDocMime(mime: string): string {
+  const m = mime.trim().toLowerCase().split(";")[0] || "";
+  if (m === "application/pdf") return "pdf";
+  if (m === "application/json") return "json";
+  if (m === "text/markdown") return "md";
+  if (m === "text/csv") return "csv";
+  if (m === "text/html") return "html";
+  if (m.startsWith("text/")) return "txt";
+  return "bin";
+}
+
 /**
- * Extract text from a `document` block when it is plain text; otherwise reject loudly.
- * Silently dropping an attachment would make the client believe the model saw it.
+ * Parse an Anthropic `document` block:
+ * - `text` / `content` sources become inline `[DOCUMENT]` text;
+ * - `base64` / `url` sources become `NormalizedFile` attachments (or inline text when small UTF-8 text/*).
  */
-function documentBlockToText(block: Record<string, unknown>): string {
+function parseAnthropicDocumentBlock(block: Record<string, unknown>, docIndex: number): { text?: string; file?: NormalizedFile } {
   const src = isRecord(block.source) ? block.source : undefined;
-  const title = typeof block.title === "string" && block.title ? `${block.title}\n` : "";
-  if (src?.type === "text" && typeof src.data === "string") return `[DOCUMENT]\n${title}${src.data}`;
+  const rawTitle = typeof block.title === "string" && block.title.trim() ? block.title.trim() : "";
+  const titleHeader = rawTitle ? `${rawTitle}\n` : "";
+  if (src?.type === "text" && typeof src.data === "string") {
+    return { text: `[DOCUMENT]\n${titleHeader}${src.data}` };
+  }
   if (src?.type === "content" && Array.isArray(src.content)) {
     const parts = src.content.map((c) => (isRecord(c) && c.type === "text" && typeof c.text === "string" ? c.text : "")).filter(Boolean);
-    if (parts.length) return `[DOCUMENT]\n${title}${parts.join("\n")}`;
+    if (parts.length) return { text: `[DOCUMENT]\n${titleHeader}${parts.join("\n")}` };
+  }
+  if (src?.type === "base64" && typeof src.data === "string") {
+    const mimeType = typeof src.media_type === "string" && src.media_type.trim()
+      ? src.media_type.trim().toLowerCase()
+      : "application/pdf";
+    const cleanB64 = src.data.replace(/\s+/g, "");
+    if (!cleanB64) {
+      throw new GatewayError("Empty base64 `document` block.", 400, "invalid_request_error");
+    }
+    if (isTextDocumentMime(mimeType)) {
+      const decoded = Buffer.from(cleanB64, "base64").toString("utf8");
+      return { text: `[DOCUMENT]\n${titleHeader}${decoded}` };
+    }
+    const ext = extForDocMime(mimeType);
+    const filename = rawTitle || `document_${docIndex + 1}.${ext}`;
+    return { file: { filename, mimeType, data: cleanB64 } };
+  }
+  if (src?.type === "url" && typeof src.url === "string" && src.url.trim()) {
+    const url = src.url.trim();
+    const dataMatch = /^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s.exec(url);
+    if (dataMatch) {
+      const mimeType = (dataMatch[1] || "application/pdf").trim().toLowerCase();
+      const cleanB64 = (dataMatch[2] || "").replace(/\s+/g, "");
+      if (isTextDocumentMime(mimeType)) {
+        return { text: `[DOCUMENT]\n${titleHeader}${Buffer.from(cleanB64, "base64").toString("utf8")}` };
+      }
+      return { file: { filename: rawTitle || `document_${docIndex + 1}.${extForDocMime(mimeType)}`, mimeType, data: cleanB64 } };
+    }
+    if (/^https?:\/\//i.test(url)) {
+      const mimeType = typeof src.media_type === "string" && src.media_type.trim()
+        ? src.media_type.trim().toLowerCase()
+        : "application/pdf";
+      const filename = rawTitle || `document_${docIndex + 1}.${extForDocMime(mimeType)}`;
+      return { file: { filename, mimeType, url } };
+    }
   }
   throw new GatewayError(
-    "Unsupported content block: `document` with this source type is not supported by this gateway (only plain-text documents are). Convert it to text first.",
+    "Unsupported content block: `document` with this source type is not supported (use `text`, `content`, `base64`, or `url`).",
     400,
     "invalid_request_error"
   );
@@ -79,11 +144,12 @@ function formatToolReferenceBlock(block: Record<string, unknown>): string {
   return refName ? `[TOOL_REFERENCE: ${refName}]` : "";
 }
 
-function flattenToolResultContent(content: unknown): { text: string; images: NormalizedImage[] } {
-  if (typeof content === "string") return { text: content, images: [] };
-  if (!Array.isArray(content)) return { text: "", images: [] };
+function flattenToolResultContent(content: unknown, fileOffset = 0): { text: string; images: NormalizedImage[]; files: NormalizedFile[] } {
+  if (typeof content === "string") return { text: content, images: [], files: [] };
+  if (!Array.isArray(content)) return { text: "", images: [], files: [] };
   const texts: string[] = [];
   const images: NormalizedImage[] = [];
+  const files: NormalizedFile[] = [];
   for (const b of content) {
     if (typeof b === "string") {
       texts.push(b);
@@ -94,13 +160,16 @@ function flattenToolResultContent(content: unknown): { text: string; images: Nor
     else if (b.type === "image") {
       const img = parseAnthropicImageBlock(b);
       if (img) images.push(img);
-    } else if (b.type === "document") texts.push(documentBlockToText(b));
-    else if (b.type === "tool_reference") {
+    } else if (b.type === "document") {
+      const parsed = parseAnthropicDocumentBlock(b, fileOffset + files.length);
+      if (parsed.text) texts.push(parsed.text);
+      if (parsed.file) files.push(parsed.file);
+    } else if (b.type === "tool_reference") {
       const refText = formatToolReferenceBlock(b);
       if (refText) texts.push(refText);
     } else assertSupportedBlockType(typeof b.type === "string" ? b.type : "");
   }
-  return { text: texts.join("\n"), images };
+  return { text: texts.join("\n"), images, files };
 }
 
 export function parseAnthropicTools(rawTools: unknown): {
@@ -144,14 +213,18 @@ export function parseAnthropicToolChoice(raw: unknown): ToolChoiceMode {
 export function estimateAnthropicTokens(body: unknown): number {
   if (!isRecord(body)) return 1;
   let images = 0;
-  // Replace every image block (including ones nested in tool_result content) so the base64
-  // payload is not counted as text; each image is charged a flat estimate instead.
+  // Replace every image/base64-document block (including ones nested in tool_result content) so the base64
+  // payload is not counted as text; each attachment is charged a flat estimate instead.
   const serialized = JSON.stringify(
     { system: body.system ?? "", messages: body.messages ?? [], tools: body.tools ?? [] },
     (_key, value) => {
       if (isRecord(value) && value.type === "image") {
         images += 1;
         return { type: "image" };
+      }
+      if (isRecord(value) && value.type === "document" && isRecord(value.source) && value.source.type === "base64") {
+        images += 1;
+        return { type: "document", title: value.title };
       }
       return value;
     }
@@ -190,6 +263,7 @@ export function parseAnthropicMessagesRequest(
 
   const items: AnthropicTurnLine[] = [];
   const allImages: NormalizedImage[] = [];
+  const allFiles: NormalizedFile[] = [];
   let trailingToolResults: NormalizedToolResult[] = [];
   let trailingUserText: string | undefined;
   let trailingImages: NormalizedImage[] = [];
@@ -215,6 +289,7 @@ export function parseAnthropicMessagesRequest(
 
     const textChunks: string[] = [];
     const msgImages: NormalizedImage[] = [];
+    const msgFiles: NormalizedFile[] = [];
     const toolUseLines: string[] = [];
     const toolCallRefs: Array<{ id: string; name: string }> = [];
     const toolResultLines: string[] = [];
@@ -242,16 +317,23 @@ export function parseAnthropicMessagesRequest(
       } else if (bType === "tool_result") {
         const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id.trim() : "";
         const isError = block.is_error === true;
-        const { text, images } = flattenToolResultContent(block.content);
+        const { text, images, files } = flattenToolResultContent(block.content, allFiles.length);
         msgImages.push(...images);
         allImages.push(...images);
+        msgFiles.push(...files);
+        allFiles.push(...files);
         toolImagesByUseId.set(toolUseId, images);
         toolResultLines.push(`[TOOL_RESULT id=${toolUseId}${isError ? " error=true" : ""}]:\n${text || "[empty]"}`);
         if (toolUseId) {
           msgToolResults.push({ toolCallId: toolUseId, content: text, isError, ...(images.length ? { images } : {}) });
         }
       } else if (bType === "document") {
-        textChunks.push(documentBlockToText(block));
+        const parsed = parseAnthropicDocumentBlock(block, allFiles.length);
+        if (parsed.text) textChunks.push(parsed.text);
+        if (parsed.file) {
+          msgFiles.push(parsed.file);
+          allFiles.push(parsed.file);
+        }
       } else if (bType === "tool_reference") {
         const refText = formatToolReferenceBlock(block);
         if (refText) textChunks.push(refText);
@@ -263,8 +345,9 @@ export function parseAnthropicMessagesRequest(
     const joinedText = textChunks.join("\n");
     const hasTools = toolUseLines.length > 0 || toolResultLines.length > 0;
     const formattedParts: string[] = [...toolResultLines];
-    if (joinedText || (!hasTools && msgImages.length > 0)) {
-      formattedParts.push(`[${role.toUpperCase()}]:\n${joinedText || "[Image]"}`);
+    if (joinedText || (!hasTools && (msgImages.length > 0 || msgFiles.length > 0))) {
+      const placeholder = msgImages.length > 0 ? "[Image]" : `[File: ${msgFiles.map((f) => f.filename).join(", ")}]`;
+      formattedParts.push(`[${role.toUpperCase()}]:\n${joinedText || placeholder}`);
     }
     if (toolUseLines.length > 0) {
       formattedParts.push(`[ASSISTANT_TOOL_CALLS]:\n${toolUseLines.join("\n")}`);
@@ -275,6 +358,7 @@ export function parseAnthropicMessagesRequest(
         role,
         text: joinedText,
         images: msgImages,
+        ...(msgFiles.length > 0 ? { files: msgFiles } : {}),
         hasTools,
         ...(toolCallRefs.length > 0 ? { toolCalls: toolCallRefs } : {}),
         formattedLine: formattedParts.join("\n\n")
@@ -295,7 +379,7 @@ export function parseAnthropicMessagesRequest(
   );
 
   const baseTranscriptText = items.length === 1 && items[0].role === "user" && !items[0].hasTools
-    ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
+    ? (items[0].text || (items[0].images.length ? "[Image]" : allFiles.length ? `[File: ${allFiles.map((f) => f.filename).join(", ")}]` : ""))
     : items.map((it) => it.formattedLine).join("\n\n");
 
   const fullTranscriptText = hasAssistantPrefill
@@ -325,6 +409,7 @@ export function parseAnthropicMessagesRequest(
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,
+    ...(allFiles.length > 0 ? { files: allFiles } : {}),
     tools,
     ...(nativeSdkTools.length > 0 ? { nativeSdkTools } : {}),
     toolChoice,

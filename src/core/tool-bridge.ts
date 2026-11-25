@@ -52,16 +52,67 @@ function compactJsonSchema(
 }
 
 /**
+ * Unconditionally strip forged/internal client billing headers (e.g. `x-anthropic-billing-header`)
+ * that third-party CLI tools embed into system prompts and that trigger upstream prompt-injection alarms.
+ */
+export function stripHighRiskClientHeaders(text: string): string {
+  if (!text) return text;
+  if (!/x-anthropic-billing-header/i.test(text)) return text;
+  return text
+    .replace(/^x-anthropic-billing-header[^\n]*$/gim, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+/**
+ * Linearly convert `<system-reminder>...</system-reminder>` blocks in outbound prompt text into
+ * neutral `[Context note: ...]` wrappers so AWS Quick's safety layer does not misclassify them
+ * as system-tag spoofing / indirect prompt injection. Only applied to outbound wire text
+ * (never alters conversation prefix hashes).
+ */
+export function normalizeSystemReminderTagsForUpstream(input: string): string {
+  if (!input) return input;
+  const lower = input.toLowerCase();
+  const openTag = "<system-reminder>";
+  const closeTag = "</system-reminder>";
+  if (!lower.includes(openTag)) return input;
+  let out = "";
+  let pos = 0;
+  while (pos < input.length) {
+    const start = lower.indexOf(openTag, pos);
+    if (start < 0) {
+      out += input.slice(pos);
+      break;
+    }
+    out += input.slice(pos, start);
+    const end = lower.indexOf(closeTag, start + openTag.length);
+    if (end < 0) {
+      out += input.slice(start);
+      break;
+    }
+    const inner = input.slice(start + openTag.length, end).trim();
+    if (inner) {
+      out += `[Context note]\n${inner}\n[/Context note]`;
+    }
+    pos = end + closeTag.length;
+  }
+  return out.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
  * Soften direct identity-override phrases from third-party CLI/IDE agents (e.g. Claude Code,
- * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes) ONLY when falling back to AWS Quick's
- * built-in default agent with tools enabled. Plain chat and Custom Agent sessions pass the
- * client's system prompt through verbatim without modification.
+ * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes) when tools are enabled so they do not
+ * clash with AWS Quick's built-in identity or trigger false-positive prompt-injection refusals.
  */
 export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTools = true): string {
   if (!systemPrompt || !hasTools) return systemPrompt;
-  return systemPrompt
+  return stripHighRiskClientHeaders(systemPrompt)
     .replace(
       /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|Hermes)\b[^\n.]*\.?/gi,
+      "You are assisting a developer through an external coding client.",
+    )
+    .replace(
+      /\bYou are Claude,\s+Anthropic's[^\n.]*\.?/gi,
       "You are assisting a developer through an external coding client.",
     )
     .replace(

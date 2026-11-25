@@ -27,6 +27,9 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
   - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Coding Assistant` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
   - When a custom agent is active, tool bridging switches to ultra-clean minimal JSON schemas (no verbose anti-refusal boilerplate; zero `user_message` suffix injection on Opus/Sonnet), reliably powering local files, `.env`, shell, MCP, Skills, and Codex `apply_patch`.
   - Under **Routing & Strategy**, hot-update `AUTO_ENSURE_CODING_AGENT` and the global default instructions template `CUSTOM_AGENT_PROMPT`; under **Credentials**, click **Agent** on any account to inspect live custom agents, switch or restore default in one click, auto-create/bind, or **edit & hot-publish an existing agent's prompt directly to AWS Quick**.
+- **Anti-False-Positive Sanitization & Opt-In Defensive Rephrase**:
+  - Automatically strips forged/high-risk CLI billing headers (`x-anthropic-billing-header`), softens conflicting CLI identity lines, and normalizes outbound `<system-reminder>` tags into neutral notes without affecting conversation prefix hashes; includes a lightweight `warmup` guard to recover from false-positive prompt-injection refusals.
+  - Under **Routing & Strategy**, an opt-in **`AUTO_REPHRASE_ON_CONTENT_FILTER`** toggle (OFF by default) with an editable prompt template lets a lightweight helper model (`quick-fast` by default) rephrase only the latest blocked user message into defensive engineering wording when upstream returns `content_filtered` before text emission, then retries once on the **exact same user-requested model** (using native `edit_message` branching on warm sessions to keep KV cache & Turn N+1 `warm_incremental` intact — never silently downgrading the answering model).
 - **Multi-Account Pool & Per-Credential Proxies**:
   - `quota-aware`, `least-busy`, and `round-robin` scheduling, sticky session affinity (high Bedrock Prompt Cache hit rate), automatic circuit-breaking on quota exhaustion, and failover on 401/429/502/503.
   - Zero-dependency per-account outbound proxy supporting `http://`, `https://`, `socks5://`, `socks5h://` (remote DNS), and common provider shorthands (`host:port`, `user:pass@host:port`, `host:port:user:pass`), with automatic transient retry for residential proxies.
@@ -144,7 +147,10 @@ When using published multi-arch (`linux/amd64`, `linux/arm64`) GHCR images (`ghc
 docker compose pull && docker compose up -d
 ```
 
-> **Upgrading Docker from `<= v0.1.15`**: Starting in `v0.1.16`, the container runs as non-root (`node`, UID/GID `1000:1000`) with `cap_drop: [ALL]`. If your existing `./data` directory or `.env` file is owned by `root`, run `chown -R 1000:1000 data .env` once before upgrading.
+> **Lossless Upgrades (Zero Data Loss)**: All persistent state lives outside the code/image — imported AWS accounts, proxies, agent bindings, and routing settings stay in your host `.env`, while client sub-keys (`gateway-keys.json`), usage ledger (`usage-ledger.json`), and admin sessions stay in `./data/`. All new options default safely so existing deployments upgrade without reconfiguring:
+> - **Docker**: Keep `./.env` and `./data`, then run `docker compose pull && docker compose up -d`;
+> - **Source**: Keep `.env` and `data/`, then run `git pull && npm ci && npm run build` and restart the service;
+> - **One-time permission step only when upgrading Docker from `<= v0.1.15`**: `v0.1.16+` runs as non-root (`node`, UID/GID `1000:1000`) with `cap_drop: [ALL]`. If your existing `./data` or `.env` is owned by `root`, run `chown -R 1000:1000 data .env` once before upgrading.
 
 - **Web Console**: `http://127.0.0.1:3456/dashboard`
 - **OpenAI Base URL**: `http://127.0.0.1:3456/v1`
@@ -164,18 +170,21 @@ See [.env.example](./.env.example) for the full template:
 | `ADMIN_PASSWORD` | - | Console login password (required on remote servers; if unset, first-time setup is restricted to localhost `127.0.0.1`/`::1`) |
 | `QUICK_TOKENS` | `local-outpost` | Upstream credentials (can also be added via OAuth/Cookie in Console) |
 | `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `quick-advanced` on Free tier) |
-| `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console) |
+| `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console). Keep `true` for **shared pools / zero cloud history**; set `false` for **personal / high-concurrency** workloads (e.g. Claude Code subagents) so turns still resume via cloud `thread_id` even if a parked WS disconnects or is evicted |
 | `AUTO_DELETE_SESSION` | `false` | Send extra `session_delete` RPC after each incognito turn (off by default) |
 | `WEB_SEARCH_ENABLED` | `true` | Enable AWS Quick native web search |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | Show the routed model in the thinking block |
 | `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | Set `true` only if a legacy OpenAI SSE client cannot handle a trailing `reasoning_content` chunk |
 | `SANITIZE_AWS_UI_TAGS` | `true` | Convert AWS Quick `<decision>`/`<artifact>` XML into Markdown (preserves fenced code blocks) |
 | `AWS_QUICK_LOCALE` | `en-US` | Locale sent to upstream |
-| `AWS_QUICK_APP_VERSION` | `1.2.4660` | Desktop client version header override |
+| `AWS_QUICK_APP_VERSION` | `1.2.4757` | Desktop client version header override |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | Global default proxy (per-account `http://`, `https://`, `socks5://` and shorthand proxies can be set in Console) |
+| `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | Opt-in toggle (hot-configurable in Console): when enabled, if upstream returns `content_filtered` before text emission, a helper model rephrases the latest user prompt into defensive engineering wording and retries once on the exact same requested model (via native `edit_message` on warm threads) |
+| `CONTENT_FILTER_REPHRASE_PROMPT` | - | Custom prompt template for defensive auto-rephrase (empty = built-in default; editable in Console with one-click reset) |
+| `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | Lightweight helper model (`quick-fast` or `quick-balanced`) used strictly for short prompt rephrasing; never replaces the answering model |
 | `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | Safety-net compaction threshold for oversized prompts (`0` to disable) |
 | `AUTO_COMPACT_SUMMARY` | `true` | Summarize middle history when overflow compaction triggers |
-| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental cache TTL (30 min) and max entries when `INCOGNITO=false` |
+| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental session cache TTL (30 min) and max entries |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | GitHub `owner/repo` for non-blocking release check in Console (set `off` to disable) |
 
 ---
@@ -184,7 +193,7 @@ See [.env.example](./.env.example) for the full template:
 
 - **Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`)**: Not enforced upstream; accepted for client compatibility and reported via response headers.
 - **`response_format` (`json_object` / `json_schema`) & `n > 1`**: Not supported; returns an explicit `400` error.
-- **Attachments**: Image inputs (PNG/JPG/WebP/GIF) are supported. Because AWS Quick currently enforces a 50 KB single-frame WebSocket limit for inline images, oversized images are automatically downscaled and JPEG-compressed (`sharp`) within the shared frame budget; 1–2 cropped screenshots remain sharp and reliable, while sending 4+ dense small-font screenshots in a single turn degrades OCR accuracy due to tighter per-image budget (**out-of-band native attachment upload for images is planned for `v0.1.18`**). PDF, document, and audio attachments are not supported yet.
+- **Attachments**: Image inputs (PNG/JPG/WebP/GIF, up to 10 most recent per turn) and PDF/document inputs (Anthropic `document`, OpenAI Chat `file`, Responses `input_file`) are supported. With OAuth credentials, multi-image turns (≥2 images or >20 KB) and binary files like PDFs upload natively out-of-band at full resolution (up to 10 MB per file); non-OAuth credentials and single tiny images automatically fall back to `sharp` compression/inline text. Audio attachments are not supported yet.
 - **Non-chat endpoints**: Embeddings, image generation, TTS, and Whisper are not supported.
 
 ---

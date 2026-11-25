@@ -27,6 +27,9 @@
   - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，持久化写入 `.env`（后续 0ms 额外开销）。
   - 自定义 Agent 生效后自动切换极简工具桥接（去除长篇防拒答文案，Opus / Sonnet 保持 `user_message` 零注入），稳定支持 Claude Code / Codex CLI / Witan 发起本地文件、`.env`、终端、MCP、Skill、`apply_patch` 等调用。
   - Web 管理台「路由与策略」支持热更新 `AUTO_ENSURE_CODING_AGENT` 开关与全局默认提示词模板 `CUSTOM_AGENT_PROMPT`；「凭证池」点击任意账号的 **Agent** 按钮即可实时查看该账号下所有自定义 Agent、一键切换/恢复默认、一键自动创建绑定，或**在线编辑并热发布已有 Agent 提示词到 AWS Quick**。
+- **防误拦截净化与可选防御重述自愈**：
+  - 自动无害剥离第三方 CLI 高危账单头（`x-anthropic-billing-header`）、柔化冲突身份头并将出站 `<system-reminder>` 转为中性注释（不影响前缀哈希与热续传）；内置 `warmup` 软拒答守卫拦截提示词注入误判。
+  - Web 管理台「路由与策略」提供默认关闭的 **`AUTO_REPHRASE_ON_CONTENT_FILTER`** 开关与可微调提示词模板：开启后仅在收到上游 `content_filtered` 且尚未吐出正文时，由轻量辅助模型（默认 `quick-fast`）将最后一句重述为防御性工程表述，并通过原生 `edit_message` 热分支（或冷重试）**死守用户请求的原模型重试 1 次**（绝不降级偷换模型，下一轮继续 `warm_incremental` 热续接）。
 - **多账号调度与独立代理**：
   - 支持余量感知（`quota-aware`）、最少并发（`least-busy`）、轮询（`round-robin`）与会话粘性亲和；额度耗尽自动熔断，遇到 401/429/502/503 自动切换至健康账号。
   - 零依赖单账号独立出口代理，原生支持 `http://`、`https://`、`socks5://`、`socks5h://`（远程 DNS 解析）及常见简写（`ip:port`、`user:pass@ip:port`、`ip:port:user:pass`），内置住宅代理 `ECONNRESET` 瞬态断连自动重试。
@@ -152,7 +155,10 @@ docker compose up -d --build
 docker compose pull && docker compose up -d
 ```
 
-> **从 `<= v0.1.15` 升级 Docker 的权限说明**：`v0.1.16+` 镜像已切换为非 root 用户（`node`，UID/GID `1000:1000`）运行并启用最小权限。若宿主机旧的 `./data` 或 `.env` 归 `root` 所有，升级前请执行一次：`chown -R 1000:1000 data .env`。
+> **无损升级说明（账号、子密钥与账本均不会丢失）**：所有持久化数据均与程序目录解耦——已导入的 AWS 账号、代理、Agent 绑定与路由配置保存在宿主机 `.env`，网关子密钥（`gateway-keys.json`）、用量账本（`usage-ledger.json`）与管理会话保存在 `./data/`。新增配置项均带安全默认值，老用户升级无需重新配置：
+> - **Docker 用户**：保留 `./.env` 和 `./data`，直接执行 `docker compose pull && docker compose up -d` 即可无损升级；
+> - **源码用户**：保留 `.env` 和 `data/`，执行 `git pull && npm ci && npm run build` 后重启服务即可；
+> - **仅从 `<= v0.1.15` 升级 Docker 时一次性操作**：`v0.1.16+` 镜像已切换为非 root 用户（`node`，UID/GID `1000:1000`）运行并启用最小权限，若宿主机旧的 `./data` 或 `.env` 归 `root` 所有，首次升级前请执行一次 `chown -R 1000:1000 data .env`。
 
 - **Web 管理台**：`http://127.0.0.1:3456/dashboard`
 - **OpenAI Base URL**：`http://127.0.0.1:3456/v1`
@@ -172,18 +178,21 @@ docker compose pull && docker compose up -d
 | `ADMIN_PASSWORD` | - | 管理台密码（公网部署必填；留空时仅允许 `127.0.0.1`/`::1` 初始化） |
 | `QUICK_TOKENS` | `local-outpost` | 上游凭证（也可启动后直接在管理台用 OAuth 或 Cookie 添加） |
 | `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（Free 账号建议填 `quick-advanced`） |
-| `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换） |
+| `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换）。**共享号池/需云端零留存**保持 `true`；**个人独享/高并发**（如 Claude Code 多子代理）建议设为 `false`，WS 断开或被并发驱逐后仍可凭云端 `thread_id` 热续传，显著减少冷重放 |
 | `AUTO_DELETE_SESSION` | `false` | 无痕模式下回合结束后是否额外发 `session_delete`（默认关闭） |
 | `WEB_SEARCH_ENABLED` | `true` | 开启 AWS Quick 原生联网搜索 |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | 在思考块中显示实际路由模型 |
 | `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | 仅当老旧 OpenAI 客户端无法兼容正文后的 `reasoning_content` 时设为 `true` |
 | `SANITIZE_AWS_UI_TAGS` | `true` | 将 AWS Quick 私有 `<decision>`/`<artifact>` 标签转为 Markdown（保留代码块原样） |
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
-| `AWS_QUICK_APP_VERSION` | `1.2.4660` | 桌面端版本号请求头覆盖 |
+| `AWS_QUICK_APP_VERSION` | `1.2.4757` | 桌面端版本号请求头覆盖 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | 全局默认代理（单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独配置） |
 | `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | 超长上下文网关兜底压缩阈值（`0` 关闭） |
 | `AUTO_COMPACT_SUMMARY` | `true` | 触发超限压缩时优先对中间旧内容生成摘要 |
-| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 关闭无痕时多轮增量热复用的缓存时长（30 分钟）与上限 |
+| `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型将最后一句重述为防御性工程措辞并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
+| `CONTENT_FILTER_REPHRASE_PROMPT` | - | 防御性重述提示词模板（留空使用内置默认模板，可在管理台直接微调并一键恢复默认） |
+| `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | 仅用于短文本重述的辅助模型（`quick-fast` 或 `quick-balanced`），绝不替代最终回答模型 |
+| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 多轮增量热复用的会话缓存时长（30 分钟）与上限 |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | 管理台新版本提示仓库（设为 `off` 关闭） |
 
 ---
@@ -192,7 +201,7 @@ docker compose pull && docker compose up -d
 
 - **采样参数（`temperature` / `top_p` / `max_tokens` / `stop` / `seed`）**：上游不强制执行；网关兼容接收并通过响应头声明。
 - **`response_format`（`json_object` / `json_schema`）与 `n > 1`**：暂不支持，返回明确 `400` 错误。
-- **附件**：支持常见图片（PNG/JPG/WebP/GIF）。当前版本受 AWS Quick 50 KB 单帧 WebSocket 上限约束，大图会按总预算自动通过 `sharp` 缩放并压缩为 JPEG 发送；日常 1–2 张局部截图识别清晰稳定，若单轮同时发送 4 张以上高分密集小字截图，因多图均分帧预算会出现压缩模糊与识别降级（**已规划在下一版本 `v0.1.18` 将图片接入原生带外附件通道优化**）。暂不支持 PDF、文档和音频。
+- **附件**：支持图片（PNG/JPG/WebP/GIF，单轮最多保留最近 10 张）与 PDF/文档（Anthropic `document`、OpenAI Chat `file`、Responses `input_file`）。OAuth 凭证下多图（≥2 张或 >20KB）与 PDF 等二进制文件直接走原生带外附件通道高清无损上传（单文件上限 10MB），非 OAuth 凭证或单张小图自动回退 `sharp` 等比压缩内联。暂不支持音频。
 - **非对话接口**：不支持 Embeddings、文生图、TTS 与 Whisper。
 
 ---

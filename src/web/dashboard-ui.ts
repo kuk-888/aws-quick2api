@@ -507,14 +507,16 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
     /* Modal */
     .modal-mask {
-      position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+      position: fixed; inset: 0; background: rgba(0,0,0,0.52);
+      backdrop-filter: blur(2px);
       display: none; align-items: center; justify-content: center; padding: 20px; z-index: 60;
     }
     .modal-mask.open { display: flex; }
     .modal-card {
       width: 100%; max-width: 460px; max-height: 90vh; background: var(--panel);
-      border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+      border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
       display: flex; flex-direction: column;
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.22);
     }
     .modal-body { padding: 16px; display: flex; flex-direction: column; gap: 14px; overflow-y: auto; flex: 1; }
     .modal-foot {
@@ -703,6 +705,121 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       display: flex; flex-direction: column; gap: 10px; margin-top: 10px;
       padding: 12px; background: var(--subtle); border: 1px solid var(--border); border-radius: 8px;
     }
+
+    /* Topbar Version Pill & Update Modal */
+    .version-pill {
+      height: 26px; padding: 0 10px; border-radius: 999px;
+      border: 1px solid var(--border); background: var(--subtle); color: var(--fg-muted);
+      font-size: 11.5px; font-weight: 500; display: inline-flex; align-items: center; gap: 6px;
+      margin-right: 4px; transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .version-pill:hover { background: var(--panel-hover); border-color: var(--border-strong); color: var(--fg); }
+    .version-pill.has-update {
+      background: rgba(16, 185, 129, 0.10); border-color: rgba(16, 185, 129, 0.34); color: var(--ok);
+    }
+    .version-pill.has-update:hover {
+      background: rgba(16, 185, 129, 0.16); border-color: rgba(16, 185, 129, 0.52); color: var(--ok);
+    }
+    .version-pill-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
+    .version-pill.has-update .version-pill-dot { box-shadow: 0 0 0 2.5px rgba(16, 185, 129, 0.22); }
+
+    .upd-hero {
+      padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px;
+      background: var(--subtle); display: flex; flex-direction: column; gap: 10px;
+    }
+    .upd-hero.is-update {
+      border-color: rgba(16, 185, 129, 0.36);
+      background: linear-gradient(135deg, rgba(16, 185, 129, 0.08), var(--subtle) 68%);
+    }
+    .upd-ver-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+    }
+    .upd-ver-pair { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .upd-ver-box { display: flex; flex-direction: column; gap: 2px; }
+    .upd-ver-lbl { font-size: 11px; color: var(--fg-muted); }
+    .upd-ver-num { font-size: 16px; font-weight: 600; letter-spacing: -0.02em; color: var(--fg); line-height: 1.25; }
+    .upd-ver-num.is-ok { color: var(--ok); }
+    .upd-arrow { color: var(--fg-faint); font-size: 14px; padding-top: 12px; }
+    .upd-meta-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+      padding-top: 9px; border-top: 1px solid var(--border); font-size: 11.5px; color: var(--fg-muted);
+    }
+    .upd-repo-link {
+      color: var(--fg); text-decoration: none; display: inline-flex; align-items: center; gap: 5px;
+      transition: color 0.12s;
+    }
+    .upd-repo-link:hover { color: var(--ok); text-decoration: underline; text-underline-offset: 3px; }
+    .upd-sec { display: flex; flex-direction: column; gap: 7px; }
+    .upd-sec-hdr {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      font-size: 12px; font-weight: 600; color: var(--fg);
+    }
+    .upd-sec-hint { font-size: 11px; font-weight: 400; color: var(--fg-muted); }
+    .upd-notes-box {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px 14px; max-height: 220px; overflow-y: auto;
+      font-size: 12.5px; line-height: 1.6; color: var(--fg);
+    }
+    .upd-md-h2 {
+      font-size: 13px; font-weight: 600; color: var(--fg); margin: 0 0 6px;
+      padding-bottom: 5px; border-bottom: 1px solid var(--border);
+    }
+    .upd-md-h2:not(:first-child) { margin-top: 10px; }
+    .upd-md-h3 { font-size: 12px; font-weight: 600; color: var(--fg-muted); margin: 8px 0 4px; }
+    .upd-md-h3:first-child { margin-top: 0; }
+    .upd-md-p { margin: 4px 0; color: var(--fg); }
+    .upd-md-ul { list-style: none; padding: 0; margin: 4px 0; display: flex; flex-direction: column; gap: 5px; }
+    .upd-md-li { position: relative; padding-left: 14px; color: var(--fg); word-break: break-word; }
+    .upd-md-li::before {
+      content: ""; position: absolute; left: 2px; top: 8px;
+      width: 4px; height: 4px; border-radius: 50%; background: var(--fg-faint);
+    }
+    .upd-md-li.is-sub { margin-left: 14px; color: var(--fg-muted); font-size: 12px; }
+    .upd-md-li.is-sub::before { background: transparent; border: 1px solid var(--fg-faint); }
+    .upd-inline-code {
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11.5px; padding: 1px 5px; border-radius: 4px;
+      background: var(--subtle); border: 1px solid var(--border); color: var(--fg);
+    }
+    .upd-cmd-list { display: flex; flex-direction: column; gap: 7px; }
+    .upd-cmd-row {
+      display: flex; align-items: center; gap: 10px; padding: 7px 8px 7px 11px;
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    }
+    .upd-cmd-tag {
+      font-size: 11px; font-weight: 600; color: var(--fg-muted); min-width: 52px; flex-shrink: 0;
+    }
+    .upd-cmd-code {
+      flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
+      font-size: 11.5px; color: var(--fg); scrollbar-width: none;
+    }
+    .upd-cmd-code::-webkit-scrollbar { display: none; }
+    .upd-ext-link {
+      text-decoration: none; display: inline-flex; align-items: center; gap: 4px;
+      font-size: 12px; color: var(--fg-muted); height: 28px; padding: 0 8px; border-radius: 6px;
+      transition: background-color 0.12s, color 0.12s;
+    }
+    .upd-ext-link:hover { background: var(--panel-hover); color: var(--fg); }
+
+    /* Per-row compact quota refresh button */
+    .quota-cell-wrap {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; min-width: 195px;
+    }
+    .quota-cell-main { flex: 1; min-width: 0; }
+    .quota-refresh-btn {
+      width: 24px; height: 24px; padding: 0; border-radius: 6px; flex-shrink: 0;
+      background: transparent; border: 1px solid transparent; color: var(--fg-faint);
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: background-color 0.14s, border-color 0.14s, color 0.14s;
+    }
+    .quota-refresh-btn:hover:not(:disabled) {
+      background: var(--subtle); border-color: var(--border); color: var(--fg);
+    }
+    .quota-refresh-btn svg { width: 13px; height: 13px; stroke-width: 2; }
+    .quota-refresh-btn.is-spinning svg { animation: quickSpin 0.7s linear infinite; color: var(--fg); }
+    @media (prefers-reduced-motion: reduce) {
+      .quota-refresh-btn.is-spinning svg { animation: none; }
+    }
   </style>
 </head>
 <body>
@@ -774,7 +891,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       <div class="topbar">
         <div class="topbar-left" id="topbarTitle">总览监控</div>
         <div class="topbar-right">
-          <button class="tb-icon-btn" id="versionPillBtn" type="button" style="display:none;font-size:11.5px;padding:4px 8px;" title="Version Info"></button>
+          <button class="version-pill mono" id="versionPillBtn" type="button" style="display:none;" title="版本信息与更新指南"></button>
           <span class="sync-time mono" id="syncTimeLabel">—</span>
           <button class="tb-icon-btn" id="langToggleBtn" type="button" title="切换语言">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>
@@ -1218,6 +1335,31 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               </div>
               <textarea id="cfgCustomAgentPrompt" rows="3" style="width:100%;resize:vertical;line-height:1.5;" placeholder="留空将使用内置极简默认模板"></textarea>
             </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <h3>内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)</h3>
+                <p>默认关闭。开启后，仅当上游返回 content_filtered 且尚未向客户端输出正文时，由辅助模型将最后一条用户提问自动重述为防御性工程措辞，并死守用户请求的原模型重试 1 次（热会话优先使用原生 edit_message 分支保留前文缓存，绝不降级偷换主回答模型）。</p>
+              </div>
+              <label class="switch"><input type="checkbox" id="cfgAutoRephraseOnContentFilter" /><span class="slider"></span></label>
+            </div>
+
+            <div class="setting-row" id="cfgRephrasePromptWrap" style="display:none;flex-direction:column;align-items:stretch;gap:10px;background:var(--subtle);border-radius:6px;padding:12px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+                <div class="setting-info">
+                  <h3>防御性重述提示词模板与辅助模型 (CONTENT_FILTER_REPHRASE_PROMPT)</h3>
+                  <p>仅用于重述被误拦的提问本身，绝不替代最终回答模型；留空或点击「恢复默认」将使用内置模板。</p>
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+                  <select id="cfgContentFilterRephraseModel" style="min-width:170px;">
+                    <option value="quick-fast">quick-fast (Haiku 5.5 · 推荐)</option>
+                    <option value="quick-balanced">quick-balanced (Sonnet 5.5)</option>
+                  </select>
+                  <button type="button" class="btn-xs" id="resetRephrasePromptBtn">恢复默认</button>
+                </div>
+              </div>
+              <textarea id="cfgContentFilterRephrasePrompt" rows="5" style="width:100%;resize:vertical;line-height:1.5;font-size:12px;" placeholder="留空将使用内置防御性工程重述模板"></textarea>
+            </div>
           </div>
 
           <div class="panel-box">
@@ -1404,15 +1546,24 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
   <!-- Version / Update Notification Modal -->
   <div class="modal-mask" id="updateModal" role="dialog" aria-modal="true" aria-labelledby="updateModalTitle" data-click-self="closeUpdateModal">
-    <div class="modal-card" style="max-width: 560px;">
+    <div class="modal-card" style="max-width: 600px;">
       <div class="panel-hdr">
-        <h2 id="updateModalTitle">版本信息与更新指南</h2>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--fg-muted);flex-shrink:0;" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="16 12 12 8 8 12"/><line x1="12" y1="16" x2="12" y2="8"/></svg>
+          <h2 id="updateModalTitle">版本信息与更新指南</h2>
+        </div>
         <button class="btn-xs btn-ghost" aria-label="关闭弹窗" data-click="closeUpdateModal">✕</button>
       </div>
-      <div class="modal-body" id="updateModalBody" style="font-size:12.5px;line-height:1.6;"></div>
-      <div class="modal-foot">
-        <button class="btn-xs" id="recheckVersionBtn" type="button">重新检查更新</button>
-        <button class="btn-solid" data-click="closeUpdateModal">关闭</button>
+      <div class="modal-body" id="updateModalBody" style="gap:14px;"></div>
+      <div class="modal-foot" style="justify-content:space-between;align-items:center;">
+        <a id="updateReleaseLink" class="upd-ext-link" href="#" target="_blank" rel="noopener" style="display:none;">
+          <span>GitHub Release</span>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+        </a>
+        <div style="display:flex;align-items:center;gap:8px;margin-left:auto;">
+          <button id="recheckVersionBtn" type="button">重新检查更新</button>
+          <button class="btn-solid" data-click="closeUpdateModal">关闭</button>
+        </div>
       </div>
     </div>
   </div>
@@ -1559,6 +1710,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     let clientKeysCache = [];
     let editingCkId = null;
     const ckPickedModels = new Set();
+    let cachedVersionInfo = null;
 
     const $ = (id) => document.getElementById(id);
 
@@ -1571,6 +1723,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "多账号调度、亲和性与熔断策略": "Routing, Sticky Affinity & Circuit Breakers",
       "对齐 CPA 生产级路由机制，修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist to .env",
       "保存路由配置": "Save Routing",
+      "内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto Defensive Rephrase on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
+      "默认关闭。开启后，仅当上游返回 content_filtered 且尚未向客户端输出正文时，由辅助模型将最后一条用户提问自动重述为防御性工程措辞，并死守用户请求的原模型重试 1 次（热会话优先使用原生 edit_message 分支保留前文缓存，绝不降级偷换主回答模型）。": "Off by default. When enabled, ONLY if upstream returns content_filtered before any answer text is emitted, a lightweight helper model rephrases the latest user prompt into defensive engineering phrasing and retries once on the exact same user-requested model (using native edit_message on warm threads; never downgrading the answering model).",
+      "防御性重述提示词模板与辅助模型 (CONTENT_FILTER_REPHRASE_PROMPT)": "Defensive Rephrase Prompt Template & Helper Model (CONTENT_FILTER_REPHRASE_PROMPT)",
+      "仅用于重述被误拦的提问本身，绝不替代最终回答模型；留空或点击「恢复默认」将使用内置模板。": "Used strictly to rephrase the blocked prompt, never to replace the answering model. Leave empty or click Reset to use the built-in template.",
+      "恢复默认": "Reset Default",
 
       "输入管理员访问密码以解锁多账号调度、模型权限、实时日志与额度中心。": "Enter the admin password to unlock account pool routing, model access, live logs, and quota telemetry.",
       "管理员密码": "Admin password",
@@ -1765,7 +1922,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "已选 0 项": "0 picked",
       "仅勾 Auto 免费池": "Auto Pool Only",
       "全选": "Select All",
-      "保存网关密钥配置": "Save Sub-Key"
+      "保存网关密钥配置": "Save Sub-Key",
+      "版本信息与更新指南": "Version & Updates",
+      "重新检查更新": "Check Updates"
     };
 
 
@@ -1917,6 +2076,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       if (openTraceDetail) renderDrawerContent();
       if (modelsCatalogCache.length) renderModelsTable();
       if (clientKeysCache.length) renderClientKeysTable();
+      if (cachedVersionInfo) {
+        updateVersionPill(cachedVersionInfo);
+        if ($("updateModal") && $("updateModal").classList.contains("open")) renderUpdateModal(cachedVersionInfo);
+      }
       if ($("appShell").style.display !== "none") showConsole();
     }
 
@@ -2630,6 +2793,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         '</div>' +
         (s.lastSyncError ? '<div style="font-size:10.5px;color:var(--err);margin-top:3px;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(s.lastSyncError) + '">' + esc(tr("最近同步失败: ", "Sync failed: ") + s.lastSyncError) + '</div>' : '');
     };
+    const buildQuotaCellWithRefreshHtml = (s, isSyncing) =>
+      '<div class="quota-cell-wrap"><div class="quota-cell-main">' + buildCompactQuotaHtml(s, isSyncing) + '</div>' +
+        '<button type="button" class="quota-refresh-btn' + (isSyncing ? ' is-spinning' : '') + '" data-click="syncOneQuota" data-arg="' + esc(s.slotId) + '"' + (isSyncing ? ' disabled' : '') + ' title="' + esc(tr("刷新该账号额度（额度恢复后将自动解除熔断）", "Refresh quota for this account only")) + '" aria-label="' + esc(tr("刷新该账号额度", "Refresh account quota")) + '">' +
+          '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>' +
+        '</button></div>';
 
     function renderAll(data) {
       lastConsoleData = data;
@@ -2663,7 +2831,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             (s.autoDisabledReason ? '<div style="font-size:10.5px;color:' + (s.autoDisabledKind === 'quota' ? 'var(--warn)' : 'var(--err)') + ';margin-top:3px;max-width:165px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="' + esc(s.autoDisabledReason) + '">' + esc(formatShortDisableReason(s.autoDisabledReason, s.autoDisabledKind, s.autoRecoverAt)) + '</div>' : '') +
           '</td>' +
           '<td title="' + esc(tr("凭证指纹: ", "Key: ") + s.maskedKey) + '">' + buildAccountInfoHtml(s) + '</td>' +
-          '<td>' + buildCompactQuotaHtml(s, isSyncing) + '</td>' +
+          '<td>' + buildQuotaCellWithRefreshHtml(s, isSyncing) + '</td>' +
           '<td class="mono" style="font-size:11.5px;">' +
             '<div>' + esc(tr('调度 ', 'Req ') + fmt(s.totalSelected) + ' · 429: ' + fmt(s.rateLimitHits) + ' · ' + tr('会话 ', 'Sess ') + (typeof s.cloudSessionCount === 'number' ? s.cloudSessionCount : '—')) + '</div>' +
             '<div style="color:var(--fg-muted);font-size:11px;margin-top:2px;">' + esc(tr('粘性 ', 'Sticky ') + fmt(s.stickySessions) + tr(' · 命中 ', ' · Hits ') + fmt(s.affinityHits)) + '</div>' +
@@ -2685,6 +2853,23 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       window.__activeCustomAgentPrompt = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
       if ($("cfgCustomAgentPrompt")) {
         $("cfgCustomAgentPrompt").value = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
+      }
+      window.__defaultContentFilterRephrasePrompt = settings.defaultContentFilterRephrasePrompt || "";
+      const rephraseOn = settings.autoRephraseOnContentFilter === true;
+      if ($("cfgAutoRephraseOnContentFilter")) {
+        $("cfgAutoRephraseOnContentFilter").checked = rephraseOn;
+      }
+      if ($("cfgRephrasePromptWrap")) {
+        $("cfgRephrasePromptWrap").style.display = rephraseOn ? "flex" : "none";
+      }
+      if ($("cfgContentFilterRephrasePrompt")) {
+        $("cfgContentFilterRephrasePrompt").value =
+          settings.contentFilterRephrasePrompt || settings.defaultContentFilterRephrasePrompt || "";
+      }
+      if ($("cfgContentFilterRephraseModel")) {
+        $("cfgContentFilterRephraseModel").value =
+          settings.contentFilterRephraseModel || settings.defaultContentFilterRephraseModel || "quick-fast";
+        syncSelectUi($("cfgContentFilterRephraseModel"));
       }
 
       $("affinityTableBody").innerHTML = affinities.length ? affinities.map((a) =>
@@ -2758,28 +2943,46 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       });
       return list;
     }
+    function isCredFilterActive() {
+      const kw = ($("credSearchInput") ? $("credSearchInput").value : "").trim();
+      const st = $("credStatusFilter") ? $("credStatusFilter").value : "all";
+      return kw.length > 0 || (st && st !== "all");
+    }
+    function getCredSyncBtnText(filteredLen) {
+      if (selectedCredIds.size > 0) {
+        return tr("同步所选 (" + selectedCredIds.size + ")", "Sync Selected (" + selectedCredIds.size + ")");
+      }
+      if (isCredFilterActive()) {
+        const cnt = typeof filteredLen === "number" ? filteredLen : getFilteredCreds().length;
+        return tr("同步当前筛选 (" + cnt + ")", "Sync Filtered (" + cnt + ")");
+      }
+      return tr("同步最新额度", "Sync Quotas");
+    }
 
     function renderCredTable() {
       const filtered = getFilteredCreds();
+      const filterActive = isCredFilterActive();
       const validIds = new Set(poolSlotsCache.map((s) => s.slotId));
       for (const id of [...selectedCredIds]) { if (!validIds.has(id)) selectedCredIds.delete(id); }
       if ($("credSelSummary")) {
         $("credSelSummary").textContent = tr("已选 ", "") + selectedCredIds.size + tr(" 项（显示 ", " selected (") + filtered.length + "/" + poolSlotsCache.length + tr("）", ")");
       }
       if ($("credSyncQuotaBtn") && !$("credSyncQuotaBtn").disabled) {
-        $("credSyncQuotaBtn").textContent = selectedCredIds.size > 0
-          ? tr("同步所选 (" + selectedCredIds.size + ")", "Sync Selected (" + selectedCredIds.size + ")")
-          : tr("同步最新额度", "Sync Quotas");
+        $("credSyncQuotaBtn").textContent = getCredSyncBtnText(filtered.length);
       }
       if ($("credBatchRecheckBtn") && !$("credBatchRecheckBtn").disabled) {
         $("credBatchRecheckBtn").textContent = selectedCredIds.size > 0
           ? tr("批量检测 (" + selectedCredIds.size + ")", "Batch Check (" + selectedCredIds.size + ")")
-          : tr("批量检测", "Batch Check");
+          : (filterActive
+            ? tr("检测筛选 (" + filtered.length + ")", "Check Filtered (" + filtered.length + ")")
+            : tr("批量检测", "Batch Check"));
       }
       if ($("credClearSessionsBtn") && !$("credClearSessionsBtn").disabled) {
         $("credClearSessionsBtn").textContent = selectedCredIds.size > 0
           ? tr("清理所选会话 (" + selectedCredIds.size + ")", "Clear Sessions (" + selectedCredIds.size + ")")
-          : tr("清理会话", "Clear Sessions");
+          : (filterActive
+            ? tr("清理筛选会话 (" + filtered.length + ")", "Clear Filtered (" + filtered.length + ")")
+            : tr("清理会话", "Clear Sessions"));
       }
       if ($("credSelectAllCb")) {
         $("credSelectAllCb").checked = filtered.length > 0 && filtered.every((s) => selectedCredIds.has(s.slotId));
@@ -2794,7 +2997,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<td><input type="checkbox" ' + checked + ' data-change="toggleCredSelect" data-arg="' + esc(s.slotId) + '" /></td>' +
           '<td><label class="switch"><input type="checkbox" ' + (s.enabled ? 'checked' : '') + ' data-change="toggleKey" data-arg="' + esc(s.slotId) + '" /><span class="slider"></span></label></td>' +
           '<td title="' + esc(tr("凭证指纹: ", "Key: ") + s.maskedKey) + '">' + buildAccountInfoHtml(s) + '</td>' +
-          '<td>' + buildCompactQuotaHtml(s, isSyncing) + '</td>' +
+          '<td>' + buildQuotaCellWithRefreshHtml(s, isSyncing) + '</td>' +
           '<td title="' + esc(addedTitle) + '" style="white-space:nowrap;">' +
             '<div style="font-size:12px;font-weight:500;">' + esc(fmtRelTime(s.addedAt)) + '</div>' +
             '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;">' + esc(fmtShortDate(s.addedAt)) + '</div>' +
@@ -2928,11 +3131,15 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     if ($("credBatchDeleteBtn")) $("credBatchDeleteBtn").onclick = () => void runCredBatch("delete");
     if ($("credBatchRecheckBtn")) {
       $("credBatchRecheckBtn").onclick = async () => {
-        const abnormalIds = poolSlotsCache.filter((s) => !s.enabled || s.lastSyncError || s.cooldownRemainingMs > 0).map((s) => s.slotId);
+        const filterActive = isCredFilterActive();
+        const scopeSlots = filterActive ? getFilteredCreds() : poolSlotsCache;
+        const abnormalIds = scopeSlots.filter((s) => !s.enabled || s.lastSyncError || s.cooldownRemainingMs > 0).map((s) => s.slotId);
         const ids = selectedCredIds.size > 0
           ? [...selectedCredIds]
-          : (abnormalIds.length ? abnormalIds : poolSlotsCache.map((s) => s.slotId));
-        if (!ids.length) return notify(tr("当前没有可检测的凭证。", "No credentials to check."), true);
+          : (abnormalIds.length ? abnormalIds : scopeSlots.map((s) => s.slotId));
+        if (!ids.length) {
+          return notify(filterActive ? tr("当前筛选结果为空，没有可检测的凭证。", "No matching credentials to check.") : tr("当前没有可检测的凭证。", "No credentials to check."), true);
+        }
         const btn = $("credBatchRecheckBtn");
         btn.disabled = true;
         ids.forEach((id) => busySyncIds.add(id));
@@ -3027,6 +3234,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               : (r.execMode ? '<span class="tag" style="font-size:10.5px;">' + esc(execModeLabel(r.execMode)) + '</span>' : '');
 
         const badges = [];
+        if (r.contentFilterRecovered) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("防误拦重述", "Rephrased")) + '</span>');
         if (r.usedProxy) badges.push('<span class="tag">' + esc(tr("代理", "Proxy")) + '</span>');
         if (r.hasThinking) badges.push('<span class="tag">' + esc(tr("思考", "Thinking")) + '</span>');
         if (r.emittedToolCallsCount > 0) badges.push('<span class="tag">' + esc(tr("调工具×", "Tools ×")) + r.emittedToolCallsCount + '</span>');
@@ -3132,6 +3340,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           row(esc(tr('客户端', 'Client')), esc(d.client || '—')) +
           row('User-Agent', esc(d.userAgent || '—')) +
           row(esc(tr('结束原因', 'Stop Reason')), esc(d.stopReason || '—')) +
+          (d.contentFilterRecovered ? row(esc(tr('内容过滤恢复', 'Content Filter Recovery')), esc(tr('已自动防御性重述恢复（同模型无降级）', 'Auto-recovered via defensive rephrase (same model)'))) : '') +
         '</div>' +
         (d.errorMessage ? '<div><span class="field-lbl" style="color:var(--err);">' + esc(tr('错误信息', 'Error Message')) + '</span><pre class="code-block mono" style="border-color:var(--err);color:var(--err);">' + esc(d.errorMessage) + '</pre></div>' : '') +
         '<div style="font-size:12px;color:var(--fg-muted);">' + esc(tr('指纹是单向短哈希，仅用于判断两次请求是否属于同一对话前缀，无法还原内容。', 'Hashes are one-way 8-char fingerprints used only to match conversation prefixes; content cannot be reconstructed.')) + '</div>';
@@ -3652,8 +3861,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       } finally {
         syncBtns.forEach((b) => {
           b.disabled = false;
-          if (b.id === "credSyncQuotaBtn" && selectedCredIds.size > 0) {
-            b.textContent = tr("同步所选 (" + selectedCredIds.size + ")", "Sync Selected (" + selectedCredIds.size + ")");
+          if (b.id === "credSyncQuotaBtn") {
+            b.textContent = getCredSyncBtnText();
           } else {
             b.textContent = tr("同步最新额度", "Sync Quotas");
           }
@@ -3742,12 +3951,19 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       b.onclick = async () => {
         const isCredBtn = b.id === "credSyncQuotaBtn";
         const selIds = isCredBtn ? [...selectedCredIds] : [];
-        const targetIds = selIds.length > 0 ? selIds : poolSlotsCache.map((s) => s.slotId);
+        const filterActive = isCredBtn && selIds.length === 0 && isCredFilterActive();
+        const filteredIds = filterActive ? getFilteredCreds().map((s) => s.slotId) : [];
+        if (filterActive && filteredIds.length === 0) {
+          notify(tr("当前筛选结果为空，没有可同步的凭证。", "No matching credentials to sync."), true);
+          return;
+        }
+        const explicitIds = selIds.length > 0 ? selIds : (filterActive ? filteredIds : []);
+        const targetIds = explicitIds.length > 0 ? explicitIds : poolSlotsCache.map((s) => s.slotId);
         targetIds.forEach((id) => busySyncIds.add(id));
         setCredPanelLoading();
         renderCredTable();
-        const qs = selIds.length > 0
-          ? ("?force=1&slotIds=" + encodeURIComponent(selIds.join(",")))
+        const qs = explicitIds.length > 0
+          ? ("?force=1&slotIds=" + encodeURIComponent(explicitIds.join(",")))
           : "?force=1";
         try {
           const data = await loadConsoleData(qs);
@@ -3797,6 +4013,42 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         notify(tr("凭证备注已更新。", "Credential label updated."));
         await loadConsoleData("");
       } catch (e) { notify(e.message, true); }
+    };
+
+    window.syncOneQuota = async (slotId) => {
+      if (!slotId || busySyncIds.has(slotId)) return;
+      busySyncIds.add(slotId);
+      setCredPanelLoading();
+      renderCredTable();
+      try {
+        const data = await loadConsoleData("?force=1&slotIds=" + encodeURIComponent(slotId));
+        if (!data) return;
+        const report = Array.isArray(data.accounts) ? data.accounts[0] : undefined;
+        if (report && report.status === "ok") {
+          const slot = (data.keyPool && Array.isArray(data.keyPool.slots) ? data.keyPool.slots : poolSlotsCache).find((s) => s.slotId === slotId);
+          const q = slot && slot.quota ? slot.quota : null;
+          const mPct = q && q.premiumApiPool && q.premiumApiPool.usedPercent != null
+            ? Number(q.premiumApiPool.usedPercent).toFixed(1) + "%"
+            : null;
+          const sPct = q && q.sessionPool && q.sessionPool.usedPercent != null
+            ? Math.round(Number(q.sessionPool.usedPercent)) + "%"
+            : null;
+          const summary = [
+            mPct ? tr("月度已用 " + mPct, "Monthly " + mPct) : null,
+            sPct ? tr("短时 " + sPct, "5h " + sPct) : null
+          ].filter(Boolean).join(" · ");
+          notify(summary ? tr("已刷新额度：", "Quota refreshed: ") + summary : tr("已刷新该账号额度。", "Account quota refreshed."));
+        } else {
+          const reason = String((report && report.error) || tr("未知错误", "Unknown error")).slice(0, 120);
+          notify(tr("刷新该账号额度失败：", "Failed to refresh account quota: ") + reason, true);
+        }
+      } catch (e) {
+        notify(e.message, true);
+      } finally {
+        busySyncIds.delete(slotId);
+        setCredPanelLoading();
+        renderCredTable();
+      }
     };
 
     window.recheckKey = async (slotId) => {
@@ -4464,29 +4716,38 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("credClearSessionsBtn").onclick = async () => {
         const btn = $("credClearSessionsBtn");
         const ids = [...selectedCredIds];
-        const totalCount = ids.length > 0 ? ids.length : poolSlotsCache.length;
-        if (!totalCount) return notify(tr("当前没有可清理的账号。", "No accounts available to clear."), true);
+        const filterActive = ids.length === 0 && isCredFilterActive();
+        const filteredIds = filterActive ? getFilteredCreds().map((s) => s.slotId) : [];
+        const explicitIds = ids.length > 0 ? ids : (filterActive ? filteredIds : []);
+        const totalCount = explicitIds.length > 0 ? explicitIds.length : (filterActive ? 0 : poolSlotsCache.length);
+        if (!totalCount) {
+          return notify(filterActive ? tr("当前筛选结果为空，没有可清理的账号。", "No matching accounts to clear.") : tr("当前没有可清理的账号。", "No accounts available to clear."), true);
+        }
         const ok = await uiConfirm({
           title: ids.length > 0
             ? tr("清理所选账号云端会话", "Clear Selected Cloud Sessions")
-            : tr("清理全部账号云端会话", "Clear All Cloud Sessions"),
+            : (filterActive
+              ? tr("清理当前筛选账号云端会话", "Clear Filtered Cloud Sessions")
+              : tr("清理全部账号云端会话", "Clear All Cloud Sessions")),
           desc: ids.length > 0
             ? tr("确认一键清理已勾选的 " + ids.length + " 个账号在 AWS Quick 云端的全部历史会话吗？此操作不可恢复。", "Clear all cloud chat sessions for the " + ids.length + " selected account(s)? This cannot be undone.")
-            : tr("未勾选账号，将默认清理全部 " + totalCount + " 个账号在 AWS Quick 云端的历史会话。确认继续吗？", "No accounts selected. Clear cloud chat sessions for all " + totalCount + " account(s)?"),
+            : (filterActive
+              ? tr("未勾选账号，将清理当前筛选展示的 " + totalCount + " 个账号在 AWS Quick 云端的全部历史会话。确认继续吗？", "No accounts selected. Clear cloud chat sessions for the " + totalCount + " filtered account(s)?")
+              : tr("未勾选账号，将默认清理全部 " + totalCount + " 个账号在 AWS Quick 云端的历史会话。确认继续吗？", "No accounts selected. Clear cloud chat sessions for all " + totalCount + " account(s)?")),
           okText: tr("确认清理", "Clear"),
           danger: true
         });
         if (!ok) return;
         btn.disabled = true;
         btn.textContent = tr("清理中...", "Clearing...");
-        const targetIds = ids.length > 0 ? ids : poolSlotsCache.map((s) => s.slotId);
+        const targetIds = explicitIds.length > 0 ? explicitIds : poolSlotsCache.map((s) => s.slotId);
         targetIds.forEach((id) => busyClearIds.add(id));
         setCredPanelLoading();
         renderCredTable();
         try {
           const r = await api("/v1/admin/keys/clear-cloud-sessions", {
             method: "POST",
-            body: JSON.stringify(ids.length > 0 ? { slotIds: ids } : {})
+            body: JSON.stringify(explicitIds.length > 0 ? { slotIds: explicitIds } : {})
           });
           const totalDeleted = Number(r.totalDeleted || 0);
           const okCount = Number(r.okCount || 0);
@@ -4516,9 +4777,6 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           targetIds.forEach((id) => busyClearIds.delete(id));
           setCredPanelLoading();
           btn.disabled = false;
-          btn.textContent = selectedCredIds.size > 0
-            ? tr("清理所选会话 (" + selectedCredIds.size + ")", "Clear Sessions (" + selectedCredIds.size + ")")
-            : tr("清理会话", "Clear Sessions");
           renderCredTable();
         }
       };
@@ -4550,10 +4808,39 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    if ($("cfgAutoRephraseOnContentFilter")) {
+      $("cfgAutoRephraseOnContentFilter").onchange = () => {
+        const on = $("cfgAutoRephraseOnContentFilter").checked;
+        if ($("cfgRephrasePromptWrap")) {
+          $("cfgRephrasePromptWrap").style.display = on ? "flex" : "none";
+        }
+        if (on && $("cfgContentFilterRephrasePrompt") && !$("cfgContentFilterRephrasePrompt").value.trim()) {
+          $("cfgContentFilterRephrasePrompt").value = window.__defaultContentFilterRephrasePrompt || "";
+        }
+      };
+    }
+
+    if ($("resetRephrasePromptBtn")) {
+      $("resetRephrasePromptBtn").onclick = () => {
+        if ($("cfgContentFilterRephrasePrompt")) {
+          $("cfgContentFilterRephrasePrompt").value = window.__defaultContentFilterRephrasePrompt || "";
+        }
+        if ($("cfgContentFilterRephraseModel")) {
+          $("cfgContentFilterRephraseModel").value = "quick-fast";
+          syncSelectUi($("cfgContentFilterRephraseModel"));
+        }
+      };
+    }
+
     $("saveRoutingBtn").onclick = async () => {
       try {
         const promptVal = $("cfgCustomAgentPrompt") ? $("cfgCustomAgentPrompt").value.trim() : "";
         const isBuiltInDefault = promptVal === (window.__defaultCustomAgentPrompt || "").trim();
+        const rephrasePromptVal = $("cfgContentFilterRephrasePrompt")
+          ? $("cfgContentFilterRephrasePrompt").value.trim()
+          : "";
+        const isBuiltInRephraseDefault =
+          rephrasePromptVal === (window.__defaultContentFilterRephrasePrompt || "").trim();
         await api("/v1/admin/settings", {
           method: "POST",
           body: JSON.stringify({
@@ -4563,7 +4850,14 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             autoDisableExhaustedKeys: $("cfgAutoDisable").checked,
             incognitoMode: $("cfgIncognitoMode") ? $("cfgIncognitoMode").checked : true,
             autoEnsureCodingAgent: $("cfgAutoEnsureCodingAgent") ? $("cfgAutoEnsureCodingAgent").checked : true,
-            customAgentPrompt: isBuiltInDefault ? "" : promptVal
+            customAgentPrompt: isBuiltInDefault ? "" : promptVal,
+            autoRephraseOnContentFilter: $("cfgAutoRephraseOnContentFilter")
+              ? $("cfgAutoRephraseOnContentFilter").checked
+              : false,
+            contentFilterRephrasePrompt: isBuiltInRephraseDefault ? "" : rephrasePromptVal,
+            contentFilterRephraseModel: $("cfgContentFilterRephraseModel")
+              ? $("cfgContentFilterRephraseModel").value
+              : "quick-fast"
           })
         });
         notify(tr("路由、粘性亲和与 Agent 模板策略已热更新生效。", "Routing, affinity, and agent template settings saved."));
@@ -4669,78 +4963,185 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       }
     })();
 
-    let cachedVersionInfo = null;
     window.closeUpdateModal = () => { if ($("updateModal")) $("updateModal").classList.remove("open"); };
+    function formatUpdateInlineMd(escapedText) {
+      return escapedText
+        .replace(/\\x60([^\\x60]+)\\x60/g, '<code class="upd-inline-code">$1</code>')
+        .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+        .replace(/\\[([^\\]]+)\\]\\((https?:\\/\\/[^)\\s]+)\\)/g, '<a href="$2" target="_blank" rel="noopener" style="color:var(--ok);text-decoration:underline;">$1</a>');
+    }
+    function renderReleaseNotesMd(rawMd) {
+      const lines = String(rawMd || "").replace(/\\r\\n/g, "\\n").split("\\n");
+      const out = [];
+      let inList = false;
+      const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) { closeList(); continue; }
+        const h2 = /^##\\s+(.+)$/.exec(trimmed);
+        if (h2) {
+          closeList();
+          out.push('<div class="upd-md-h2">' + formatUpdateInlineMd(esc(h2[1])) + '</div>');
+          continue;
+        }
+        const h3 = /^###\\s+(.+)$/.exec(trimmed);
+        if (h3) {
+          closeList();
+          out.push('<div class="upd-md-h3">' + formatUpdateInlineMd(esc(h3[1])) + '</div>');
+          continue;
+        }
+        const li = /^(\\s*)[-*]\\s+(.+)$/.exec(line);
+        if (li) {
+          if (!inList) { out.push('<ul class="upd-md-ul">'); inList = true; }
+          const isSub = li[1].length >= 2;
+          out.push('<li class="upd-md-li' + (isSub ? ' is-sub' : '') + '">' + formatUpdateInlineMd(esc(li[2])) + '</li>');
+          continue;
+        }
+        closeList();
+        out.push('<p class="upd-md-p">' + formatUpdateInlineMd(esc(trimmed)) + '</p>');
+      }
+      closeList();
+      return out.join("");
+    }
+    function updateVersionPill(v) {
+      const btn = $("versionPillBtn");
+      if (!btn || !v) return;
+      btn.style.display = "inline-flex";
+      if (v.hasUpdate && v.latestVersion) {
+        btn.className = "version-pill has-update";
+        btn.innerHTML = '<span class="version-pill-dot"></span><span>' + esc(tr("新版本", "New")) + '</span><span class="mono">v' + esc(v.latestVersion) + '</span>';
+      } else {
+        btn.className = "version-pill mono";
+        btn.innerHTML = '<span>v' + esc(v.currentVersion) + '</span>';
+      }
+      btn.onclick = () => {
+        renderUpdateModal(cachedVersionInfo);
+        $("updateModal").classList.add("open");
+      };
+    }
     function renderUpdateModal(v) {
       if (!$("updateModalBody") || !v) return;
-      const lines = [];
-      lines.push('<div><strong>' + esc(tr('当前版本：', 'Current version: ')) + '</strong><span class="mono">v' + esc(v.currentVersion) + '</span></div>');
-      if (v.repo) {
-        lines.push('<div><strong>' + esc(tr('GitHub 仓库：', 'GitHub repo: ')) + '</strong><span class="mono">' + esc(v.repo) + '</span></div>');
-        if (v.latestVersion) {
-          lines.push('<div><strong>' + esc(tr('最新版本：', 'Latest release: ')) + '</strong><span class="mono" style="color:' + (v.hasUpdate ? 'var(--ok)' : 'var(--fg)') + ';">v' + esc(v.latestVersion) + '</span>' +
-            (v.hasUpdate ? ' <span class="tag tag-ok">' + esc(tr('有可用更新', 'Update Available')) + '</span>' : ' <span class="tag">' + esc(tr('已是最新', 'Up to date')) + '</span>') + '</div>');
-        }
+      const parts = [];
+      const checkedStr = v.checkedAt ? new Date(v.checkedAt).toLocaleTimeString([], { hour12: false }) : "";
+      const hasUpd = Boolean(v.hasUpdate && v.latestVersion);
+      const repoUrl = v.repo ? ("https://github.com/" + encodeURI(v.repo)) : "";
+
+      // 1. Version comparison hero card
+      let heroHtml = '<div class="upd-hero' + (hasUpd ? ' is-update' : '') + '"><div class="upd-ver-row"><div class="upd-ver-pair">';
+      heroHtml += '<div class="upd-ver-box"><span class="upd-ver-lbl">' + esc(tr("当前版本", "Current")) + '</span><span class="upd-ver-num mono">v' + esc(v.currentVersion) + '</span></div>';
+      if (v.repo && v.latestVersion) {
+        heroHtml += '<span class="upd-arrow" aria-hidden="true">→</span>';
+        heroHtml += '<div class="upd-ver-box"><span class="upd-ver-lbl">' + esc(tr("最新版本", "Latest")) + '</span><span class="upd-ver-num mono' + (hasUpd ? ' is-ok' : '') + '">v' + esc(v.latestVersion) + '</span></div>';
+      }
+      heroHtml += '</div>';
+      if (v.repo && v.latestVersion) {
+        heroHtml += hasUpd
+          ? '<span class="tag tag-ok">' + esc(tr("有可用更新", "Update Available")) + '</span>'
+          : '<span class="tag">' + esc(tr("已是最新", "Up to date")) + '</span>';
+      } else if (v.repo) {
+        heroHtml += '<span class="tag">' + esc(tr("未获取到版本", "Check Failed")) + '</span>';
       } else {
-        lines.push('<div style="color:var(--fg-muted);">' + esc(tr('已通过 UPDATE_CHECK_REPO=off 关闭 GitHub Releases 版本检测。移除该配置即可恢复默认检测。', 'GitHub Releases check is disabled via UPDATE_CHECK_REPO=off. Remove it to re-enable.')) + '</div>');
+        heroHtml += '<span class="tag">' + esc(tr("检测已关闭", "Disabled")) + '</span>';
       }
+      heroHtml += '</div>';
+      heroHtml += '<div class="upd-meta-row">';
+      if (v.repo) {
+        heroHtml += '<a class="upd-repo-link mono" href="' + esc(repoUrl) + '" target="_blank" rel="noopener">' +
+          '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.57.11.78-.25.78-.55 0-.27-.01-1.17-.02-2.12-3.2.69-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.76 2.69 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.28 1.18-3.08-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.17 1.18a11 11 0 0 1 5.78 0c2.2-1.49 3.17-1.18 3.17-1.18.62 1.58.23 2.75.11 3.04.73.8 1.18 1.83 1.18 3.08 0 4.41-2.69 5.39-5.25 5.67.41.36.78 1.06.78 2.14 0 1.54-.01 2.79-.01 3.17 0 .31.21.67.79.55A11.5 11.5 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5Z"/></svg>' +
+          '<span>' + esc(v.repo) + '</span></a>';
+      } else {
+        heroHtml += '<span>' + esc(tr("已通过 UPDATE_CHECK_REPO=off 关闭检测", "Disabled via UPDATE_CHECK_REPO=off")) + '</span>';
+      }
+      if (checkedStr) {
+        heroHtml += '<span class="mono">' + esc(tr("检查于 ", "Checked ") + checkedStr) + '</span>';
+      }
+      heroHtml += '</div></div>';
+      parts.push(heroHtml);
+
+      // 2. Rendered release notes
       if (v.releaseNotes) {
-        lines.push('<div style="margin-top:8px;"><strong>' + esc(tr('更新日志：', 'Release Notes:')) + '</strong><pre class="code-block mono" style="max-height:180px;overflow:auto;white-space:pre-wrap;">' + esc(v.releaseNotes) + '</pre></div>');
+        parts.push('<div class="upd-sec"><div class="upd-sec-hdr"><span>' + esc(tr("更新日志", "Release Notes")) + '</span>' +
+          (v.latestVersion ? '<span class="upd-sec-hint mono">v' + esc(v.latestVersion) + '</span>' : '') +
+          '</div><div class="upd-notes-box">' + renderReleaseNotesMd(v.releaseNotes) + '</div></div>');
       }
-      lines.push('<div style="margin-top:10px;"><div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;"><strong>' + esc(tr('升级命令参考：', 'Upgrade Commands:')) + '</strong>' +
-        '<div style="display:flex;gap:6px;">' +
-        '<button type="button" class="btn btn-sm" id="copyDockerUpgradeBtn">' + esc(tr('复制 Docker 升级命令', 'Copy Docker Upgrade')) + '</button>' +
-        '<button type="button" class="btn btn-sm" id="copySourceUpgradeBtn">' + esc(tr('复制源码升级命令', 'Copy Source Upgrade')) + '</button>' +
-        '</div></div>' +
-        '<pre class="code-block mono" style="margin-top:6px;"># Docker\\ndocker compose pull && docker compose up -d\\n\\n# Source\\ngit pull && npm ci && npm run build</pre></div>');
-      if (v.releaseUrl && (String(v.releaseUrl).startsWith("https://") || String(v.releaseUrl).startsWith("http://"))) {
-        lines.push('<div style="margin-top:6px;"><a href="' + esc(v.releaseUrl) + '" target="_blank" rel="noopener" style="color:var(--cta-bg);text-decoration:underline;">' + esc(tr('前往 GitHub Release 页面查看详情 →', 'View on GitHub Releases →')) + '</a></div>');
+
+      // 3. Clean single-line upgrade command rows + lossless upgrade guarantee
+      const dockerCmd = "docker compose pull && docker compose up -d";
+      const sourceCmd = "git pull && npm ci && npm run build";
+      parts.push('<div class="upd-sec"><div class="upd-sec-hdr"><span>' + esc(tr("升级方式", "Upgrade Commands")) + '</span>' +
+        '<span class="upd-sec-hint">' + esc(tr("点击右侧按钮复制并在部署目录执行", "Copy and run in your deploy directory")) + '</span></div>' +
+        '<div class="upd-cmd-list">' +
+          '<div class="upd-cmd-row"><span class="upd-cmd-tag">Docker</span><code class="upd-cmd-code mono">' + esc(dockerCmd) + '</code>' +
+            '<button type="button" class="btn-xs" id="copyDockerUpgradeBtn">' + esc(tr("复制", "Copy")) + '</button></div>' +
+          '<div class="upd-cmd-row"><span class="upd-cmd-tag">' + esc(tr("源码", "Source")) + '</span><code class="upd-cmd-code mono">' + esc(sourceCmd) + '</code>' +
+            '<button type="button" class="btn-xs" id="copySourceUpgradeBtn">' + esc(tr("复制", "Copy")) + '</button></div>' +
+        '</div>' +
+        '<div style="margin-top:8px;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--bg-soft);font-size:12px;line-height:1.55;color:var(--fg-muted);">' +
+          '<strong style="color:var(--ok);">' + esc(tr("无损升级说明：", "Lossless Upgrade: ")) + '</strong>' +
+          esc(tr("只要保留部署目录中的 ", "Keep ")) + '<code class="mono">.env</code>' + esc(tr(" 和 ", " and ")) + '<code class="mono">data/</code>' +
+          esc(tr("，已导入账号、子密钥、用量账本和后台设置均会自动保留，无需重新配置（源码升级完成后重启服务即可）。从 v0.1.15 及更早 Docker 版本升级时，首次前执行一次 ", " intact—all imported accounts, sub-keys, usage ledger, and settings are preserved automatically (restart the service after a source build). Upgrading from Docker <= v0.1.15? Run ")) +
+          '<code class="mono">chown -R 1000:1000 data .env</code>' + esc(tr(" 即可。", " once beforehand.")) +
+        '</div></div>');
+
+      $("updateModalBody").innerHTML = parts.join("");
+
+      const relLink = $("updateReleaseLink");
+      if (relLink) {
+        if (v.releaseUrl && (String(v.releaseUrl).startsWith("https://") || String(v.releaseUrl).startsWith("http://"))) {
+          relLink.href = v.releaseUrl;
+          relLink.style.display = "inline-flex";
+          const span = relLink.querySelector("span");
+          if (span) span.textContent = tr("前往 GitHub Release", "View on GitHub");
+        } else {
+          relLink.style.display = "none";
+        }
       }
-      $("updateModalBody").innerHTML = lines.join("");
-      const copyCmd = async (cmd, label) => {
+
+      const copyCmd = async (btnEl, cmd, label) => {
         try {
           await navigator.clipboard.writeText(cmd);
+          if (btnEl) {
+            const orig = btnEl.textContent;
+            btnEl.textContent = tr("已复制", "Copied");
+            setTimeout(() => { if (btnEl) btnEl.textContent = orig; }, 1600);
+          }
           notify(tr("已复制 " + label + " 升级命令，在服务器终端执行即可完成升级。", "Copied " + label + " upgrade command."));
         } catch {
           notify(tr("复制失败，请手动复制下方命令。", "Copy failed, please copy manually."), true);
         }
       };
       if ($("copyDockerUpgradeBtn")) {
-        $("copyDockerUpgradeBtn").onclick = () => void copyCmd("docker compose pull && docker compose up -d", "Docker");
+        $("copyDockerUpgradeBtn").onclick = () => void copyCmd($("copyDockerUpgradeBtn"), dockerCmd, "Docker");
       }
       if ($("copySourceUpgradeBtn")) {
-        $("copySourceUpgradeBtn").onclick = () => void copyCmd("git pull && npm ci && npm run build", tr("源码", "Source"));
+        $("copySourceUpgradeBtn").onclick = () => void copyCmd($("copySourceUpgradeBtn"), sourceCmd, tr("源码", "Source"));
       }
     }
     async function checkAppVersion(force) {
+      const recheckBtn = $("recheckVersionBtn");
+      if (force && recheckBtn) {
+        recheckBtn.disabled = true;
+        recheckBtn.innerHTML = '<span class="inline-spin"></span> ' + esc(tr("检查中...", "Checking..."));
+      }
       try {
         const v = await api("/v1/admin/version" + (force ? "?force=1" : ""));
         cachedVersionInfo = v;
         if ($("sidebarBrandVer") && v.currentVersion) {
           $("sidebarBrandVer").textContent = "v" + v.currentVersion;
         }
-        const btn = $("versionPillBtn");
-        if (btn) {
-          btn.style.display = "inline-flex";
-          if (v.hasUpdate && v.latestVersion) {
-            btn.style.color = "var(--ok)";
-            btn.style.borderColor = "var(--ok)";
-            btn.textContent = tr("新版本 v", "New v") + v.latestVersion;
-          } else {
-            btn.style.color = "";
-            btn.style.borderColor = "";
-            btn.textContent = "v" + v.currentVersion;
-          }
-          btn.onclick = () => {
-            renderUpdateModal(cachedVersionInfo);
-            $("updateModal").classList.add("open");
-          };
-        }
+        updateVersionPill(v);
         if (force && $("updateModal").classList.contains("open")) {
           renderUpdateModal(v);
           notify(v.hasUpdate ? tr("发现新版本 v" + v.latestVersion, "Update available: v" + v.latestVersion) : tr("当前已是最新版本。", "You are up to date."));
         }
-      } catch {}
+      } catch {
+        if (force) notify(tr("检查更新失败，请稍后重试。", "Failed to check for updates."), true);
+      } finally {
+        if (force && recheckBtn) {
+          recheckBtn.disabled = false;
+          recheckBtn.textContent = tr("重新检查更新", "Check Updates");
+        }
+      }
     }
     if ($("recheckVersionBtn")) {
       $("recheckVersionBtn").onclick = () => void checkAppVersion(true);

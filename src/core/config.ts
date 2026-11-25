@@ -185,6 +185,12 @@ export function loadConfigFromEnv(
     customAgentPrompt: env.CUSTOM_AGENT_PROMPT
       ? env.CUSTOM_AGENT_PROMPT.replace(/\\n/g, "\n").trim() || undefined
       : undefined,
+    autoRephraseOnContentFilter: parseBoolEnv(env.AUTO_REPHRASE_ON_CONTENT_FILTER, false),
+    contentFilterRephrasePrompt: env.CONTENT_FILTER_REPHRASE_PROMPT
+      ? env.CONTENT_FILTER_REPHRASE_PROMPT.replace(/\\n/g, "\n").trim() || undefined
+      : undefined,
+    contentFilterRephraseModel:
+      env.CONTENT_FILTER_REPHRASE_MODEL?.trim() === "quick-balanced" ? "quick-balanced" : "quick-fast",
     keyChatAgentIds: parseKeyLabels(env.KEY_CHAT_AGENT_IDS),
     keyAddedAt: parseKeyAddedAt(env.KEY_ADDED_AT),
     keyAutoDisabled: parseKeyAutoDisabled(env.KEY_AUTO_DISABLED),
@@ -287,6 +293,9 @@ export function persistPoolConfigToEnvFile(
     incognitoMode?: boolean;
     autoEnsureCodingAgent?: boolean;
     customAgentPrompt?: string;
+    autoRephraseOnContentFilter?: boolean;
+    contentFilterRephrasePrompt?: string;
+    contentFilterRephraseModel?: string;
   }
 ): void {
   if (!envFilePath || !existsSync(envFilePath)) return;
@@ -312,6 +321,15 @@ export function persistPoolConfigToEnvFile(
       : {}),
     ...(typeof state.customAgentPrompt === "string"
       ? { CUSTOM_AGENT_PROMPT: stripEnvNewlines(state.customAgentPrompt.replace(/\r?\n/g, "\\n")) }
+      : {}),
+    ...(typeof state.autoRephraseOnContentFilter === "boolean"
+      ? { AUTO_REPHRASE_ON_CONTENT_FILTER: String(state.autoRephraseOnContentFilter) }
+      : {}),
+    ...(typeof state.contentFilterRephrasePrompt === "string"
+      ? { CONTENT_FILTER_REPHRASE_PROMPT: stripEnvNewlines(state.contentFilterRephrasePrompt.replace(/\r?\n/g, "\\n")) }
+      : {}),
+    ...(typeof state.contentFilterRephraseModel === "string"
+      ? { CONTENT_FILTER_REPHRASE_MODEL: stripEnvNewlines(state.contentFilterRephraseModel) }
       : {})
   };
   const seen = new Set<string>();

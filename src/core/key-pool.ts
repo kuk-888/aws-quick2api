@@ -115,6 +115,9 @@ export interface PoolRoutingSettings {
   incognitoMode: boolean;
   autoEnsureCodingAgent: boolean;
   customAgentPrompt?: string;
+  autoRephraseOnContentFilter: boolean;
+  contentFilterRephrasePrompt?: string;
+  contentFilterRephraseModel: string;
   chatAgentId?: string;
 }
 
@@ -209,6 +212,9 @@ export class UpstreamKeyPool {
   private incognitoMode: boolean;
   private autoEnsureCodingAgent: boolean;
   private customAgentPrompt?: string;
+  private autoRephraseOnContentFilter: boolean;
+  private contentFilterRephrasePrompt?: string;
+  private contentFilterRephraseModel: string;
   private chatAgentId?: string;
   private rrIndex = 0;
 
@@ -228,7 +234,16 @@ export class UpstreamKeyPool {
     | "incognitoMode"
     | "envFilePath"
     | "dataDir"
-  > & Partial<Pick<GatewayConfig, "chatAgentId" | "keyChatAgentIds" | "autoEnsureCodingAgent" | "customAgentPrompt">> & {
+  > & Partial<Pick<
+    GatewayConfig,
+    | "chatAgentId"
+    | "keyChatAgentIds"
+    | "autoEnsureCodingAgent"
+    | "customAgentPrompt"
+    | "autoRephraseOnContentFilter"
+    | "contentFilterRephrasePrompt"
+    | "contentFilterRephraseModel"
+  >> & {
     maxInflightPerSlot?: number;
   }) {
     this.baseCooldownMs = config.keyCooldownMs;
@@ -240,6 +255,10 @@ export class UpstreamKeyPool {
     this.incognitoMode = config.incognitoMode !== false;
     this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
     this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
+    this.autoRephraseOnContentFilter = config.autoRephraseOnContentFilter === true;
+    this.contentFilterRephrasePrompt = config.contentFilterRephrasePrompt?.trim() || undefined;
+    this.contentFilterRephraseModel =
+      config.contentFilterRephraseModel?.trim() === "quick-balanced" ? "quick-balanced" : "quick-fast";
     this.chatAgentId = config.chatAgentId?.trim() || undefined;
     this.envFilePath = config.envFilePath;
     if (config.dataDir) {
@@ -406,7 +425,10 @@ export class UpstreamKeyPool {
       autoDisableExhaustedKeys: this.autoDisableExhaustedKeys,
       incognitoMode: this.incognitoMode,
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
-      customAgentPrompt: this.customAgentPrompt ?? ""
+      customAgentPrompt: this.customAgentPrompt ?? "",
+      autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
+      contentFilterRephrasePrompt: this.contentFilterRephrasePrompt ?? "",
+      contentFilterRephraseModel: this.contentFilterRephraseModel
     });
   }
 
@@ -419,6 +441,9 @@ export class UpstreamKeyPool {
       incognitoMode: this.incognitoMode,
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
       ...(this.customAgentPrompt ? { customAgentPrompt: this.customAgentPrompt } : {}),
+      autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
+      ...(this.contentFilterRephrasePrompt ? { contentFilterRephrasePrompt: this.contentFilterRephrasePrompt } : {}),
+      contentFilterRephraseModel: this.contentFilterRephraseModel,
       ...(this.chatAgentId ? { chatAgentId: this.chatAgentId } : {})
     };
   }
@@ -443,6 +468,15 @@ export class UpstreamKeyPool {
     }
     if (typeof patch.customAgentPrompt === "string") {
       this.customAgentPrompt = patch.customAgentPrompt.trim().slice(0, 4000) || undefined;
+    }
+    if (typeof patch.autoRephraseOnContentFilter === "boolean") {
+      this.autoRephraseOnContentFilter = patch.autoRephraseOnContentFilter;
+    }
+    if (typeof patch.contentFilterRephrasePrompt === "string") {
+      this.contentFilterRephrasePrompt = patch.contentFilterRephrasePrompt.trim().slice(0, 4000) || undefined;
+    }
+    if (patch.contentFilterRephraseModel === "quick-fast" || patch.contentFilterRephraseModel === "quick-balanced") {
+      this.contentFilterRephraseModel = patch.contentFilterRephraseModel;
     }
     if (typeof patch.chatAgentId === "string") {
       this.chatAgentId = validateChatAgentId(patch.chatAgentId);

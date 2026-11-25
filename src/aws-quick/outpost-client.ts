@@ -211,7 +211,7 @@ export class OutpostHandle {
             path: 'profile/usage',
             queryParams: {
               surfaceType: 'QUICK_WORK_DESKTOP_MAC',
-              appVersion: '1.2.4660',
+              appVersion: '1.2.4757',
               _method: 'GET',
             },
             body: {},
@@ -249,7 +249,7 @@ export class OutpostHandle {
             path: 'api/ws-rpc',
             queryParams: {
               surfaceType: 'QUICK_WORK_DESKTOP_MAC',
-              appVersion: '1.2.4660',
+              appVersion: '1.2.4757',
               _method: 'POST',
             },
             body: {

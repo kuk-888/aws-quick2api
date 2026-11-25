@@ -35,6 +35,8 @@ export interface RequestTraceSummary {
   maskedKey?: string;
   execMode?: ExecutionModeTag;
   usedProxy?: boolean;
+  /** Metadata-only boolean: true when the turn hit upstream content_filtered and recovered via defensive rephrase. Never holds prompt text. */
+  contentFilterRecovered?: boolean;
   ttftMs: number | null;
   durationMs: number | null;
   toolCount: number;
@@ -146,7 +148,7 @@ export class RequestTraceLogger {
 
   bindExecutionMeta(
     traceId: string | null,
-    meta: { slotId?: string; maskedKey: string; accountLabel?: string; execMode: ExecutionModeTag; usedProxy?: boolean }
+    meta: { slotId?: string; maskedKey: string; accountLabel?: string; execMode: ExecutionModeTag; usedProxy?: boolean; contentFilterRecovered?: boolean }
   ): void {
     if (!traceId) return;
     const rec = this.records.get(traceId);
@@ -156,6 +158,7 @@ export class RequestTraceLogger {
     if (meta.accountLabel) rec.accountLabel = meta.accountLabel;
     rec.execMode = meta.execMode;
     if (meta.usedProxy) rec.usedProxy = true;
+    if (meta.contentFilterRecovered) rec.contentFilterRecovered = true;
     if (meta.execMode === "parked_tool_resume") {
       rec.upstreamSentChars = Math.max(4, rec.toolResumeDeltaChars);
     } else if (meta.execMode === "warm_incremental") {

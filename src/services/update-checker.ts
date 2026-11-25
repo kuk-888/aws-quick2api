@@ -91,7 +91,7 @@ export async function checkLatestVersion(force = false): Promise<VersionCheckRes
       hasUpdate,
       repo,
       releaseUrl: data.html_url || `https://github.com/${repo}/releases`,
-      releaseNotes: data.body ? data.body.slice(0, 1200) : null,
+      releaseNotes: data.body ? data.body.slice(0, 3000) : null,
       checkedAt: new Date(now).toISOString(),
     };
     cachedAtMs = now;

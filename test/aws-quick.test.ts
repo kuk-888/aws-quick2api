@@ -280,6 +280,64 @@ describe("Credential parser & ClientKeyStore", () => {
     const match = /<script nonce="test-nonce">([\s\S]*?)<\/script>/.exec(html);
     assert.ok(match && match[1], "dashboard inline script tag should exist");
     assert.doesNotThrow(() => new vm.Script(match[1]!));
+
+    const els = new Map<string, Record<string, unknown>>();
+    const makeEl = (id = ""): Record<string, unknown> => ({
+      id,
+      style: {},
+      classList: { add() {}, remove() {}, contains() { return false; }, toggle() {} },
+      setAttribute() {},
+      getAttribute() { return null; },
+      hasAttribute() { return false; },
+      addEventListener() {},
+      removeEventListener() {},
+      focus() {},
+      querySelector() { return makeEl(); },
+      querySelectorAll() { return []; },
+      appendChild() {},
+      insertBefore() {},
+      children: [],
+      options: [{ textContent: "all", value: "all" }],
+      selectedIndex: 0,
+      parentNode: { insertBefore() {}, removeChild() {} },
+      textContent: "",
+      value: id === "credStatusFilter" ? "all" : "",
+      innerHTML: "",
+      getBoundingClientRect() { return { left: 0, top: 0, bottom: 0, right: 0, width: 100, height: 30 }; },
+    });
+    const ctx: Record<string, unknown> = {
+      location: { pathname: "/dashboard", origin: "http://localhost:3456", search: "" },
+      navigator: { language: "zh-CN", clipboard: { writeText: async () => {} } },
+      localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+      sessionStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+      document: {
+        documentElement: { lang: "zh-CN", setAttribute() {}, getAttribute() { return "light"; } },
+        getElementById(id: string) { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); },
+        querySelector() { return makeEl(); },
+        querySelectorAll() { return []; },
+        createElement(tag: string) { return makeEl(tag); },
+        createElementNS() { return makeEl(); },
+        createTreeWalker() { return { nextNode() { return null; } }; },
+        addEventListener() {},
+        body: makeEl("body"),
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      fetch: async () => ({ ok: false, status: 401, json: async () => ({}) }),
+      setTimeout: () => 0,
+      clearTimeout() {},
+      setInterval: () => 0,
+      clearInterval() {},
+      Event: class {},
+      NodeFilter: { SHOW_TEXT: 4 },
+      console, Date, Math, JSON, Number, String, Boolean, Array, Object, Set, Map, Promise, RegExp, encodeURI, encodeURIComponent,
+    };
+    ctx.window = ctx;
+    assert.doesNotThrow(() => vm.runInNewContext(match[1]!, ctx));
+    assert.equal((ctx.isCredFilterActive as () => boolean)(), false);
+    els.get("credStatusFilter")!.value = "healthy";
+    assert.equal((ctx.isCredFilterActive as () => boolean)(), true);
+    assert.equal(typeof ctx.syncOneQuota, "function");
   });
 
   it("enforces one-time initial admin password setup and min length", () => {
@@ -1823,5 +1881,505 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
     assert.equal(resolveModelSelection("quick-smart", { reasoning: { effort: "max" } }).selection.thinkingEffort, "max");
     assert.equal(resolveModelSelection("quick-fast", { reasoning_effort: "max" }).selection.thinkingEffort, "off");
     assert.equal(resolveKnownModelId("quick-smart-max"), "quick-smart");
+  });
+
+  it("parses PDF/document/file blocks across all 3 protocols, isolates incremental files, and uploads binary attachments cleanly", async () => {
+    const { estimateAnthropicTokens, parseAnthropicMessagesRequest } = await import("../src/protocols/anthropic.js");
+    const { parseChatCompletionsRequest, parseResponsesRequest } = await import("../src/protocols/openai.js");
+    const { uploadOAuthBinaryAttachment } = await import("../src/aws-quick/oauth-client.js");
+    const { fetchViaOptionalProxy } = await import("../src/utils/proxy-agent.js");
+
+    const fakePdf = Buffer.from("%PDF-1.4\n1 0 obj\n<<>>\nendobj\n", "utf8");
+    const pdfB64 = fakePdf.toString("base64");
+
+    // 1. Anthropic `document` (base64 PDF + text + token estimation)
+    const anthBody = {
+      model: "quick-smart",
+      max_tokens: 128,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "document", title: "spec.pdf", source: { type: "base64", media_type: "application/pdf", data: pdfB64 } },
+            { type: "document", title: "notes.txt", source: { type: "text", data: "hello plain doc" } },
+            { type: "text", text: "Summarize spec.pdf" },
+          ],
+        },
+      ],
+    };
+    const anthTurn = parseAnthropicMessagesRequest(anthBody);
+    assert.equal(anthTurn.files?.length, 1);
+    assert.equal(anthTurn.files?.[0]?.filename, "spec.pdf");
+    assert.equal(anthTurn.files?.[0]?.mimeType, "application/pdf");
+    assert.equal(anthTurn.files?.[0]?.data, pdfB64);
+    assert.ok(anthTurn.fullTranscriptText.includes("hello plain doc"));
+    assert.ok(estimateAnthropicTokens({ ...anthBody, messages: [{ role: "user", content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "A".repeat(100_000) } }] }] }) < 2_000);
+
+    // 2. OpenAI Chat `file` + OpenAI Responses `input_file` + `file_id` rejection
+    const oaiTurn = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "file", file: { filename: "report.pdf", file_data: `data:application/pdf;base64,${pdfB64}` } },
+            { type: "text", text: "Check report" },
+          ],
+        },
+      ],
+    });
+    assert.equal(oaiTurn.files?.length, 1);
+    assert.equal(oaiTurn.files?.[0]?.filename, "report.pdf");
+    assert.equal(oaiTurn.files?.[0]?.mimeType, "application/pdf");
+
+    const respTurn = parseResponsesRequest({
+      model: "quick-balanced",
+      input: [
+        {
+          role: "user",
+          content: [
+            { type: "input_file", filename: "remote.pdf", file_url: "https://example.com/remote.pdf" },
+            { type: "input_text", text: "Inspect remote.pdf" },
+          ],
+        },
+      ],
+    });
+    assert.equal(respTurn.files?.length, 1);
+    assert.equal(respTurn.files?.[0]?.url, "https://example.com/remote.pdf");
+
+    assert.throws(
+      () => parseResponsesRequest({
+        model: "quick-balanced",
+        input: [{ role: "user", content: [{ type: "input_file", file_id: "file-abc123" }] }],
+      }),
+      /file_id/,
+    );
+
+    // 3. Binary attachment upload pipeline (preserves exact bytes & mimeType)
+    const origFetch = globalThis.fetch;
+    const binaryPayload = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0xff]);
+    let uploadedBytes: Buffer | undefined;
+    let uploadedQuery = "";
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const u = String(input);
+      if (u.includes("upload-attachment")) {
+        uploadedQuery = new URL(u).search;
+        uploadedBytes = Buffer.isBuffer(init?.body) ? init.body : Buffer.from(init?.body as Uint8Array);
+        return new Response(JSON.stringify({ attachmentId: "att-bin-1" }), { status: 200 });
+      }
+      if (u.includes("attachment-dlp-status")) {
+        return new Response(JSON.stringify({ dlpJobStatus: "COMPLETED", policyAction: "ALLOW" }), { status: 200 });
+      }
+      if (u.includes("qbs-event")) {
+        return new Response(JSON.stringify({ eventResponse: { invokeAgentResponse: JSON.stringify({ body: JSON.stringify({ path: "/workspace/user_image_001.png" }) }) } }), { status: 200 });
+      }
+      throw new Error(`Unexpected fetch URL: ${u}`);
+    }) as typeof fetch;
+
+    try {
+      const att = await uploadOAuthBinaryAttachment(
+        {
+          clientId: "cid-1",
+          clientSecret: "csec-1",
+          refreshToken: "rt-1",
+          accessToken: "at-1",
+          expiresAt: Date.now() + 3600_000,
+          wsHost: "chat.quick.aws.com",
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+        },
+        "thread-123",
+        "user_image_001.png",
+        binaryPayload,
+        "image/png",
+      );
+      assert.equal(att.type, "image");
+      assert.equal(att.size, binaryPayload.byteLength);
+      assert.equal(att.mimeType, "image/png");
+      assert.equal(att.path, "/workspace/user_image_001.png");
+      assert.ok(uploadedQuery.includes("contentType=image%2Fpng"));
+      assert.ok(uploadedBytes && Buffer.compare(uploadedBytes, binaryPayload) === 0);
+
+      // Direct fetchViaOptionalProxy binary Buffer passthrough check
+      const proxyRes = await fetchViaOptionalProxy(
+        "https://chat.quick.aws.com/integration/quick-work/upload-attachment",
+        { method: "POST", body: binaryPayload },
+      );
+      assert.equal(proxyRes.ok, true);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // 4. Responses single-file placeholder, tool-result incrementalFiles, and upload error classification
+    const respFileOnly = parseResponsesRequest({
+      model: "quick-balanced",
+      input: [{ role: "user", content: [{ type: "input_file", filename: "only.pdf", file_data: pdfB64 }] }],
+    });
+    assert.equal(respFileOnly.fullTranscriptText, "[File: only.pdf]");
+
+    const chatToolFile = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      messages: [
+        { role: "user", content: "Run tool" },
+        { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "fetch_doc", arguments: "{}" } }] },
+        { role: "tool", tool_call_id: "c1", content: [{ type: "file", file: { filename: "tool_out.pdf", file_data: pdfB64 } }] },
+      ],
+    });
+    assert.equal(chatToolFile.incrementalFiles?.length, 1);
+    assert.equal(chatToolFile.incrementalFiles?.[0]?.filename, "tool_out.pdf");
+
+    const respToolFile = parseResponsesRequest({
+      model: "quick-balanced",
+      input: [
+        { role: "user", content: "Run tool" },
+        { type: "function_call", call_id: "c1", name: "fetch_doc", arguments: "{}" },
+        { type: "function_call_output", call_id: "c1", output: [{ type: "input_file", filename: "resp_tool.pdf", file_data: pdfB64 }] },
+      ],
+    });
+    assert.equal(respToolFile.incrementalFiles?.length, 1);
+    assert.equal(respToolFile.incrementalFiles?.[0]?.filename, "resp_tool.pdf");
+
+    const { classifyUpstreamError, mapAttachmentUploadError } = await import("../src/core/engine.js");
+    const err429 = mapAttachmentUploadError(new Error("upload-attachment failed (429)"), "Upload failed");
+    assert.equal(err429.status, 429);
+    assert.equal(classifyUpstreamError(err429).isRateLimitErr, true);
+    const err401 = mapAttachmentUploadError(new Error("attachment-dlp-status failed (401)"), "Upload failed");
+    assert.equal(err401.status, 401);
+    assert.equal(classifyUpstreamError(err401).isAuthErr, true);
+    const errOidcGrant = mapAttachmentUploadError(new Error('OIDC refresh_token failed (400): {"error":"invalid_grant"}'), "Upload failed");
+    assert.equal(classifyUpstreamError(errOidcGrant).isAuthErr, true);
+    const errDlp = mapAttachmentUploadError(new Error("Attachment blocked by AWS Quick DLP policy (BLOCK)."), "Upload failed");
+    assert.equal(errDlp.status, 400);
+    assert.equal(errDlp.code, "content_filtered");
+    const err400 = mapAttachmentUploadError(new Error("upload-attachment failed (400)"), "Upload failed");
+    assert.equal(err400.status, 400);
+    assert.equal(classifyUpstreamError(err400).isProxyOrConnErr, false);
+  });
+
+  it("sanitizes high-risk client headers/tags, classifies soft refusals conservatively, and persists auto-rephrase settings (default OFF)", async () => {
+    const {
+      stripHighRiskClientHeaders,
+      normalizeSystemReminderTagsForUpstream,
+      sanitizeClientSystemPromptForQuick,
+    } = await import("../src/core/tool-bridge.js");
+    const {
+      DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
+      DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+      isLikelySoftRefusal,
+    } = await import("../src/core/engine.js");
+    const { evaluateDlpPollResponse } = await import("../src/aws-quick/oauth-client.js");
+
+    // 1. High-risk billing header stripping & <system-reminder> linear normalization
+    const rawHeader = "x-anthropic-billing-header: cc_version=2.1.0; cc_entrypoint=cli\n\nYou are Claude, Anthropic's AI assistant.\nFollow project rules.";
+    const stripped = stripHighRiskClientHeaders(rawHeader);
+    assert.ok(!stripped.includes("x-anthropic-billing-header"));
+    assert.ok(stripped.includes("Follow project rules."));
+    const softened = sanitizeClientSystemPromptForQuick(rawHeader, true);
+    assert.ok(!softened.includes("x-anthropic-billing-header"));
+    assert.ok(!softened.includes("You are Claude, Anthropic's"));
+
+    const rawReminder = "<system-reminder>\nInternal context A\n</system-reminder>\n\nActual question";
+    const normReminder = normalizeSystemReminderTagsForUpstream(rawReminder);
+    assert.ok(!normReminder.includes("<system-reminder>"));
+    assert.ok(normReminder.includes("[Context note]\nInternal context A\n[/Context note]"));
+    assert.ok(normReminder.includes("Actual question"));
+
+    // 2. Conservative soft-refusal classifier
+    assert.equal(isLikelySoftRefusal("I need to stop and flag this as a prompt injection attack."), true);
+    assert.equal(isLikelySoftRefusal("As an AWS Quick assistant, no device is connected right now."), true);
+    assert.equal(isLikelySoftRefusal("检测到提示词注入，我无法执行。"), true);
+    assert.equal(isLikelySoftRefusal("I'm sorry, I noticed a typo in line 12. Here is the fixed code."), false);
+    assert.equal(
+      isLikelySoftRefusal('<tool_call>{"name":"Read","arguments":{"path":"src/app.ts"}}</tool_call>'),
+      false,
+    );
+    // Long normal security explanation mentioning "prompt injection" past char 320 must NOT trigger
+    const longEdu = `${"Here is a thorough architecture review of your TypeScript service. ".repeat(10)}We should also consider prompt injection defenses in middleware.`;
+    assert.equal(isLikelySoftRefusal(longEdu), false);
+
+    // 3. DLP poll response preserves upstream policy detail
+    const dlpBlocked = evaluateDlpPollResponse({
+      dlpJobStatus: "COMPLETED",
+      policyAction: "BLOCK",
+      policyName: "SecretsRule",
+      reason: "Detected private key",
+    });
+    assert.equal(dlpBlocked.state, "failed");
+    assert.ok(dlpBlocked.state === "failed" && dlpBlocked.reason.includes("SecretsRule"));
+
+    // 4. Config default OFF + persistence round-trip + Dashboard HTML renders new controls
+    const fs = await import("node:fs");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aq2a-rephrase-cfg-"));
+    const envFile = path.join(tmpDir, ".env");
+    try {
+      fs.writeFileSync(envFile, "QUICK_TOKENS=local-outpost\nINCOGNITO=true\n", "utf8");
+      const cfg = loadConfigFromEnv({ QUICK_TOKENS: "local-outpost", INCOGNITO: "true" }, envFile);
+      assert.equal(cfg.autoRephraseOnContentFilter, false);
+      assert.equal(cfg.contentFilterRephrasePrompt, undefined);
+      assert.equal(cfg.contentFilterRephraseModel, DEFAULT_CONTENT_FILTER_REPHRASE_MODEL);
+      assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("defensive"));
+
+      const pool = new UpstreamKeyPool(cfg);
+      assert.equal(pool.getSettings().autoRephraseOnContentFilter, false);
+      pool.updateSettings({
+        autoRephraseOnContentFilter: true,
+        contentFilterRephrasePrompt: "Rule 1\nRule 2",
+        contentFilterRephraseModel: "quick-balanced",
+      });
+      assert.equal(pool.getSettings().autoRephraseOnContentFilter, true);
+      assert.equal(pool.getSettings().contentFilterRephrasePrompt, "Rule 1\nRule 2");
+      assert.equal(pool.getSettings().contentFilterRephraseModel, "quick-balanced");
+
+      const envContent = fs.readFileSync(envFile, "utf8");
+      assert.ok(envContent.includes("AUTO_REPHRASE_ON_CONTENT_FILTER=true"));
+      assert.ok(envContent.includes("CONTENT_FILTER_REPHRASE_PROMPT=Rule 1\\nRule 2"));
+      assert.ok(envContent.includes("CONTENT_FILTER_REPHRASE_MODEL=quick-balanced"));
+
+      const reloaded = loadConfigFromEnv(
+        {
+          QUICK_TOKENS: "local-outpost",
+          AUTO_REPHRASE_ON_CONTENT_FILTER: "true",
+          CONTENT_FILTER_REPHRASE_PROMPT: "Rule 1\\nRule 2",
+          CONTENT_FILTER_REPHRASE_MODEL: "quick-balanced",
+        },
+        envFile,
+      );
+      assert.equal(reloaded.autoRephraseOnContentFilter, true);
+      assert.equal(reloaded.contentFilterRephrasePrompt, "Rule 1\nRule 2");
+      assert.equal(reloaded.contentFilterRephraseModel, "quick-balanced");
+
+      const html = renderDashboardHtml("/dashboard", "test-nonce");
+      assert.ok(html.includes("cfgAutoRephraseOnContentFilter"));
+      assert.ok(html.includes("cfgContentFilterRephrasePrompt"));
+      assert.ok(html.includes("cfgContentFilterRephraseModel"));
+      assert.ok(html.includes("resetRephrasePromptBtn"));
+      assert.ok(html.includes("无损升级说明"));
+      assert.ok(html.includes("防误拦重述"));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers from content_filtered via native edit_message warm branch without downgrading model, preserves Turn 3 warm_incremental, and logs zero-content recovery metadata", async () => {
+    const { WebSocket, WebSocketServer } = await import("ws");
+    const { encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+    const { serializeOAuthCredential } = await import("../src/aws-quick/oauth-client.js");
+    const { QuickExecutionEngine } = await import("../src/core/engine.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+
+    const sendCloudOutput = (ws: import("ws").WebSocket, ev: Record<string, unknown>) => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+      ws.send(
+        encodeEventStream(
+          { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+          payload,
+        ),
+      );
+    };
+
+    const receivedFrames: Array<{ connIdx: number; type: string; payload: Record<string, unknown> }> = [];
+    const dialedUrls: string[] = [];
+    let nextConnIdx = 0;
+
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => wss.once("listening", resolve));
+    const addr = wss.address();
+    assert.ok(addr && typeof addr === "object");
+    const mockPort = addr.port;
+
+    wss.on("connection", (ws, req) => {
+      const u = new URL(req.url || "/", `http://127.0.0.1:${mockPort}`);
+      const connIdx = Number(u.searchParams.get("connIdx") || "0");
+      sendCloudOutput(ws, { type: "connected", payload: { user: { email: "mock@example.com" } } });
+
+      ws.on("message", (raw) => {
+        const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+        const b64 = outer.payload?.payload;
+        if (!b64) return;
+        const inner = JSON.parse(Buffer.from(b64, "base64").toString("utf8")) as {
+          type?: string;
+          payload?: Record<string, unknown>;
+        };
+        const type = String(inner.type || "");
+        const payload = inner.payload || {};
+        if (type === "ping") return;
+        if (type === "session_connect") {
+          sendCloudOutput(ws, { type: "session_established", payload: {} });
+          return;
+        }
+        if (type !== "user_message" && type !== "edit_message") return;
+        receivedFrames.push({ connIdx, type, payload });
+
+        if (type === "user_message") {
+          const mode = String(payload.agent_mode || "");
+          const text = String(payload.text || "");
+          const tid = String(payload.thread_id || "");
+          if (mode === "fast") {
+            sendCloudOutput(ws, { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-haiku-5-5" } });
+            sendCloudOutput(ws, { type: "text_delta", payload: { delta: "Explain parameterized SQL queries for defensive hardening." } });
+            sendCloudOutput(ws, { type: "turn_usage", payload: { input_tokens: 40, output_tokens: 12, cache_read_tokens: 0, cache_write_tokens: 0, resolved_model_id: "us.anthropic.claude-haiku-5-5" } });
+            sendCloudOutput(ws, { type: "message_complete", thread_id: tid, payload: {} });
+          } else if (text.includes("TRIGGER_CONTENT_FILTER")) {
+            sendCloudOutput(ws, {
+              type: "error",
+              thread_id: tid,
+              payload: { error_code: "content_filtered", error: "Output blocked by upstream content filter" },
+            });
+          } else if (tid === "branch-mock1234") {
+            sendCloudOutput(ws, { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+            sendCloudOutput(ws, { type: "text_delta", payload: { delta: "Project code is ORION-8821." } });
+            sendCloudOutput(ws, { type: "turn_usage", payload: { input_tokens: 30, output_tokens: 10, cache_read_tokens: 1200, cache_write_tokens: 0, resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+            sendCloudOutput(ws, { type: "message_complete", thread_id: tid, payload: {} });
+          } else {
+            sendCloudOutput(ws, { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+            sendCloudOutput(ws, { type: "text_delta", payload: { delta: "Acknowledged ORION-8821." } });
+            sendCloudOutput(ws, { type: "turn_usage", payload: { input_tokens: 60, output_tokens: 8, cache_read_tokens: 0, cache_write_tokens: 60, resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+            sendCloudOutput(ws, { type: "message_complete", thread_id: tid, payload: {} });
+          }
+        } else if (type === "edit_message") {
+          const tid = String(payload.thread_id || "");
+          sendCloudOutput(ws, { type: "tree_sync", thread_id: tid, payload: { kernel_thread_id: "branch-mock1234", thread_id: tid } });
+          sendCloudOutput(ws, { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+          sendCloudOutput(ws, { type: "text_delta", payload: { delta: "Use parameterized queries to prevent SQL injection." } });
+          sendCloudOutput(ws, { type: "turn_usage", payload: { input_tokens: 50, output_tokens: 16, cache_read_tokens: 900, cache_write_tokens: 0, resolved_model_id: "us.anthropic.claude-opus-5-5" } });
+          sendCloudOutput(ws, { type: "message_complete", thread_id: "branch-mock1234", payload: { kernel_thread_id: "branch-mock1234" } });
+        }
+      });
+    });
+
+    const mockOAuthKey = serializeOAuthCredential({
+      clientId: "mock-client-id-rephrase",
+      clientSecret: "mock-client-secret",
+      refreshToken: "mock-refresh-token",
+      accessToken: "mock-valid-access-token",
+      expiresAt: Date.now() + 3_600_000,
+      wsHost: "api.us-east-1.quick.aws.com",
+      region: "us-east-1",
+      issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+    });
+
+    const cfg = loadConfigFromEnv({
+      QUICK_TOKENS: mockOAuthKey,
+      INCOGNITO: "true",
+      AUTO_ENSURE_CODING_AGENT: "false",
+      AUTO_REPHRASE_ON_CONTENT_FILTER: "true",
+      CONTENT_FILTER_REPHRASE_MODEL: "quick-fast",
+    });
+    const pool = new UpstreamKeyPool(cfg);
+    const usage = new UsageTracker();
+    const traceLogger = new RequestTraceLogger();
+    const engine = new QuickExecutionEngine({
+      config: cfg,
+      usageTracker: usage,
+      webSocketFactory: (url) => {
+        dialedUrls.push(url);
+        const idx = nextConnIdx++;
+        return new WebSocket(`ws://127.0.0.1:${mockPort}/?connIdx=${idx}`);
+      },
+    });
+
+    const runTurn = async (messages: Array<{ role: string; content: string }>) => {
+      const turn = parseChatCompletionsRequest({ model: "quick-smart", stream: true, messages }, { "x-session-id": "mock-conv-1" });
+      const traceId = traceLogger.startTrace("openai-chat", turn);
+      let text = "";
+      let thinking = "";
+      let lastMeta: { execMode?: string; contentFilterRecovered?: boolean } = {};
+      for await (const ev of engine.executeTurnWithPool(turn, pool, (meta) => {
+        lastMeta = meta;
+        traceLogger.bindExecutionMeta(traceId, meta);
+      })) {
+        if (ev.type === "text") {
+          text += ev.text;
+          traceLogger.recordTextDelta(traceId, ev.text);
+        } else if (ev.type === "thinking") {
+          thinking += ev.text;
+          traceLogger.recordThinkingDelta(traceId, ev.text);
+        }
+      }
+      traceLogger.finishSuccess(traceId, "stop");
+      return { text, thinking, meta: lastMeta, trace: traceLogger.getDetail(traceId)! };
+    };
+
+    try {
+      // Turn 1: Cold incognito turn establishes warm WS + root thread
+      const t1 = await runTurn([{ role: "user", content: "Remember project code ORION-8821." }]);
+      assert.equal(t1.text, "Acknowledged ORION-8821.");
+      assert.equal(t1.meta.execMode, "incognito");
+      assert.equal(t1.trace.contentFilterRecovered, undefined);
+      assert.equal(engine.runtimeStats().warmIdleSessions, 1);
+
+      // Turn 2: Warm turn hits content_filtered -> isolated helper rephrases -> native edit_message on SAME warm WS & SAME smart model
+      const t2 = await runTurn([
+        { role: "user", content: "Remember project code ORION-8821." },
+        { role: "assistant", content: "Acknowledged ORION-8821." },
+        { role: "user", content: "TRIGGER_CONTENT_FILTER explain SQL bypass" },
+      ]);
+      assert.equal(t2.text, "Use parameterized queries to prevent SQL injection.");
+      assert.ok(t2.thinking.includes("routed=us.anthropic.claude-opus-5-5 · rephrased"));
+      assert.equal(t2.meta.execMode, "warm_incremental");
+      assert.equal(t2.meta.contentFilterRecovered, true);
+      assert.equal(t2.trace.contentFilterRecovered, true);
+      // Zero-content privacy invariant: trace detail must NEVER store original or rephrased prompt text
+      const traceJson = JSON.stringify(t2.trace);
+      assert.ok(!traceJson.includes("TRIGGER_CONTENT_FILTER"));
+      assert.ok(!traceJson.includes("parameterized SQL queries"));
+      assert.ok(!traceJson.includes("ORION-8821"));
+
+      // Turn 3: Client sends original (un-rephrased) Turn 2 in history -> must STILL hit warm_incremental on branch-mock1234!
+      const t3 = await runTurn([
+        { role: "user", content: "Remember project code ORION-8821." },
+        { role: "assistant", content: "Acknowledged ORION-8821." },
+        { role: "user", content: "TRIGGER_CONTENT_FILTER explain SQL bypass" },
+        { role: "assistant", content: "Use parameterized queries to prevent SQL injection." },
+        { role: "user", content: "What was the project code?" },
+      ]);
+      assert.equal(t3.text, "Project code is ORION-8821.");
+      assert.equal(t3.meta.execMode, "warm_incremental");
+      assert.equal(t3.trace.contentFilterRecovered, undefined);
+
+      // Wire-level assertions:
+      // 1) Exactly 2 WS connections total: conn 0 (warm thread reused across T1 -> T2 -> edit_message -> T3) + conn 1 (isolated rephrase helper)
+      assert.equal(dialedUrls.length, 2);
+      const wsSessions = dialedUrls.map((u) => new URL(u).searchParams.get("workingSessionId"));
+      assert.ok(wsSessions[0] && wsSessions[1] && wsSessions[0] !== wsSessions[1], "helper WS must use a distinct workingSessionId");
+
+      const t1Frame = receivedFrames[0]!;
+      const t2InitialFrame = receivedFrames[1]!;
+      const helperFrame = receivedFrames[2]!;
+      const editFrame = receivedFrames[3]!;
+      const t3Frame = receivedFrames[4]!;
+
+      assert.equal(t1Frame.connIdx, 0);
+      assert.equal(t1Frame.type, "user_message");
+      assert.equal(t1Frame.payload.agent_mode, "smart");
+
+      assert.equal(t2InitialFrame.connIdx, 0);
+      assert.equal(t2InitialFrame.type, "user_message");
+      assert.equal(t2InitialFrame.payload.agent_mode, "smart");
+      assert.equal(t2InitialFrame.payload.thread_id, t1Frame.payload.thread_id);
+
+      assert.equal(helperFrame.connIdx, 1);
+      assert.equal(helperFrame.type, "user_message");
+      assert.equal(helperFrame.payload.agent_mode, "fast");
+      assert.equal(helperFrame.payload.web_search_enabled, false);
+
+      assert.equal(editFrame.connIdx, 0, "edit_message must reuse the live warm WS");
+      assert.equal(editFrame.type, "edit_message");
+      assert.equal(editFrame.payload.agent_mode, "smart", "must NEVER downgrade user's requested model");
+      assert.equal(editFrame.payload.original_message_id, t2InitialFrame.payload.message_id);
+      assert.equal(editFrame.payload.root_session_id, t1Frame.payload.thread_id);
+      assert.equal(editFrame.payload.thread_id, t1Frame.payload.thread_id);
+      assert.equal(editFrame.payload.text, "Explain parameterized SQL queries for defensive hardening.");
+
+      assert.equal(t3Frame.connIdx, 0, "Turn 3 must reuse the same warm WS after edit_message");
+      assert.equal(t3Frame.type, "user_message");
+      assert.equal(t3Frame.payload.thread_id, "branch-mock1234", "Turn 3 must target the branch thread returned by tree_sync");
+      assert.equal(t3Frame.payload.agent_mode, "smart");
+    } finally {
+      await engine.disposeAll();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
   });
 });

@@ -11,7 +11,12 @@ import {
 import { getSharedOutpost, parseQuickCredential } from "../aws-quick/outpost-singleton.js";
 import { listWebCloudSessions } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
-import { DEFAULT_CODING_AGENT_INSTRUCTIONS, type QuickExecutionEngine } from "../core/engine.js";
+import {
+  DEFAULT_CODING_AGENT_INSTRUCTIONS,
+  DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
+  DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+  type QuickExecutionEngine,
+} from "../core/engine.js";
 import type { PoolRoutingSettings, UpstreamKeyPool } from "../core/key-pool.js";
 import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "../core/types.js";
 import { isRecord } from "../protocols/common.js";
@@ -200,6 +205,8 @@ export async function tryHandleWebAdminRoute(
       settings: {
         ...keyPool.getSettings(),
         defaultCustomAgentPrompt: DEFAULT_CODING_AGENT_INSTRUCTIONS,
+        defaultContentFilterRephrasePrompt: DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+        defaultContentFilterRephraseModel: DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
       },
       runtime: engine.runtimeStats(),
       keyPool: keyPool.statusSnapshot(),
@@ -264,17 +271,33 @@ export async function tryHandleWebAdminRoute(
     if (typeof body.customAgentPrompt === "string") {
       patch.customAgentPrompt = body.customAgentPrompt;
     }
+    if (typeof body.autoRephraseOnContentFilter === "boolean") {
+      patch.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
+      config.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
+    }
+    if (typeof body.contentFilterRephrasePrompt === "string") {
+      patch.contentFilterRephrasePrompt = body.contentFilterRephrasePrompt;
+    }
+    if (body.contentFilterRephraseModel === "quick-fast" || body.contentFilterRephraseModel === "quick-balanced") {
+      patch.contentFilterRephraseModel = body.contentFilterRephraseModel;
+      config.contentFilterRephraseModel = body.contentFilterRephraseModel;
+    }
     if (typeof body.chatAgentId === "string") {
       patch.chatAgentId = body.chatAgentId;
     }
     keyPool.updateSettings(patch);
     config.chatAgentId = keyPool.getSettings().chatAgentId;
     config.customAgentPrompt = keyPool.getSettings().customAgentPrompt;
+    config.autoRephraseOnContentFilter = keyPool.getSettings().autoRephraseOnContentFilter;
+    config.contentFilterRephrasePrompt = keyPool.getSettings().contentFilterRephrasePrompt;
+    config.contentFilterRephraseModel = keyPool.getSettings().contentFilterRephraseModel;
     sendJson(res, 200, {
       ok: true,
       settings: {
         ...keyPool.getSettings(),
         defaultCustomAgentPrompt: DEFAULT_CODING_AGENT_INSTRUCTIONS,
+        defaultContentFilterRephrasePrompt: DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+        defaultContentFilterRephraseModel: DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
       },
     });
     return true;

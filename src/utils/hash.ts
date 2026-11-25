@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import type { NormalizedImage } from "../core/types.js";
+import type { NormalizedFile, NormalizedImage } from "../core/types.js";
 
 const SECRET_REDACTION_PATTERNS: Array<[RegExp, string]> = [
   [/\bsk-aq-[A-Za-z0-9_-]{6,}\b/g, "sk-aq-[REDACTED]"],
@@ -58,6 +58,15 @@ function imagesDigest(images: readonly NormalizedImage[]): string {
   return h.digest("hex").slice(0, 16);
 }
 
+function filesDigest(files: readonly NormalizedFile[]): string {
+  if (!files.length) return "";
+  const h = crypto.createHash("sha256");
+  for (const f of files) {
+    h.update(f.url ? `u:${f.filename}:${f.mimeType}:${f.url}` : `d:${f.filename}:${f.mimeType}:${f.data || ""}`).update("\0");
+  }
+  return h.digest("hex").slice(0, 16);
+}
+
 export function normalizeSystemPromptForHash(systemPrompt: string): string {
   if (!systemPrompt) return "";
   return systemPrompt
@@ -113,6 +122,7 @@ export interface HashableDialogItem {
   role: "user" | "assistant" | "tool";
   text: string;
   images: NormalizedImage[];
+  files?: NormalizedFile[];
   hasTools: boolean;
   toolCalls?: HashableToolCallRef[];
   formattedLine?: string;
@@ -123,6 +133,7 @@ export interface ComputedDialogPrefix {
   currentInputPrefixHash?: string;
   incrementalUserText?: string;
   incrementalImages?: NormalizedImage[];
+  incrementalFiles?: NormalizedFile[];
 }
 
 type LogicalDialogGroup =
@@ -184,6 +195,7 @@ export function computeDialogPrefixHashes(params: {
   let priorPrefixHash: string | undefined;
   let incrementalUserText: string | undefined;
   let incrementalImages: NormalizedImage[] | undefined;
+  let incrementalFiles: NormalizedFile[] | undefined;
 
   for (let i = 0; i < groups.length; i += 1) {
     const grp = groups[i]!;
@@ -197,20 +209,26 @@ export function computeDialogPrefixHashes(params: {
     const grpText = isPureSingleUser
       ? grp.items[0]!.text
       : grp.items
-          .map((it) => it.formattedLine || it.text)
-          .filter((s) => s.length > 0)
-          .join("\n\n");
+        .map((it) => it.formattedLine || it.text)
+        .filter((s) => s.length > 0)
+        .join("\n\n");
     const grpImages = grp.items.flatMap((it) => it.images);
+    const grpFiles = grp.items.flatMap((it) => it.files ?? []);
 
     if (i === groups.length - 1 && i > 0) {
       priorPrefixHash = runningHash;
       incrementalUserText = grpText;
       incrementalImages = grpImages;
+      incrementalFiles = grpFiles;
     }
 
-    runningHash = isPureSingleUser
-      ? computeConversationHash([runningHash, `USER:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`])
-      : computeConversationHash([runningHash, `INPUT:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`]);
+    const hashParts = isPureSingleUser
+      ? [runningHash, `USER:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`]
+      : [runningHash, `INPUT:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`];
+    if (grpFiles.length > 0) {
+      hashParts.push(`FILE:${filesDigest(grpFiles)}`);
+    }
+    runningHash = computeConversationHash(hashParts);
   }
 
   return {
@@ -218,5 +236,6 @@ export function computeDialogPrefixHashes(params: {
     currentInputPrefixHash: runningHash,
     ...(incrementalUserText !== undefined ? { incrementalUserText } : {}),
     ...(incrementalImages ? { incrementalImages } : {}),
+    ...(incrementalFiles && incrementalFiles.length > 0 ? { incrementalFiles } : {}),
   };
 }

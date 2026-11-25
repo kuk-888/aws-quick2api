@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import {
   GatewayError,
+  type NormalizedFile,
   type NormalizedImage,
   type NormalizedTool,
   type NormalizedToolCall,
@@ -13,12 +14,55 @@ import { computeDialogPrefixHashes, type HashableDialogItem } from "../utils/has
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
 import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
-function extractContentParts(content: unknown): { text: string; images: NormalizedImage[] } {
-  if (typeof content === "string") return { text: content, images: [] };
-  if (!Array.isArray(content)) return { text: "", images: [] };
+function inferFileMimeFromName(filename: string): string {
+  const lower = filename.trim().toLowerCase();
+  if (lower.endsWith(".pdf")) return "application/pdf";
+  if (lower.endsWith(".json")) return "application/json";
+  if (lower.endsWith(".md")) return "text/markdown";
+  if (lower.endsWith(".csv")) return "text/csv";
+  if (lower.endsWith(".html") || lower.endsWith(".htm")) return "text/html";
+  if (lower.endsWith(".txt") || lower.endsWith(".log") || lower.endsWith(".yaml") || lower.endsWith(".yml")) {
+    return "text/plain";
+  }
+  return "application/octet-stream";
+}
+
+function parseOpenAiFileObject(src: Record<string, unknown>, fileIndex: number): NormalizedFile {
+  const rawName = typeof src.filename === "string" && src.filename.trim() ? src.filename.trim() : "";
+  const rawUrl = typeof src.file_url === "string" && src.file_url.trim() ? src.file_url.trim() : "";
+  const rawData = typeof src.file_data === "string" && src.file_data.trim() ? src.file_data.trim() : "";
+
+  if (rawData) {
+    const dataMatch = /^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s.exec(rawData);
+    if (dataMatch) {
+      const mimeType = (dataMatch[1] || "").trim().toLowerCase() || inferFileMimeFromName(rawName || "file.pdf");
+      const filename = rawName || `file_${fileIndex + 1}.${mimeType === "application/pdf" ? "pdf" : "bin"}`;
+      return { filename, mimeType, data: (dataMatch[2] || "").replace(/\s+/g, "") };
+    }
+    const filename = rawName || `file_${fileIndex + 1}.pdf`;
+    return { filename, mimeType: inferFileMimeFromName(filename), data: rawData.replace(/\s+/g, "") };
+  }
+  if (rawUrl && /^https?:\/\//i.test(rawUrl)) {
+    const filename = rawName || `file_${fileIndex + 1}.pdf`;
+    return { filename, mimeType: inferFileMimeFromName(filename), url: rawUrl };
+  }
+  if (typeof src.file_id === "string" && src.file_id.trim()) {
+    throw new GatewayError(
+      "Unsupported `file_id` reference: this stateless gateway does not host OpenAI `/v1/files`. Send inline `file_data` (base64/data URL) or `file_url` instead.",
+      400,
+      "invalid_request_error",
+    );
+  }
+  throw new GatewayError("Invalid `file` / `input_file` block: `file_data` or `file_url` is required.", 400, "invalid_request_error");
+}
+
+function extractContentParts(content: unknown, fileOffset = 0): { text: string; images: NormalizedImage[]; files: NormalizedFile[] } {
+  if (typeof content === "string") return { text: content, images: [], files: [] };
+  if (!Array.isArray(content)) return { text: "", images: [], files: [] };
 
   const texts: string[] = [];
   const images: NormalizedImage[] = [];
+  const files: NormalizedFile[] = [];
   for (const part of content) {
     if (typeof part === "string") {
       texts.push(part);
@@ -46,9 +90,13 @@ function extractContentParts(content: unknown): { text: string; images: Normaliz
             : "";
       const parsed = parseDataUrlOrRemoteImage(urlVal);
       if (parsed) images.push(parsed);
+    } else if (pType === "file" && isRecord(part.file)) {
+      files.push(parseOpenAiFileObject(part.file, fileOffset + files.length));
+    } else if (pType === "input_file") {
+      files.push(parseOpenAiFileObject(part, fileOffset + files.length));
     }
   }
-  return { text: texts.join("\n"), images };
+  return { text: texts.join("\n"), images, files };
 }
 
 export function parseOpenAiTools(rawTools: unknown): {
@@ -242,12 +290,14 @@ export function parseChatCompletionsRequest(
   const systemParts: string[] = [];
   const items: ChatTurnLine[] = [];
   const allImages: NormalizedImage[] = [];
+  const allFiles: NormalizedFile[] = [];
 
   for (const rawMsg of body.messages) {
     if (!isRecord(rawMsg)) continue;
     const role = typeof rawMsg.role === "string" ? rawMsg.role.toLowerCase() : "user";
-    const { text, images } = extractContentParts(rawMsg.content);
+    const { text, images, files } = extractContentParts(rawMsg.content, allFiles.length);
     allImages.push(...images);
+    allFiles.push(...files);
 
     if (role === "system" || role === "developer") {
       if (text.trim()) systemParts.push(text.trim());
@@ -258,12 +308,14 @@ export function parseChatCompletionsRequest(
       const callId = typeof rawMsg.tool_call_id === "string" ? rawMsg.tool_call_id : "";
       const name = typeof rawMsg.name === "string" ? rawMsg.name : "";
       const meta = [name ? `name=${name}` : "", callId ? `id=${callId}` : ""].filter(Boolean).join(" ");
+      const toolFallback = images.length ? "[Image]" : files.length ? `[File: ${files.map((f) => f.filename).join(", ")}]` : "[empty]";
       items.push({
         role: "tool",
         text,
         images,
+        ...(files.length > 0 ? { files } : {}),
         hasTools: true,
-        formattedLine: `[TOOL_RESULT${meta ? ` ${meta}` : ""}]:\n${text || (images.length ? "[Image]" : "[empty]")}`
+        formattedLine: `[TOOL_RESULT${meta ? ` ${meta}` : ""}]:\n${text || toolFallback}`
       });
       continue;
     }
@@ -309,8 +361,9 @@ export function parseChatCompletionsRequest(
       role: "user",
       text,
       images,
+      ...(files.length > 0 ? { files } : {}),
       hasTools: false,
-      formattedLine: `[USER]:\n${text || (images.length ? "[Image]" : "[empty]")}`
+      formattedLine: `[USER]:\n${text || (images.length ? "[Image]" : files.length ? `[File: ${files.map((f) => f.filename).join(", ")}]` : "[empty]")}`
     });
   }
 
@@ -320,7 +373,7 @@ export function parseChatCompletionsRequest(
   }
 
   const fullTranscriptText = items.length === 1 && items[0].role === "user"
-    ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
+    ? (items[0].text || (items[0].images.length ? "[Image]" : allFiles.length ? `[File: ${allFiles.map((f) => f.filename).join(", ")}]` : ""))
     : items.map((it) => it.formattedLine).join("\n\n");
 
   const systemJoined = systemParts.join("\n\n");
@@ -379,6 +432,7 @@ export function parseChatCompletionsRequest(
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,
+    ...(allFiles.length > 0 ? { files: allFiles } : {}),
     tools,
     ...(nativeSdkTools.length > 0 ? { nativeSdkTools } : {}),
     toolChoice,
@@ -388,7 +442,7 @@ export function parseChatCompletionsRequest(
     hasToolResults: items.some((it) => it.role === "tool") || trailingToolResults.length > 0,
     stream: body.stream === true,
     includeStreamUsage: isRecord(body.stream_options) && body.stream_options.include_usage === true,
-    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length),
+    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length + allFiles.length),
     signal
   };
 }
@@ -423,6 +477,7 @@ export function parseResponsesRequest(
   const transcriptLines: string[] = [];
   const items: HashableDialogItem[] = [];
   const allImages: NormalizedImage[] = [];
+  const allFiles: NormalizedFile[] = [];
   const trailingToolResults: NormalizedToolResult[] = [];
   let trailingUserText: string | undefined;
   const trailingImages: NormalizedImage[] = [];
@@ -444,17 +499,21 @@ export function parseResponsesRequest(
         const callId = typeof item.call_id === "string" ? item.call_id.trim() : "";
         let outStr = "";
         let outImages: NormalizedImage[] = [];
+        let outFiles: NormalizedFile[] = [];
         if (typeof item.output === "string") {
           outStr = item.output;
         } else if (Array.isArray(item.output)) {
-          const parts = extractContentParts(item.output);
+          const parts = extractContentParts(item.output, allFiles.length);
           outStr = parts.text;
           outImages = parts.images;
+          outFiles = parts.files;
           allImages.push(...outImages);
+          allFiles.push(...outFiles);
         } else {
           outStr = JSON.stringify(item.output ?? "");
         }
-        const toolResLine = `[TOOL_RESULT id=${callId}]:\n${outStr}`;
+        const toolFallback = outImages.length ? "[Image]" : outFiles.length ? `[File: ${outFiles.map((f) => f.filename).join(", ")}]` : "";
+        const toolResLine = `[TOOL_RESULT id=${callId}]:\n${outStr || toolFallback}`;
         transcriptLines.push(toolResLine);
         if (callId) {
           trailingToolResults.push({
@@ -463,7 +522,14 @@ export function parseResponsesRequest(
             ...(outImages.length ? { images: outImages } : {})
           });
         }
-        items.push({ role: "tool", text: outStr, images: outImages, hasTools: true, formattedLine: toolResLine });
+        items.push({
+          role: "tool",
+          text: outStr,
+          images: outImages,
+          ...(outFiles.length > 0 ? { files: outFiles } : {}),
+          hasTools: true,
+          formattedLine: toolResLine
+        });
         continue;
       }
       if (itemType === "function_call" || itemType === "custom_tool_call" || itemType === "local_shell_call") {
@@ -510,8 +576,9 @@ export function parseResponsesRequest(
         );
       }
       const role = typeof item.role === "string" ? item.role.toLowerCase() : "user";
-      const { text, images } = extractContentParts(item.content);
+      const { text, images, files } = extractContentParts(item.content, allFiles.length);
       allImages.push(...images);
+      allFiles.push(...files);
       if (role === "system" || role === "developer") {
         if (text.trim()) systemParts.push(text.trim());
       } else if (role === "assistant") {
@@ -521,9 +588,10 @@ export function parseResponsesRequest(
         if (text.trim()) transcriptLines.push(`[ASSISTANT]:\n${text}`);
         items.push({ role: "assistant", text, images, hasTools: false });
       } else {
-        const userLine = `[USER]:\n${text || "[empty]"}`;
+        const placeholder = images.length ? "[Image]" : files.length ? `[File: ${files.map((f) => f.filename).join(", ")}]` : "[empty]";
+        const userLine = `[USER]:\n${text || placeholder}`;
         transcriptLines.push(userLine);
-        items.push({ role: "user", text, images, hasTools: false, formattedLine: userLine });
+        items.push({ role: "user", text, images, ...(files.length > 0 ? { files } : {}), hasTools: false, formattedLine: userLine });
         // A user message that follows tool outputs is the same turn's trailing user text
         // (mirrors the Chat Completions path); without this the new text was silently dropped on resume.
         if (trailingToolResults.length > 0) {
@@ -548,7 +616,7 @@ export function parseResponsesRequest(
   const systemJoined = systemParts.join("\n\n");
   const fullTranscriptText =
     items.length === 1 && items[0].role === "user"
-      ? (items[0].text || (items[0].images.length ? "[Image]" : ""))
+      ? (items[0].text || (items[0].images.length ? "[Image]" : allFiles.length ? `[File: ${allFiles.map((f) => f.filename).join(", ")}]` : ""))
       : transcriptLines.join("\n\n");
   const toolSig = (toolChoice === "none" ? [] : tools).map((t) => t.name).join(",");
   const prefixHashes = computeDialogPrefixHashes({
@@ -571,6 +639,7 @@ export function parseResponsesRequest(
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,
+    ...(allFiles.length > 0 ? { files: allFiles } : {}),
     tools,
     ...(nativeSdkTools.length > 0 ? { nativeSdkTools } : {}),
     toolChoice,
@@ -579,7 +648,7 @@ export function parseResponsesRequest(
     ...(trailingImages.length ? { trailingImages } : {}),
     hasToolResults,
     stream: body.stream === true,
-    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length),
+    estimatedInputTokens: Math.max(1, Math.ceil((systemJoined.length + fullTranscriptText.length) / 4)) + estimateImageTokens(allImages.length + allFiles.length),
     signal
   };
 }

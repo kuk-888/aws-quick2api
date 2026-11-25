@@ -62,11 +62,11 @@ export function sanitizeAwsQuickWsHost(raw: string): string {
 
 export function closeAllOAuthServers(): void {
   if (activeDiscoveryServer) {
-    try { activeDiscoveryServer.close(); } catch {}
+    try { activeDiscoveryServer.close(); } catch { }
     activeDiscoveryServer = null;
   }
   for (const flow of activeFlows.values()) {
-    try { flow.server?.close(); } catch {}
+    try { flow.server?.close(); } catch { }
   }
   activeFlows.clear();
 }
@@ -142,7 +142,7 @@ export async function fetchOAuthUserIdentity(
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        try { ws.close(); } catch {}
+        try { ws.close(); } catch { }
         resolve(val);
       };
       const timer = setTimeout(() => finish(null), 5_500);
@@ -198,7 +198,7 @@ export async function fetchOAuthUserIdentity(
   }
 }
 
-export const QUICK_APP_VERSION = process.env.AWS_QUICK_APP_VERSION?.trim() || "1.2.4660";
+export const QUICK_APP_VERSION = process.env.AWS_QUICK_APP_VERSION?.trim() || "1.2.4757";
 export const QUICK_DESKTOP_USER_AGENT =
   process.platform === "win32"
     ? `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) AmazonQuick/${QUICK_APP_VERSION} Chrome/136.0.7103.113 Electron/36.3.2 Safari/537.36`
@@ -243,13 +243,13 @@ export function buildOAuthDiscoveryUrl(
   if (opts?.onCompleted) {
     try {
       activeDiscoveryServer?.close();
-    } catch {}
+    } catch { }
     const srv = http.createServer(async (req, res) => {
       try {
         const reqUrl = new URL(req.url || "/", `http://127.0.0.1:${port}`);
         if (reqUrl.pathname === "/callback" && (reqUrl.searchParams.has("issuerUrl") || reqUrl.searchParams.has("tenantUrl"))) {
           // Close discovery server first so startOAuthPkceFlow can bind the same port cleanly
-          try { srv.close(); } catch {}
+          try { srv.close(); } catch { }
           if (activeDiscoveryServer === srv) activeDiscoveryServer = null;
           const started = await startOAuthPkceFlow({
             discoveryCallbackUrl: reqUrl.toString(),
@@ -274,7 +274,7 @@ export function buildOAuthDiscoveryUrl(
     srv.listen(port, "127.0.0.1");
     activeDiscoveryServer = srv;
     setTimeout(() => {
-      try { srv.close(); } catch {}
+      try { srv.close(); } catch { }
       if (activeDiscoveryServer === srv) activeDiscoveryServer = null;
     }, 10 * 60 * 1000).unref?.();
   }
@@ -389,7 +389,7 @@ function extractEmailFromIdToken(idToken?: string | null): string | undefined {
       const v = claims[k];
       if (typeof v === "string" && v.trim()) return v.trim();
     }
-  } catch {}
+  } catch { }
   return undefined;
 }
 
@@ -523,7 +523,7 @@ export async function startOAuthPkceFlow(params: {
       throw new Error("OIDC client/register did not return clientId/clientSecret.");
     }
   } catch (err) {
-    try { server.close(); } catch {}
+    try { server.close(); } catch { }
     throw err;
   }
 
@@ -587,7 +587,7 @@ export async function startOAuthPkceFlow(params: {
       params.onCompleted?.(cred);
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       res.end("<h3>AWS Quick authorization complete! You can close this tab and return to aws-quick2api.</h3>");
-      setTimeout(() => { try { server.close(); } catch {} }, 500);
+      setTimeout(() => { try { server.close(); } catch { } }, 500);
     } catch (err) {
       callbackHandled = false;
       flow.status = "error";
@@ -601,7 +601,7 @@ export async function startOAuthPkceFlow(params: {
   setTimeout(() => {
     const cur = activeFlows.get(flowId);
     if (cur) {
-      try { cur.server?.close(); } catch {}
+      try { cur.server?.close(); } catch { }
       activeFlows.delete(flowId);
     }
   }, 10 * 60_000).unref();
@@ -649,7 +649,7 @@ export async function completeOAuthPkceCallback(
   const cred = await exchangeAuthCode(flow, code);
   flow.status = "completed";
   flow.credential = cred;
-  try { flow.server?.close(); } catch {}
+  try { flow.server?.close(); } catch { }
   return cred;
 }
 
@@ -827,7 +827,7 @@ export async function fetchOAuthProfileUsage(
 }
 
 export interface QuickFileAttachment {
-  type: "file";
+  type: "file" | "image";
   name: string;
   size: number;
   mimeType: string;
@@ -852,14 +852,23 @@ export function evaluateDlpPollResponse(dlpJson: {
   status?: string;
   policyAction?: string;
   action?: string;
+  reason?: string;
+  policyName?: string;
+  message?: string;
 }): DlpPollDecision {
   const status = String(dlpJson.dlpJobStatus || dlpJson.status || "").trim().toUpperCase();
   const action = String(dlpJson.policyAction || dlpJson.action || "").trim().toUpperCase();
+  const extraDetail = [dlpJson.policyName, dlpJson.reason, dlpJson.message]
+    .map((v) => (typeof v === "string" ? v.trim() : ""))
+    .filter(Boolean)
+    .join(" | ")
+    .slice(0, 140);
+  const suffix = extraDetail ? ` [${extraDetail}]` : "";
   if (action === "BLOCK" || action === "BLOCKED" || action === "DENY" || action === "REJECT") {
-    return { state: "failed", reason: `Attachment blocked by AWS Quick DLP policy (${action}).` };
+    return { state: "failed", reason: `Attachment blocked by AWS Quick DLP policy (${action})${suffix}.` };
   }
   if (status === "FAILED" || status === "ERROR" || status === "REJECTED" || status === "BLOCKED") {
-    return { state: "failed", reason: `Attachment DLP scan failed (${status}).` };
+    return { state: "failed", reason: `Attachment DLP scan failed (${status})${suffix}.` };
   }
   if (
     status === "COMPLETED" ||
@@ -877,30 +886,30 @@ const MAX_DLP_POLL_ATTEMPTS = 40;
 const DLP_POLL_INTERVAL_MS = 1_500;
 
 /**
- * Upload an oversized UTF-8 text payload (>46KB) out-of-band via AWS Quick's official
- * 3-step AIDP attachment pipeline (`upload-attachment` -> `attachment-dlp-status` -> `files/upload/{threadId}`),
- * allowing 400KB+ contexts to be delivered in a single ~300-byte WS `user_message` frame
- * instead of multi-turn 50KB chunking.
+ * Upload any binary or UTF-8 file payload (images, PDFs, oversized `.txt` contexts) out-of-band via
+ * AWS Quick's official 3-step AIDP attachment pipeline (`upload-attachment` -> `attachment-dlp-status`
+ * -> `files/upload/{threadId}`), bypassing the 50KB WebSocket single-frame limit completely.
  */
-export async function uploadOAuthTextAttachment(
+export async function uploadOAuthBinaryAttachment(
   cred: OAuthCredential,
   threadId: string,
   filename: string,
-  textContent: string,
+  content: Buffer | Uint8Array,
+  mimeType: string,
   proxyUrl?: string,
   signal?: AbortSignal,
 ): Promise<QuickFileAttachment> {
   if (signal?.aborted) throw new Error("Attachment upload aborted by client.");
   let { accessToken } = await resolveOAuthAccessToken(cred, false, proxyUrl);
-  const buf = Buffer.from(textContent, "utf8");
+  const buf = Buffer.isBuffer(content) ? content : Buffer.from(content);
   const contentSha256 = crypto.createHash("sha256").update(buf).digest("hex");
-  const mimeType = "text/plain";
+  const normalizedMime = mimeType.trim().toLowerCase() || "application/octet-stream";
 
   // Step 1: Upload raw bytes (with 1 forced-refresh retry on 401)
   const upUrl =
     `https://${cred.wsHost}/integration/quick-work/upload-attachment` +
     `?name=${encodeURIComponent(filename)}` +
-    `&contentType=${encodeURIComponent(mimeType)}` +
+    `&contentType=${encodeURIComponent(normalizedMime)}` +
     `&contentLength=${buf.byteLength}`;
   let upRes = await fetchViaOptionalProxy(
     upUrl,
@@ -912,7 +921,7 @@ export async function uploadOAuthTextAttachment(
         "Content-Type": "application/octet-stream",
         "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
       },
-      body: textContent,
+      body: buf,
       ...(signal ? { signal } : {}),
     },
     proxyUrl,
@@ -929,7 +938,7 @@ export async function uploadOAuthTextAttachment(
           "Content-Type": "application/octet-stream",
           "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
         },
-        body: textContent,
+        body: buf,
         ...(signal ? { signal } : {}),
       },
       proxyUrl,
@@ -1026,14 +1035,37 @@ export async function uploadOAuthTextAttachment(
   }
 
   return {
-    type: "file",
+    type: normalizedMime.startsWith("image/") ? "image" : "file",
     name: filename,
     size: buf.byteLength,
-    mimeType,
+    mimeType: normalizedMime,
     path: serverPath,
     attachmentId,
     contentSha256,
   };
+}
+
+/**
+ * Upload an oversized UTF-8 text payload (>46KB) out-of-band via AWS Quick's official
+ * 3-step AIDP attachment pipeline (`upload-attachment` -> `attachment-dlp-status` -> `files/upload/{threadId}`).
+ */
+export async function uploadOAuthTextAttachment(
+  cred: OAuthCredential,
+  threadId: string,
+  filename: string,
+  textContent: string,
+  proxyUrl?: string,
+  signal?: AbortSignal,
+): Promise<QuickFileAttachment> {
+  return uploadOAuthBinaryAttachment(
+    cred,
+    threadId,
+    filename,
+    Buffer.from(textContent, "utf8"),
+    "text/plain",
+    proxyUrl,
+    signal,
+  );
 }
 
 export async function listOAuthCloudSessions(
