@@ -5,6 +5,7 @@ English | **[简体中文](./README.md)**
 [![Release](https://img.shields.io/github/v/release/kuk-888/aws-quick2api?display_name=tag&sort=semver&style=flat-square)](https://github.com/kuk-888/aws-quick2api/releases)
 [![GHCR](https://img.shields.io/badge/GHCR-aws--quick2api-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/kuk-888/aws-quick2api/pkgs/container/aws-quick2api)
 [![Community: LINUX DO](https://img.shields.io/badge/Community-LINUX%20DO-1f2937?style=flat-square)](https://linux.do)
+[![Telegram](https://img.shields.io/badge/Telegram-Group-26A5E4?logo=telegram&logoColor=white&style=flat-square)](https://t.me/+-2B2GA8qESpjYWZl)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 
 Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Linux, Docker, macOS, and Windows without installing the official desktop app, and ships with a built-in Web Console (`aws-quick-admin`).
@@ -20,8 +21,7 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
   - **2-step OAuth PKCE wizard** in the Web Console (universal multi-cell tenant discovery, 90-day auto-refresh, automatic email & display name extraction).
   - **Web Cookie import** (`Copy as cURL` from `quick.aws.com`), batch JSON backup/restore, and optional macOS `local-outpost` reuse.
 - **Large Context & Streaming Resilience**:
-  - Oversized contexts (`>46 KB`) on OAuth accounts automatically use AWS Quick's **native out-of-band `.txt` attachment upload** (single-frame delivery + 60s DLP poll verification + Turn-2 warm incremental reuse); non-OAuth or fallback paths use `≤46.5 KB` JSON-escaped UTF-8 chunking (with a 45s `turn_usage` watchdog and a 12-chunk safety cap). Streaming requests above 16 KB or with tools flush `HTTP 200` + `: keepalive` heartbeats once an upstream slot is leased (preserving genuine pre-lease HTTP `429` responses while preventing Cloudflare `524` timeouts).
-  - Optional gateway safety-net compaction above `850K` tokens (`AUTO_COMPACT_OVERFLOW_TOKENS`, zero-touch below threshold so client Prompt Cache stays intact).
+  - Oversized contexts (`>46 KB`) on OAuth accounts automatically use AWS Quick's **native out-of-band `.txt` attachment upload** (single-frame delivery + 60s DLP poll verification + preserving both opening request and trailing context + Turn-2 warm incremental reuse; upload 401/429 propagates to refresh/failover cleanly without silent chunk fallback); non-OAuth accounts use `≤46.5 KB` JSON-escaped UTF-8 chunking (with a 45s `turn_usage` watchdog and a 12-chunk safety cap). Streaming requests above 16 KB or with tools flush `HTTP 200` + `: keepalive` heartbeats once an upstream slot is leased (preserving genuine pre-lease HTTP `429` responses while preventing Cloudflare `524` timeouts).
   - Streaming sanitizer converts AWS Quick's proprietary `<decision>` / `<decisions>` / `<artifact>` UI XML into plain Markdown while leaving fenced code blocks untouched.
 - **Auto-Managed Custom Agent & Clean Tool Bridge**:
   - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Coding Assistant` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
@@ -171,19 +171,14 @@ See [.env.example](./.env.example) for the full template:
 | `QUICK_TOKENS` | `local-outpost` | Upstream credentials (can also be added via OAuth/Cookie in Console) |
 | `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `quick-advanced` on Free tier) |
 | `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console). Keep `true` for **shared pools / zero cloud history**; set `false` for **personal / high-concurrency** workloads (e.g. Claude Code subagents) so turns still resume via cloud `thread_id` even if a parked WS disconnects or is evicted |
-| `AUTO_DELETE_SESSION` | `false` | Send extra `session_delete` RPC after each incognito turn (off by default) |
 | `WEB_SEARCH_ENABLED` | `true` | Enable AWS Quick native web search |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | Show the routed model in the thinking block |
-| `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | Set `true` only if a legacy OpenAI SSE client cannot handle a trailing `reasoning_content` chunk |
-| `SANITIZE_AWS_UI_TAGS` | `true` | Convert AWS Quick `<decision>`/`<artifact>` XML into Markdown (preserves fenced code blocks) |
 | `AWS_QUICK_LOCALE` | `en-US` | Locale sent to upstream |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | Desktop client version header override |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | Global default proxy (per-account `http://`, `https://`, `socks5://` and shorthand proxies can be set in Console) |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | Opt-in toggle (hot-configurable in Console): when enabled, if upstream returns `content_filtered` before text emission, a helper model rephrases the latest user prompt into defensive engineering wording and retries once on the exact same requested model (via native `edit_message` on warm threads) |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | Custom prompt template for defensive auto-rephrase (empty = built-in default; editable in Console with one-click reset) |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | Lightweight helper model (`quick-fast` or `quick-balanced`) used strictly for short prompt rephrasing; never replaces the answering model |
-| `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | Safety-net compaction threshold for oversized prompts (`0` to disable) |
-| `AUTO_COMPACT_SUMMARY` | `true` | Summarize middle history when overflow compaction triggers |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental session cache TTL (30 min) and max entries |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | GitHub `owner/repo` for non-blocking release check in Console (set `off` to disable) |
 

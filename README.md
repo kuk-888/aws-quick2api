@@ -5,6 +5,7 @@
 [![Release](https://img.shields.io/github/v/release/kuk-888/aws-quick2api?display_name=tag&sort=semver&style=flat-square)](https://github.com/kuk-888/aws-quick2api/releases)
 [![GHCR](https://img.shields.io/badge/GHCR-aws--quick2api-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/kuk-888/aws-quick2api/pkgs/container/aws-quick2api)
 [![Community: LINUX DO](https://img.shields.io/badge/Community-LINUX%20DO-1f2937?style=flat-square)](https://linux.do)
+[![Telegram](https://img.shields.io/badge/Telegram-%E4%BA%A4%E6%B5%81%E7%BE%A4-26A5E4?logo=telegram&logoColor=white&style=flat-square)](https://t.me/+-2B2GA8qESpjYWZl)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](./LICENSE)
 
 面向 **AWS Quick** 的单进程 **OpenAI & Anthropic 双协议 API 网关**。可在 Linux、Docker、macOS、Windows 上独立运行，无需安装官方桌面端，内置轻量化 Web 管理台（`aws-quick-admin`）。
@@ -20,8 +21,7 @@
   - Web 管理台内置 **2 步 OAuth PKCE 网页授权**（自动发现租户分片、90 天自动续期、自动提取真实邮箱与用户名）。
   - 支持浏览器 `Copy as cURL` 导入 Cookie、JSON 批量导入导出，以及 macOS 本机 `local-outpost` 会话复用。
 - **长上下文与流式稳定性**：
-  - 超长上下文（`>46 KB`）在 OAuth 账号下自动走 AWS Quick **原生带外 `.txt` 附件上传**（1 帧秒传 + 60s DLP 轮询校验 + 第 2 轮热续传）；非 OAuth 或降级场景自动按 `≤46.5 KB` 安全分片（内置 45s `turn_usage` 兜底与最高 12 块保护上限）；流式请求超 16 KB 或带工具调用时在获取上游槽位后提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），既保留预租约真实 `429` 状态码又避免 Cloudflare `524` 超时。
-  - 超 `850K` tokens 时触发网关兜底裁剪/摘要（`AUTO_COMPACT_OVERFLOW_TOKENS`，低于阈值完全不介入，不影响客户端 Prompt Cache 命中）。
+  - 超长上下文（`>46 KB`）在 OAuth 账号下自动走 AWS Quick **原生带外 `.txt` 附件上传**（1 帧秒传 + 60s DLP 轮询校验 + 同步保留文首提问与末尾上下文 + 第 2 轮热续传；上传遇 401/429 直接刷新或切号而不静默降级）；非 OAuth 账号按 `≤46.5 KB` 安全分片（内置 45s `turn_usage` 兜底与最高 12 块保护上限）；流式请求超 16 KB 或带工具调用时在获取上游槽位后提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），既保留预租约真实 `429` 状态码又避免 Cloudflare `524` 超时。
   - 内置流式 XML 净化器：自动将 AWS Quick 私有的 `<decision>` / `<decisions>` / `<artifact>` 交互标签转为标准 Markdown，同时保护代码块原样输出。
 - **自定义 Agent 自动绑定与零污染工具桥接**：
   - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，持久化写入 `.env`（后续 0ms 额外开销）。
@@ -179,17 +179,12 @@ docker compose pull && docker compose up -d
 | `QUICK_TOKENS` | `local-outpost` | 上游凭证（也可启动后直接在管理台用 OAuth 或 Cookie 添加） |
 | `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（Free 账号建议填 `quick-advanced`） |
 | `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换）。**共享号池/需云端零留存**保持 `true`；**个人独享/高并发**（如 Claude Code 多子代理）建议设为 `false`，WS 断开或被并发驱逐后仍可凭云端 `thread_id` 热续传，显著减少冷重放 |
-| `AUTO_DELETE_SESSION` | `false` | 无痕模式下回合结束后是否额外发 `session_delete`（默认关闭） |
 | `WEB_SEARCH_ENABLED` | `true` | 开启 AWS Quick 原生联网搜索 |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | 在思考块中显示实际路由模型 |
-| `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | 仅当老旧 OpenAI 客户端无法兼容正文后的 `reasoning_content` 时设为 `true` |
-| `SANITIZE_AWS_UI_TAGS` | `true` | 将 AWS Quick 私有 `<decision>`/`<artifact>` 标签转为 Markdown（保留代码块原样） |
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | 桌面端版本号请求头覆盖 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | 全局默认代理（单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独配置） |
-| `AUTO_COMPACT_OVERFLOW_TOKENS` | `850000` | 超长上下文网关兜底压缩阈值（`0` 关闭） |
-| `AUTO_COMPACT_SUMMARY` | `true` | 触发超限压缩时优先对中间旧内容生成摘要 |
-| `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型将最后一句重述为防御性工程措辞并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
+| `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型润色最后一句提问并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | 防御性重述提示词模板（留空使用内置默认模板，可在管理台直接微调并一键恢复默认） |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | 仅用于短文本重述的辅助模型（`quick-fast` 或 `quick-balanced`），绝不替代最终回答模型 |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 多轮增量热复用的会话缓存时长（30 分钟）与上限 |
