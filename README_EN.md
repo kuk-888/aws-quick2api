@@ -106,6 +106,8 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 > **Dynamic Routing**: `/v1/models` advertises only these three models. AWS Quick assigns the underlying model server-side based on mode and reasoning effort. The actual routed model is surfaced in the thinking block, OpenAI `system_fingerprint`, and console request logs.
 >
 > **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax such as `claude-sonnet-5-5[effort=high]`.
+>
+> **Reasoning tiers**: `off` → `low` → `medium` → `high` → `max`. `max` (also `xhigh` / `ultra` / `maximum`) is forwarded to AWS Quick as-is and probed per account: if the first `max` turn completes, the account is marked as supporting it; if upstream explicitly rejects the value, the gateway retries once with `high`, records the result in `<DATA_DIR>/effort-capabilities.json`, and uses `high` for that account afterwards (other accounts keep probing). Set `THINKING_EFFORT_MAX_PASSTHROUGH=false` to force `high` globally.
 
 ---
 
@@ -163,6 +165,7 @@ See [.env.example](./.env.example) for the full template:
 | `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `claude-opus-5-5`) |
 | `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console) |
 | `AUTO_DELETE_SESSION` | `false` | Send extra `session_delete` RPC after each incognito turn (off by default) |
+| `THINKING_EFFORT_MAX_PASSTHROUGH` | `true` | Forward `thinking_effort: max` to AWS Quick and probe it per account: a completed turn marks the account as supported, an explicit rejection degrades to `high` once and is remembered; `false` forces `high` everywhere (probe results show up as `effortCapabilities` in the console runtime panel) |
 | `WEB_SEARCH_ENABLED` | `true` | Enable AWS Quick native web search |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | Show the routed model in the thinking block |
 | `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | Set `true` only if a legacy OpenAI SSE client cannot handle a trailing `reasoning_content` chunk |

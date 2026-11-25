@@ -3,6 +3,7 @@ import dns from "node:dns/promises";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
+import path from "node:path";
 import sharp from "sharp";
 import WebSocket from "ws";
 import {
@@ -28,8 +29,13 @@ import {
   withSharedOutpostLock,
 } from "../aws-quick/outpost-singleton.js";
 import { buildWebWsConnection } from "../aws-quick/web-client.js";
-import type { SDKModel } from "../aws-quick/types.js";
+import type { QuickThinkingEffort, SDKModel } from "../aws-quick/types.js";
 import { listLiveModels, resolveModelSelection } from "../services/model-catalog.js";
+import {
+  EffortCapabilityRegistry,
+  MAX_EFFORT,
+  looksLikeUnsupportedEffortError,
+} from "../services/effort-capability.js";
 import type { ExecutionModeTag, UsageTracker } from "../services/usage-tracker.js";
 import { extendHashWithAssistantTurn, redactSecrets } from "../utils/hash.js";
 import { getProxyAgent } from "../utils/proxy-agent.js";
@@ -869,6 +875,20 @@ export class QuickExecutionEngine {
   private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
   private readonly autoEnsureFailedSlots = new Map<string, { failedAt: number; count: number }>();
   private readonly overflowSummaryCache = new Map<string, { summary: string; expiresAt: number }>();
+  private readonly effortCapabilities: EffortCapabilityRegistry;
+  /**
+   * Per-turn record of the thinking tier actually forwarded to AWS Quick. The failover loop
+   * reads it after a failure to tell "upstream rejected `max`" apart from quota/rate/auth errors.
+   */
+  private readonly effortAttempts = new WeakMap<
+    ParsedProtocolTurn,
+    {
+      accountKey: string;
+      requestedEffort: QuickThinkingEffort;
+      sentEffort: QuickThinkingEffort;
+      downgraded: boolean;
+    }
+  >();
 
   private warmKey(
     scope: string | undefined,
@@ -1199,6 +1219,9 @@ export class QuickExecutionEngine {
       process.env.SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM === "true";
     this.webSearchEnabled = process.env.WEB_SEARCH_ENABLED !== "false";
     this.sanitizeAwsUiTags = process.env.SANITIZE_AWS_UI_TAGS !== "false";
+    this.effortCapabilities = new EffortCapabilityRegistry(
+      this.config.dataDir ? path.join(this.config.dataDir, "effort-capabilities.json") : undefined,
+    );
   }
 
   runtimeStats() {
@@ -1207,7 +1230,18 @@ export class QuickExecutionEngine {
       warmIncrementalSessions: new Set(this.warmThreads.values()).size,
       warmIdleSessions: this.countParkedWs(),
       memoryStore: { blobs: 0, totalBytes: 0 },
+      effortCapabilities: this.effortCapabilities.snapshot(),
     };
+  }
+
+  /** Upstream completed a turn that asked for `max`: remember that this account accepts the tier. */
+  private noteEffortCapabilitySuccess(turn: ParsedProtocolTurn): void {
+    const attempt = this.effortAttempts.get(turn);
+    if (!attempt) return;
+    this.effortAttempts.delete(turn);
+    if (attempt.requestedEffort === MAX_EFFORT && attempt.sentEffort === MAX_EFFORT) {
+      this.effortCapabilities.markSupported(attempt.accountKey);
+    }
   }
 
   async sweepStaleAssets(): Promise<void> {
@@ -1882,6 +1916,7 @@ export class QuickExecutionEngine {
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 5);
     let remainingWaitBudgetMs = 18_000;
     let retriedSameSlotConnLimit = false;
+    let retriedMaxEffortDowngrade = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       const waitStartedAt = Date.now();
@@ -2024,6 +2059,29 @@ export class QuickExecutionEngine {
           }
         }
 
+        // Compatibility fallback for the optimistic `max` tier: when AWS Quick rejects the value
+        // (not a quota / rate-limit / auth / transport failure), remember it for this account and
+        // retry the same slot once with `high` instead of surfacing an error the client can't act on.
+        const effortAttempt = this.effortAttempts.get(turn);
+        if (
+          effortAttempt &&
+          effortAttempt.sentEffort === MAX_EFFORT &&
+          !yieldedOutput &&
+          !turn.signal?.aborted &&
+          !retriedMaxEffortDowngrade &&
+          !isQuotaErr &&
+          !isRateLimitErr &&
+          !isAuthErr &&
+          !isConnLimitErr &&
+          !isProxyOrConnErr &&
+          looksLikeUnsupportedEffortError(msg)
+        ) {
+          retriedMaxEffortDowngrade = true;
+          this.effortCapabilities.markUnsupported(effortAttempt.accountKey, msg);
+          attempt -= 1;
+          continue;
+        }
+
         const evictedParked = isConnLimitErr
           ? this.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
           : 0;
@@ -2095,6 +2153,20 @@ export class QuickExecutionEngine {
     // Resolve model BEFORE consuming any parked warm WS so there is no async vacuum window
     // where a parked WS has no error/close listeners or leaks if model resolution fails.
     const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
+    // Max-effort passthrough probe: forward `max` optimistically, but keep the tier this account
+    // was already proven to reject (or a global kill switch) from ever reaching the wire.
+    // Fast mode never sends `thinking_effort`, so it is neither probed nor recorded.
+    if (selection.agentMode !== "fast") {
+      const effortDecision = this.effortCapabilities.resolveEffort(lease.maskedKey, selection.thinkingEffort);
+      const requestedEffort = selection.thinkingEffort;
+      selection.thinkingEffort = effortDecision.effort;
+      this.effortAttempts.set(turn, {
+        accountKey: lease.maskedKey,
+        requestedEffort,
+        sentEffort: effortDecision.effort,
+        downgraded: effortDecision.downgraded,
+      });
+    }
 
     const hasCustomAgent = Boolean(chatAgentId);
     const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice, {
@@ -2878,7 +2950,9 @@ export class QuickExecutionEngine {
           !(turn.stream && this.suppressLateRoutedThinkingInStream && hasEmittedText);
         const emitOrDeferRoutedThinking = (modelName: string) => {
           emittedRoutedModel = true;
-          const line = `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort} · routed=${modelName}\n`;
+          const downgradeNote =
+            this.effortAttempts.get(turn)?.downgraded === true ? ` (requested ${MAX_EFFORT}, fallback)` : "";
+          const line = `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort}${downgradeNote} · routed=${modelName}\n`;
           if (!usageLimitChecked) {
             pendingRoutedThinking = line;
           } else {
@@ -3085,7 +3159,10 @@ export class QuickExecutionEngine {
             throw item.error;
           }
           yield item;
-          if (item.type === "done") return;
+          if (item.type === "done") {
+            this.noteEffortCapabilitySuccess(turn);
+            return;
+          }
         }
         if (ended) return;
       }

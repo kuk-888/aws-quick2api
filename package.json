@@ -15,7 +15,8 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "preflight": "node scripts/preflight-review.mjs",
-    "ai-review": "node scripts/preflight-review.mjs --ai"
+    "ai-review": "node scripts/preflight-review.mjs --ai",
+    "probe:max": "node scripts/probe-max-effort.mjs"
   },
   "dependencies": {
     "sharp": "^0.35.5",

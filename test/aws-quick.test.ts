@@ -56,6 +56,10 @@ import {
 import { anthropicMessagesAdapter, parseAnthropicMessagesRequest } from "../src/protocols/anthropic.js";
 import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
 import { AWS_QUICK_MODELS, canonicalizeModelId, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
+import {
+  EffortCapabilityRegistry,
+  looksLikeUnsupportedEffortError,
+} from "../src/services/effort-capability.js";
 import { ClientGatewayKeyManager } from "../src/services/client-keys.js";
 import { checkLatestVersion } from "../src/services/update-checker.js";
 import { establishSocks5Tunnel, fetchViaOptionalProxy, maskProxyUrl, validateProxyUrl } from "../src/utils/proxy-agent.js";
@@ -158,6 +162,78 @@ describe("Model catalog & parameter resolution", () => {
       "Claude Opus 5.5",
     ]);
     assert.ok(list.every((model) => model.owned_by === "anthropic"));
+  });
+});
+
+describe("Max thinking tier (passthrough + probe)", () => {
+  it("parses max as a first-class effort and advertises it on the reasoning models", () => {
+    assert.deepEqual(resolveModelSelection("claude-opus-5-5[effort=max]").selection, {
+      model: "claude-opus-5-5",
+      agentMode: "smart",
+      thinkingEffort: "max",
+    });
+    assert.equal(resolveModelSelection("claude-opus-5-5-max").selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "max" }).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning: { effort: "xhigh" } }).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "high" }).selection.thinkingEffort, "high");
+    assert.equal(resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "medium" }).selection.thinkingEffort, "medium");
+    const effortParam = AWS_QUICK_MODELS.find((m) => m.id === "claude-opus-5-5")!.parameters![0]!;
+    assert.deepEqual(effortParam.values, ["off", "low", "medium", "high", "max"]);
+  });
+
+  it("keeps forwarding max until an account proves it rejects it, then degrades to high", () => {
+    const registry = new EffortCapabilityRegistry(undefined, { passthrough: true });
+    assert.deepEqual(registry.resolveEffort("acct-a", "max"), { effort: "max", downgraded: false });
+    assert.equal(registry.stateFor("acct-a"), "unknown");
+
+    registry.markUnsupported("acct-a", "Invalid thinking_effort value: max");
+    assert.equal(registry.stateFor("acct-a"), "unsupported");
+    assert.deepEqual(registry.resolveEffort("acct-a", "max"), { effort: "high", downgraded: true });
+    // Other accounts still probe the tier, and non-max tiers are never touched.
+    assert.deepEqual(registry.resolveEffort("acct-b", "max"), { effort: "max", downgraded: false });
+    assert.deepEqual(registry.resolveEffort("acct-a", "medium"), { effort: "medium", downgraded: false });
+  });
+
+  it("persists probe results and honors the passthrough kill switch", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "effort-cap-"));
+    try {
+      const file = path.join(dir, "effort-capabilities.json");
+      const registry = new EffortCapabilityRegistry(file, { passthrough: true });
+      registry.markSupported("acct-ok");
+      registry.markUnsupported("acct-bad", "thinking effort \"max\" is invalid");
+      registry.flush();
+
+      const reloaded = new EffortCapabilityRegistry(file, { passthrough: true });
+      assert.equal(reloaded.stateFor("acct-ok"), "supported");
+      assert.equal(reloaded.stateFor("acct-bad"), "unsupported");
+      assert.deepEqual(reloaded.resolveEffort("acct-bad", "max"), { effort: "high", downgraded: true });
+      const snapshot = reloaded.snapshot();
+      assert.equal(snapshot.maxEffortPassthrough, true);
+      assert.equal(snapshot.fallbackEffort, "high");
+      assert.equal(snapshot.supported, 1);
+      assert.equal(snapshot.unsupported, 1);
+      assert.deepEqual(
+        snapshot.accounts.map((entry) => [entry.account, entry.state]),
+        [
+          ["acct-ok", "supported"],
+          ["acct-bad", "unsupported"],
+        ],
+      );
+      assert.equal(snapshot.accounts[1]!.evidence, 'thinking effort "max" is invalid');
+      const disabled = new EffortCapabilityRegistry(file, { passthrough: false });
+      assert.deepEqual(disabled.resolveEffort("acct-ok", "max"), { effort: "high", downgraded: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("only treats effort/validation failures as an unsupported-tier signal", () => {
+    assert.equal(looksLikeUnsupportedEffortError('Invalid thinking_effort value: "max"'), true);
+    assert.equal(looksLikeUnsupportedEffortError("reasoning effort must be one of off|low|medium|high"), true);
+    assert.equal(looksLikeUnsupportedEffortError("QuotaExceededException: monthly limit exceeded"), false);
+    assert.equal(looksLikeUnsupportedEffortError("Rate limit exceeded, retry after 30"), false);
+    assert.equal(looksLikeUnsupportedEffortError("WebSocket closed (1006)"), false);
+    assert.equal(looksLikeUnsupportedEffortError(""), false);
   });
 });
 

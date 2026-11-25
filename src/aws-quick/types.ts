@@ -1,5 +1,10 @@
 export type QuickAgentMode = "fast" | "balanced" | "smart" | "advanced";
-export type QuickThinkingEffort = "off" | "low" | "medium" | "high";
+/**
+ * Thinking-effort tiers forwarded to AWS Quick as `thinking_effort`.
+ * `max` is passed through optimistically: the gateway probes it on first use and
+ * auto-degrades to `high` for accounts that reject it (see services/effort-capability.ts).
+ */
+export type QuickThinkingEffort = "off" | "low" | "medium" | "high" | "max";
 
 export interface SDKModelParameter {
   id: string;

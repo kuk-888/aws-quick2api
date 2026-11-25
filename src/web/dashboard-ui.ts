@@ -1110,7 +1110,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             <div class="panel-hdr">
               <div>
                 <h2>对外开放模型列表与启停管理 (Model Access Control)</h2>
-                <p>参数传法：① 模型名后缀如 <span class="mono">claude-sonnet-5-5[effort=high]</span>、<span class="mono">claude-opus-5-5[effort=medium]</span>；② 标准请求体 <span class="mono">reasoning_effort</span> / Claude <span class="mono">thinking</span>（网关会自动映射为 AWS Quick 的 <span class="mono">agent_mode</span> 与 <span class="mono">thinking_effort</span>）</p>
+                <p>参数传法：① 模型名后缀如 <span class="mono">claude-sonnet-5-5[effort=high]</span>、<span class="mono">claude-opus-5-5[effort=max]</span>；② 标准请求体 <span class="mono">reasoning_effort</span> / Claude <span class="mono">thinking</span>（网关会自动映射为 AWS Quick 的 <span class="mono">agent_mode</span> 与 <span class="mono">thinking_effort</span>）。档位：<span class="mono">off/low/medium/high/max</span>，<span class="mono">max</span> 透传后按账号探测，上游不支持时自动降级为 <span class="mono">high</span>（可用 <span class="mono">THINKING_EFFORT_MAX_PASSTHROUGH=false</span> 全局关闭）</p>
               </div>
               <button id="refreshModelsBtn">刷新上游模型目录</button>
             </div>

@@ -114,6 +114,8 @@ flowchart LR
 > **说明**：`/v1/models` 只公开以上三个模型。底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，实际路由到的模型会显示在思考块、OpenAI `system_fingerprint` 以及控制台请求日志中。
 >
 > **兼容别名**：旧 `quick-fast`、`quick-balanced`、`quick-smart` 仍可作为请求别名；`quick-balanced-think` 与 `quick-smart-think` 保留默认思考强度，`quick-advanced` 保留 Advanced 模式。支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking` 或方括号语法（如 `claude-sonnet-5-5[effort=high]`）按请求覆盖思考强度。
+>
+> **思考强度档位**：`off` → `low` → `medium` → `high` → `max`。`max`（也接受 `xhigh` / `ultra` / `maximum`）会原样透传给 AWS Quick，并按账号做一次探测：该账号首次 `max` 请求若正常完成即记为支持；若上游显式拒绝该取值，网关会在同一账号上自动降级为 `high` 重试一次，并把结果写入 `<DATA_DIR>/effort-capabilities.json`，之后该账号直接走 `high`（其它账号仍会各自探测）。设 `THINKING_EFFORT_MAX_PASSTHROUGH=false` 可全局强制 `high`。
 
 ---
 
@@ -174,6 +176,7 @@ docker compose pull && docker compose up -d
 | `WEB_SEARCH_ENABLED` | `true` | 开启 AWS Quick 原生联网搜索 |
 | `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | 在思考块中显示实际路由模型 |
 | `SUPPRESS_LATE_ROUTED_THINKING_IN_STREAM` | `false` | 仅当老旧 OpenAI 客户端无法兼容正文后的 `reasoning_content` 时设为 `true` |
+| `THINKING_EFFORT_MAX_PASSTHROUGH` | `true` | 把 `thinking_effort: max` 透传给 AWS Quick，并按账号探测：正常完成即记为支持，上游显式拒绝则当次自动降级为 `high` 并记住；设为 `false` 可强制全部走 `high`（探测结果见管理台运行状态里的 `effortCapabilities`） |
 | `SANITIZE_AWS_UI_TAGS` | `true` | 将 AWS Quick 私有 `<decision>`/`<artifact>` 标签转为 Markdown（保留代码块原样） |
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
 | `AWS_QUICK_APP_VERSION` | `1.2.4660` | 桌面端版本号请求头覆盖 |
