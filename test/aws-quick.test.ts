@@ -30,6 +30,7 @@ import {
   buildQuickImageAttachments,
   classifyUpstreamError,
   compactOversizedPrompt,
+  describeRequestShape,
   estimatePromptTokens,
   isPrivateOrReservedIp,
   isPseudo200UsageLimitPrefix,
@@ -181,6 +182,32 @@ describe("Model catalog & parameter resolution", () => {
     assert.equal(resolveModelSelection("claude-opus-5-5", { thinking: { type: "enabled", budget_tokens: 31999 } }).effortSource, "thinking.budget_tokens=31999");
     assert.equal(resolveModelSelection("claude-opus-5-5", { thinking: { type: "enabled" } }).effortSource, "thinking.enabled");
     assert.equal(resolveModelSelection("claude-opus-5-5", { enable_thinking: true }).effortSource, "enable_thinking");
+  });
+
+  it("fingerprints request bodies without leaking content", () => {
+    // The `[turn]` line exists so an operator can tell "the client never asked for thinking" apart
+    // from "the gateway dropped it". It must therefore expose the signal fields and nothing else.
+    const shape = describeRequestShape({
+      model: "claude-opus-5-5",
+      max_tokens: 32000,
+      stream: true,
+      thinking: { type: "enabled", budget_tokens: 31999 },
+      messages: [{ role: "user", content: "SECRET_PROMPT_TEXT" }],
+      system: "SECRET_SYSTEM_TEXT",
+      metadata: { user_id: "u1", note: "SECRET_META_TEXT" },
+    });
+    assert.match(shape, /model=claude-opus-5-5/);
+    assert.match(shape, /max_tokens=32000/);
+    assert.match(shape, /thinking\{budget_tokens:31999,type:enabled\}/);
+    assert.match(shape, /metadata\{/);
+    assert.doesNotMatch(shape, /SECRET_/);
+    assert.doesNotMatch(shape, /messages/);
+    assert.doesNotMatch(shape, /system/);
+    // A client that sends no thinking signal at all produces no signal key, which is the point:
+    // the absence is the evidence.
+    const bare = describeRequestShape({ model: "claude-opus-5-5", messages: [] });
+    assert.equal(bare, "model=claude-opus-5-5");
+    assert.equal(describeRequestShape(null), "");
   });
 
   it("advertises only the three Claude 5.5 models", () => {
