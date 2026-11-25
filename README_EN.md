@@ -20,11 +20,11 @@ Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Lin
   - **2-step OAuth PKCE wizard** in the Web Console (universal multi-cell tenant discovery, 90-day auto-refresh, automatic email & display name extraction).
   - **Web Cookie import** (`Copy as cURL` from `quick.aws.com`), batch JSON backup/restore, and optional macOS `local-outpost` reuse.
 - **Large Context & Streaming Resilience**:
-  - Automatic `≤46.5 KB` JSON-escaped UTF-8 chunking with an 8s post-`turn_usage` intermediate-chunk watchdog; early `HTTP 200` + `: keepalive` SSE heartbeats (and standard Anthropic `event: ping` after `message_start`) above 16 KB or with tools to prevent reverse-proxy/Cloudflare `524` timeouts.
+  - Oversized contexts (`>46 KB`) on OAuth accounts automatically use AWS Quick's **native out-of-band `.txt` attachment upload** (single-frame delivery + 60s DLP poll verification + Turn-2 warm incremental reuse); non-OAuth or fallback paths use `≤46.5 KB` JSON-escaped UTF-8 chunking (with a 45s `turn_usage` watchdog and a 12-chunk safety cap). Streaming requests above 16 KB or with tools flush `HTTP 200` + `: keepalive` heartbeats once an upstream slot is leased (preserving genuine pre-lease HTTP `429` responses while preventing Cloudflare `524` timeouts).
   - Optional gateway safety-net compaction above `850K` tokens (`AUTO_COMPACT_OVERFLOW_TOKENS`, zero-touch below threshold so client Prompt Cache stays intact).
   - Streaming sanitizer converts AWS Quick's proprietary `<decision>` / `<decisions>` / `<artifact>` UI XML into plain Markdown while leaving fenced code blocks untouched.
 - **Auto-Managed Custom Agent & Clean Tool Bridge**:
-  - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Quick2API Bridge` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
+  - Enabled by default (`AUTO_ENSURE_CODING_AGENT=true`): on the first call to an unbound account, the gateway uses AWS Quick's native WebSocket protocol to discover an existing custom agent or automatically create & publish `Coding Assistant` from your template, persisting its `chat_agent_id` to `.env` for zero-overhead reuse.
   - When a custom agent is active, tool bridging switches to ultra-clean minimal JSON schemas (no verbose anti-refusal boilerplate; zero `user_message` suffix injection on Opus/Sonnet), reliably powering local files, `.env`, shell, MCP, Skills, and Codex `apply_patch`.
   - Under **Routing & Strategy**, hot-update `AUTO_ENSURE_CODING_AGENT` and the global default instructions template `CUSTOM_AGENT_PROMPT`; under **Credentials**, click **Agent** on any account to inspect live custom agents, switch or restore default in one click, auto-create/bind, or **edit & hot-publish an existing agent's prompt directly to AWS Quick**.
 - **Multi-Account Pool & Per-Credential Proxies**:
@@ -123,7 +123,8 @@ npm install
 npm test
 
 cp .env.example .env
-# Edit .env to set ADMIN_PASSWORD and GATEWAY_TOKEN
+# Optional: set a strong random ADMIN_PASSWORD in .env (required on remote servers). Leave GATEWAY_TOKEN unset:
+# a random sk-aq-... key is generated on first start (copy it from Console -> Sub-Keys). Placeholder values are rejected at startup.
 npm start
 ```
 
@@ -140,6 +141,8 @@ When using published multi-arch (`linux/amd64`, `linux/arm64`) GHCR images (`ghc
 docker compose pull && docker compose up -d
 ```
 
+> **Upgrading Docker from `<= v0.1.15`**: Starting in `v0.1.16`, the container runs as non-root (`node`, UID/GID `1000:1000`) with `cap_drop: [ALL]`. If your existing `./data` directory or `.env` file is owned by `root`, run `chown -R 1000:1000 data .env` once before upgrading.
+
 - **Web Console**: `http://127.0.0.1:3456/dashboard`
 - **OpenAI Base URL**: `http://127.0.0.1:3456/v1`
 - **Anthropic Base URL**: `http://127.0.0.1:3456`
@@ -153,7 +156,7 @@ See [.env.example](./.env.example) for the full template:
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `HOST` / `PORT` | `127.0.0.1` / `3456` | Bind host and port (`0.0.0.0` inside Docker) |
-| `GATEWAY_TOKEN` | - | Comma-separated client bearer token(s) |
+| `GATEWAY_TOKEN` | - | Optional bootstrap bearer token(s), comma-separated. Seeded once into the console and tagged `.env`; afterwards the console is authoritative: deleting it there revokes it permanently (not re-created on restart), while removing/changing it in `.env` removes/replaces that key on next restart. Unset = a random key is auto-generated. Placeholder values (e.g. `sk-aq-change-me`) are rejected at startup |
 | `ENABLE_DASHBOARD` | `true` | Enable Web Console (`false` disables all console routes) |
 | `ADMIN_PASSWORD` | - | Console login password (required on remote servers; if unset, first-time setup is restricted to localhost `127.0.0.1`/`::1`) |
 | `QUICK_TOKENS` | `local-outpost` | Upstream credentials (can also be added via OAuth/Cookie in Console) |

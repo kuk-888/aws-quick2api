@@ -5,6 +5,13 @@ import { GatewayError, type GatewayConfig } from "../core/types.js";
 import { safeStringEquals } from "../utils/hash.js";
 import { normalizeBaseModelId } from "./model-access.js";
 
+/**
+ * Where a gateway key came from:
+ * - `env`: seeded from `GATEWAY_TOKEN` in `.env` (declarative bootstrap; removing the token from `.env` removes the key).
+ * - `dashboard`: created in the Web Console (fully managed by the console, never touched by `.env`).
+ */
+export type ClientKeySource = "env" | "dashboard";
+
 export interface ClientKeyStats {
   requests: number;
   inputTokens: number;
@@ -28,6 +35,7 @@ export interface ClientGatewayKeyView {
   isExpired: boolean;
   isQuotaExhausted: boolean;
   createdAt: string;
+  source: ClientKeySource;
   stats: ClientKeyStats;
 }
 
@@ -42,6 +50,7 @@ interface InternalClientKey {
   maxConcurrent: number | null;
   expiresAt: string | null;
   createdAt: string;
+  source: ClientKeySource;
   stats: ClientKeyStats;
 }
 
@@ -53,6 +62,10 @@ export type AuthenticatedClientIdentity =
       allowAllModels: boolean;
       allowedModels: ReadonlySet<string>;
     };
+
+function sha256Hex(value: string): string {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
 
 function maskGatewayToken(tok: string): string {
   if (tok.length < 24) return `${tok.slice(0, 2)}***`;
@@ -78,18 +91,54 @@ function normalizeExpiresAt(val: unknown): string | null {
 export class ClientGatewayKeyManager {
   private readonly keys: InternalClientKey[] = [];
   private readonly stateFilePath?: string;
+  /** SHA-256 digests (never plaintext) of `.env` tokens the operator explicitly deleted in the console. */
+  private readonly tombstoneFilePath?: string;
+  private readonly tombstones = new Set<string>();
   private persistTimer: NodeJS.Timeout | null = null;
+  /** Notable startup reconciliation events (pruned / suppressed env keys) for the caller to log. */
+  readonly startupEvents: Array<{ event: string; id: string; name: string }> = [];
 
   constructor(config: Pick<GatewayConfig, "gatewayTokens" | "envFilePath" | "dataDir">) {
     const dir = config.dataDir ?? (config.envFilePath ? path.dirname(config.envFilePath) : undefined);
     if (dir) {
       this.stateFilePath = path.join(dir, "gateway-keys.json");
+      this.tombstoneFilePath = path.join(dir, "env-key-tombstones.json");
     }
     this.loadAndSeed(config.gatewayTokens);
   }
 
+  private loadTombstones(): void {
+    if (!this.tombstoneFilePath || !existsSync(this.tombstoneFilePath)) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.tombstoneFilePath, "utf8")) as unknown;
+      const hashes = raw && typeof raw === "object" ? (raw as { hashes?: unknown }).hashes : undefined;
+      if (Array.isArray(hashes)) {
+        for (const h of hashes) if (typeof h === "string" && /^[a-f0-9]{64}$/.test(h)) this.tombstones.add(h);
+      }
+    } catch {
+      // Corrupt tombstone file: ignore (worst case an env key is re-seeded once and can be deleted again).
+    }
+  }
+
+  private persistTombstones(): void {
+    if (!this.tombstoneFilePath) return;
+    const dir = path.dirname(this.tombstoneFilePath);
+    mkdirSync(dir, { recursive: true });
+    const tmpPath = `${this.tombstoneFilePath}.${process.pid}.tmp`;
+    writeFileSync(tmpPath, JSON.stringify({ v: 1, hashes: [...this.tombstones].sort() }, null, 2) + "\n", { mode: 0o600 });
+    try {
+      chmodSync(tmpPath, 0o600);
+    } catch {
+      // Ignore on platforms/filesystems without POSIX chmod
+    }
+    renameSync(tmpPath, this.tombstoneFilePath);
+  }
+
   private loadAndSeed(envTokens: ReadonlySet<string>): void {
     let loadedFromFile = false;
+    let changed = false;
+    let tombstonesChanged = false;
+    this.loadTombstones();
     if (this.stateFilePath && existsSync(this.stateFilePath)) {
       try {
         const raw = JSON.parse(readFileSync(this.stateFilePath, "utf8")) as unknown;
@@ -104,6 +153,14 @@ export class ClientGatewayKeyManager {
               ? rec.allowedModels.filter((x): x is string => typeof x === "string").map((m) => normalizeBaseModelId(m))
               : [];
             const st = rec.stats && typeof rec.stats === "object" ? (rec.stats as Record<string, unknown>) : {};
+            // Files written before `source` existed: a key whose token is currently in `.env` is env-managed, the rest are console keys.
+            let source: ClientKeySource;
+            if (rec.source === "env" || rec.source === "dashboard") {
+              source = rec.source;
+            } else {
+              source = envTokens.has(token) ? "env" : "dashboard";
+              changed = true;
+            }
             let expiresAt: string | null = null;
             try {
               expiresAt = normalizeExpiresAt(rec.expiresAt);
@@ -121,6 +178,7 @@ export class ClientGatewayKeyManager {
               maxConcurrent: normalizeMaxRequests(rec.maxConcurrent),
               expiresAt,
               createdAt: typeof rec.createdAt === "string" ? rec.createdAt : new Date().toISOString(),
+              source,
               stats: {
                 requests: typeof st.requests === "number" ? st.requests : 0,
                 inputTokens: typeof st.inputTokens === "number" ? st.inputTokens : 0,
@@ -135,29 +193,56 @@ export class ClientGatewayKeyManager {
       }
     }
 
-    let addedSeed = false;
-    let idx = 0;
-    for (const tok of envTokens) {
-      if (!this.keys.some((k) => k.token === tok)) {
-        idx += 1;
-        this.keys.push({
-          id: `gk_${crypto.createHash("sha256").update(tok).digest("hex").slice(0, 8)}`,
-          name: idx === 1 && !loadedFromFile ? "Default Gateway Key" : `Env Key #${idx}`,
-          token: tok,
-          enabled: true,
-          allowAllModels: true,
-          allowedModels: new Set(),
-          maxRequests: null,
-          maxConcurrent: null,
-          expiresAt: null,
-          createdAt: new Date().toISOString(),
-          stats: { requests: 0, inputTokens: 0, outputTokens: 0 }
-        });
-        addedSeed = true;
+    // `.env` GATEWAY_TOKEN is a declarative bootstrap, not a permanent override of the console:
+    //  1) env-sourced keys whose token was removed from `.env` (rotation) or was deleted in the console are dropped;
+    //  2) tombstones for tokens no longer in `.env` are forgotten, so deliberately re-adding a token later re-seeds it;
+    //  3) env tokens that are not tombstoned and not yet known are seeded once.
+    const envHashes = new Map<string, string>();
+    for (const tok of envTokens) envHashes.set(tok, sha256Hex(tok));
+    for (let i = this.keys.length - 1; i >= 0; i -= 1) {
+      const k = this.keys[i]!;
+      if (k.source !== "env") continue;
+      const removedFromEnv = !envTokens.has(k.token);
+      const deletedInConsole = this.tombstones.has(sha256Hex(k.token));
+      if (removedFromEnv || deletedInConsole) {
+        this.keys.splice(i, 1);
+        this.startupEvents.push({ event: removedFromEnv ? "gateway_env_key_pruned" : "gateway_env_key_tombstoned", id: k.id, name: k.name });
+        changed = true;
+      }
+    }
+    const liveHashes = new Set(envHashes.values());
+    for (const h of [...this.tombstones]) {
+      if (!liveHashes.has(h)) {
+        this.tombstones.delete(h);
+        tombstonesChanged = true;
       }
     }
 
-    if (addedSeed) this.persist();
+    let idx = this.keys.filter((k) => k.source === "env").length;
+    for (const tok of envTokens) {
+      const digest = envHashes.get(tok)!;
+      if (this.tombstones.has(digest)) continue;
+      if (this.keys.some((k) => k.token === tok)) continue;
+      idx += 1;
+      this.keys.push({
+        id: `gk_${digest.slice(0, 8)}`,
+        name: idx === 1 && !loadedFromFile ? "Default Gateway Key" : `Env Key #${idx}`,
+        token: tok,
+        enabled: true,
+        allowAllModels: true,
+        allowedModels: new Set(),
+        maxRequests: null,
+        maxConcurrent: null,
+        expiresAt: null,
+        createdAt: new Date().toISOString(),
+        source: "env",
+        stats: { requests: 0, inputTokens: 0, outputTokens: 0 }
+      });
+      changed = true;
+    }
+
+    if (tombstonesChanged) this.persistTombstones();
+    if (changed) this.persist();
   }
 
   private persist(): void {
@@ -173,6 +258,7 @@ export class ClientGatewayKeyManager {
       maxConcurrent: k.maxConcurrent,
       expiresAt: k.expiresAt,
       createdAt: k.createdAt,
+      source: k.source,
       stats: k.stats
     }));
     if (this.persistTimer) {
@@ -368,8 +454,13 @@ export class ClientGatewayKeyManager {
       maxConcurrent: normalizeMaxRequests(params.maxConcurrent),
       expiresAt: normalizeExpiresAt(params.expiresAt),
       createdAt: new Date().toISOString(),
+      source: "dashboard",
       stats: { requests: 0, inputTokens: 0, outputTokens: 0 }
     };
+
+    // Explicitly re-creating a previously deleted `.env` token in the console is an intentional re-add.
+    const digest = sha256Hex(token);
+    if (this.tombstones.delete(digest)) this.persistTombstones();
 
     this.keys.push(entry);
     this.persist();
@@ -425,11 +516,29 @@ export class ClientGatewayKeyManager {
     return this.toView(entry);
   }
 
-  deleteKey(id: string): void {
+  /**
+   * Delete a key. Deleting a key that came from `.env` records a tombstone (token digest) so the next restart
+   * does not silently re-create it; delete therefore always means revoke.
+   */
+  deleteKey(id: string): { source: ClientKeySource } {
     const idx = this.keys.findIndex((k) => k.id === id);
     if (idx < 0) throw new GatewayError(`Gateway key '${id}' not found.`, 404, "not_found");
+    const entry = this.keys[idx]!;
+    if (entry.source === "env") {
+      const digest = sha256Hex(entry.token);
+      if (!this.tombstones.has(digest)) {
+        this.tombstones.add(digest);
+        try {
+          this.persistTombstones();
+        } catch (err) {
+          this.tombstones.delete(digest);
+          throw err;
+        }
+      }
+    }
     this.keys.splice(idx, 1);
     this.persist();
+    return { source: entry.source };
   }
 
   private toView(k: InternalClientKey): ClientGatewayKeyView {
@@ -449,6 +558,7 @@ export class ClientGatewayKeyManager {
       isExpired,
       isQuotaExhausted,
       createdAt: k.createdAt,
+      source: k.source,
       stats: { ...k.stats }
     };
   }

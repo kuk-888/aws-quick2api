@@ -20,11 +20,11 @@
   - Web 管理台内置 **2 步 OAuth PKCE 网页授权**（自动发现租户分片、90 天自动续期、自动提取真实邮箱与用户名）。
   - 支持浏览器 `Copy as cURL` 导入 Cookie、JSON 批量导入导出，以及 macOS 本机 `local-outpost` 会话复用。
 - **长上下文与流式稳定性**：
-  - 超长输入自动按 `≤46.5 KB`（按 JSON 转义后 UTF-8 字节精准计算）安全分片，中间分片内置 `turn_usage` 8s 兜底防卡死；流式请求超 16 KB 或带工具调用时提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），避免经过 Cloudflare / 反代时触发 `524` 超时。
+  - 超长上下文（`>46 KB`）在 OAuth 账号下自动走 AWS Quick **原生带外 `.txt` 附件上传**（1 帧秒传 + 60s DLP 轮询校验 + 第 2 轮热续传）；非 OAuth 或降级场景自动按 `≤46.5 KB` 安全分片（内置 45s `turn_usage` 兜底与最高 12 块保护上限）；流式请求超 16 KB 或带工具调用时在获取上游槽位后提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），既保留预租约真实 `429` 状态码又避免 Cloudflare `524` 超时。
   - 超 `850K` tokens 时触发网关兜底裁剪/摘要（`AUTO_COMPACT_OVERFLOW_TOKENS`，低于阈值完全不介入，不影响客户端 Prompt Cache 命中）。
   - 内置流式 XML 净化器：自动将 AWS Quick 私有的 `<decision>` / `<decisions>` / `<artifact>` 交互标签转为标准 Markdown，同时保护代码块原样输出。
 - **自定义 Agent 自动绑定与零污染工具桥接**：
-  - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Quick2API Bridge`，持久化写入 `.env`（后续 0ms 额外开销）。
+  - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，持久化写入 `.env`（后续 0ms 额外开销）。
   - 自定义 Agent 生效后自动切换极简工具桥接（去除长篇防拒答文案，Opus / Sonnet 保持 `user_message` 零注入），稳定支持 Claude Code / Codex CLI / Witan 发起本地文件、`.env`、终端、MCP、Skill、`apply_patch` 等调用。
   - Web 管理台「路由与策略」支持热更新 `AUTO_ENSURE_CODING_AGENT` 开关与全局默认提示词模板 `CUSTOM_AGENT_PROMPT`；「凭证池」点击任意账号的 **Agent** 按钮即可实时查看该账号下所有自定义 Agent、一键切换/恢复默认、一键自动创建绑定，或**在线编辑并热发布已有 Agent 提示词到 AWS Quick**。
 - **多账号调度与独立代理**：
@@ -131,7 +131,8 @@ npm install
 npm test
 
 cp .env.example .env
-# 编辑 .env 设置 ADMIN_PASSWORD 与 GATEWAY_TOKEN
+# 可选：在 .env 里设置强随机的 ADMIN_PASSWORD（公网部署必填）；GATEWAY_TOKEN 留空即可，
+# 首次启动会自动生成 sk-aq-... 密钥，到管理台「网关子密钥」复制。示例里的占位值会被启动检查拒绝。
 npm start
 ```
 
@@ -148,6 +149,8 @@ docker compose up -d --build
 docker compose pull && docker compose up -d
 ```
 
+> **从 `<= v0.1.15` 升级 Docker 的权限说明**：`v0.1.16+` 镜像已切换为非 root 用户（`node`，UID/GID `1000:1000`）运行并启用最小权限。若宿主机旧的 `./data` 或 `.env` 归 `root` 所有，升级前请执行一次：`chown -R 1000:1000 data .env`。
+
 - **Web 管理台**：`http://127.0.0.1:3456/dashboard`
 - **OpenAI Base URL**：`http://127.0.0.1:3456/v1`
 - **Anthropic Base URL**：`http://127.0.0.1:3456`
@@ -161,7 +164,7 @@ docker compose pull && docker compose up -d
 | 变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `HOST` / `PORT` | `127.0.0.1` / `3456` | 监听地址与端口（Docker 内为 `0.0.0.0`） |
-| `GATEWAY_TOKEN` | - | 客户端调用令牌，支持逗号分隔多个 |
+| `GATEWAY_TOKEN` | - | 可选的首次引导令牌，支持逗号分隔多个。仅在首次启动时种入后台并标记 `.env`；之后以管理台为准：在管理台删除即永久撤销（重启不会再生成），从 `.env` 删除或更换则下次重启移除/替换对应密钥。留空会自动生成随机密钥。占位值（如 `sk-aq-change-me`）会被拒绝启动 |
 | `ENABLE_DASHBOARD` | `true` | 是否启用 Web 管理台（`false` 关闭全部管理台路由） |
 | `ADMIN_PASSWORD` | - | 管理台密码（公网部署必填；留空时仅允许 `127.0.0.1`/`::1` 初始化） |
 | `QUICK_TOKENS` | `local-outpost` | 上游凭证（也可启动后直接在管理台用 OAuth 或 Cookie 添加） |

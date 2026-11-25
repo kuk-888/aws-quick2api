@@ -1,9 +1,25 @@
+import net from "node:net";
 import { parseOAuthCredential, type OAuthCredential } from "./oauth-client.js";
 import { OutpostHandle } from "./outpost-client.js";
 import { parseWebCurlOrCredential, type WebCookieCredential } from "./web-client.js";
 
 let sharedOutpost: OutpostHandle | null = null;
 let startingPromise: Promise<OutpostHandle> | null = null;
+let outpostLockChain: Promise<void> = Promise.resolve();
+
+const ALLOWED_WS_HOST_RE = /^(?:[a-z0-9-]+\.)+(?:plato\.ai\.aws\.dev|quick\.aws\.com|quicksight\.aws\.amazon\.com|aws\.dev)$/i;
+
+/**
+ * Validates that an upstream AWS Quick WebSocket/API host belongs to an official AWS Quick domain.
+ * Prevents SSRF / Bearer JWT exfiltration via crafted `wsHost|jwt` or JSON credentials.
+ */
+export function assertSafeWsHost(rawHost: string | undefined): string {
+  const host = (rawHost || "").trim().toLowerCase().replace(/\.$/, "");
+  if (!host || host.length > 253 || net.isIP(host) || !ALLOWED_WS_HOST_RE.test(host)) {
+    throw new Error(`Blocked untrusted AWS Quick wsHost: "${rawHost || ""}"`);
+  }
+  return host;
+}
 
 export async function getSharedOutpost(): Promise<OutpostHandle> {
   if (sharedOutpost) return sharedOutpost;
@@ -19,6 +35,25 @@ export async function getSharedOutpost(): Promise<OutpostHandle> {
       startingPromise = null;
     });
   return startingPromise;
+}
+
+/**
+ * Serializes access to the shared `OutpostHandle` singleton so concurrent token-mode requests
+ * never race on `setImportedToken(...)` and mix credentials across accounts.
+ */
+export async function withSharedOutpostLock<T>(fn: (outpost: OutpostHandle) => Promise<T>): Promise<T> {
+  const prev = outpostLockChain;
+  let release!: () => void;
+  outpostLockChain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prev;
+  try {
+    const outpost = await getSharedOutpost();
+    return await fn(outpost);
+  } finally {
+    release();
+  }
 }
 
 export function stopSharedOutpost(): void {

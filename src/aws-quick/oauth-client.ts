@@ -733,52 +733,89 @@ export async function resolveOAuthAccessToken(
   return refreshPromise;
 }
 
+async function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) throw new Error("Operation aborted by client.");
+  await new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(new Error("Operation aborted by client."));
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    t.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 async function callOAuthQbsEvent(
   cred: OAuthCredential,
   path: string,
   httpMethod: "GET" | "POST",
   bodyObj?: Record<string, unknown>,
   proxyUrl?: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  const { accessToken } = await resolveOAuthAccessToken(cred, false, proxyUrl);
-  const surfaceType =
-    process.platform === "win32" ? "QUICK_WORK_DESKTOP_WINDOWS" : "QUICK_WORK_DESKTOP_MAC";
-  const outpostId = deriveStableOutpostId(cred.clientId);
-  const resp = await fetchViaOptionalProxy(
-    `https://${cred.wsHost}/integration/quick-work/qbs-event`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": QUICK_DESKTOP_USER_AGENT,
-        Authorization: `Bearer ${accessToken}`,
-        "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
-      },
-      body: JSON.stringify({
-        eventType: "invokeAgent",
-        eventBody: {
-          invokeAgent: {
-            path,
-            queryParams: {
-              surfaceType,
-              appVersion: QUICK_APP_VERSION,
-              _method: httpMethod,
-            },
-            body: bodyObj ?? {},
-            outpostId,
-          },
+  let forceRefresh = false;
+  let lastErr: Error | undefined;
+  const maxAttempts = 3;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (signal?.aborted) throw new Error(`qbs-event ${path} aborted by client.`);
+    const { accessToken } = await resolveOAuthAccessToken(cred, forceRefresh, proxyUrl);
+    forceRefresh = false;
+    const surfaceType =
+      process.platform === "win32" ? "QUICK_WORK_DESKTOP_WINDOWS" : "QUICK_WORK_DESKTOP_MAC";
+    const outpostId = deriveStableOutpostId(cred.clientId);
+    const resp = await fetchViaOptionalProxy(
+      `https://${cred.wsHost}/integration/quick-work/qbs-event`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": QUICK_DESKTOP_USER_AGENT,
+          Authorization: `Bearer ${accessToken}`,
+          "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
         },
-      }),
-    },
-    proxyUrl,
-  );
-  if (!resp.ok) {
-    throw new Error(`qbs-event ${path} failed (${resp.status})`);
+        body: JSON.stringify({
+          eventType: "invokeAgent",
+          eventBody: {
+            invokeAgent: {
+              path,
+              queryParams: {
+                surfaceType,
+                appVersion: QUICK_APP_VERSION,
+                _method: httpMethod,
+              },
+              body: bodyObj ?? {},
+              outpostId,
+            },
+          },
+        }),
+        ...(signal ? { signal } : {}),
+      },
+      proxyUrl,
+    );
+    if (resp.status === 401 && attempt === 0) {
+      forceRefresh = true;
+      continue;
+    }
+    if ((resp.status === 429 || resp.status >= 500) && attempt + 1 < maxAttempts) {
+      lastErr = new Error(`qbs-event ${path} failed (${resp.status})`);
+      const jitterMs = 750 + Math.floor(Math.random() * 750);
+      await sleepWithAbort(jitterMs * (attempt + 1), signal);
+      continue;
+    }
+    if (!resp.ok) {
+      throw new Error(`qbs-event ${path} failed (${resp.status})`);
+    }
+    const envelope = (await resp.json()) as { eventResponse?: { invokeAgentResponse?: string | { body?: string } } };
+    const rawInv = envelope?.eventResponse?.invokeAgentResponse;
+    const apiResp = typeof rawInv === "string" ? (JSON.parse(rawInv) as { body?: string }) : rawInv;
+    return typeof apiResp?.body === "string" ? JSON.parse(apiResp.body) : {};
   }
-  const envelope = (await resp.json()) as { eventResponse?: { invokeAgentResponse?: string | { body?: string } } };
-  const rawInv = envelope?.eventResponse?.invokeAgentResponse;
-  const apiResp = typeof rawInv === "string" ? (JSON.parse(rawInv) as { body?: string }) : rawInv;
-  return typeof apiResp?.body === "string" ? JSON.parse(apiResp.body) : {};
+  throw lastErr ?? new Error(`qbs-event ${path} failed after retries`);
 }
 
 export async function fetchOAuthProfileUsage(
@@ -787,6 +824,216 @@ export async function fetchOAuthProfileUsage(
 ): Promise<QuickQuotaUsage> {
   const data = await callOAuthQbsEvent(cred, "profile/usage", "GET", undefined, proxyUrl);
   return (data && typeof data === "object" ? data : {}) as QuickQuotaUsage;
+}
+
+export interface QuickFileAttachment {
+  type: "file";
+  name: string;
+  size: number;
+  mimeType: string;
+  path: string;
+  attachmentId: string;
+  contentSha256: string;
+}
+
+export type DlpPollDecision =
+  | { state: "ready" }
+  | { state: "pending" }
+  | { state: "failed"; reason: string };
+
+/**
+ * Evaluates a single `attachment-dlp-status` JSON payload using official AWS Quick semantics:
+ * - `COMPLETED` / `COMPLETE` / `SUCCESS` / `SKIPPED` / `NOT_APPLICABLE`: ready unless `policyAction` blocks/denies.
+ * - `FAILED` / `ERROR` / `REJECTED` / `BLOCKED`: terminal failure (do not proceed to `files/upload`).
+ * - Anything else (`PENDING` / `IN_PROGRESS` / `SCANNING` / empty): keep polling.
+ */
+export function evaluateDlpPollResponse(dlpJson: {
+  dlpJobStatus?: string;
+  status?: string;
+  policyAction?: string;
+  action?: string;
+}): DlpPollDecision {
+  const status = String(dlpJson.dlpJobStatus || dlpJson.status || "").trim().toUpperCase();
+  const action = String(dlpJson.policyAction || dlpJson.action || "").trim().toUpperCase();
+  if (action === "BLOCK" || action === "BLOCKED" || action === "DENY" || action === "REJECT") {
+    return { state: "failed", reason: `Attachment blocked by AWS Quick DLP policy (${action}).` };
+  }
+  if (status === "FAILED" || status === "ERROR" || status === "REJECTED" || status === "BLOCKED") {
+    return { state: "failed", reason: `Attachment DLP scan failed (${status}).` };
+  }
+  if (
+    status === "COMPLETED" ||
+    status === "COMPLETE" ||
+    status === "SUCCESS" ||
+    status === "SKIPPED" ||
+    status === "NOT_APPLICABLE"
+  ) {
+    return { state: "ready" };
+  }
+  return { state: "pending" };
+}
+
+const MAX_DLP_POLL_ATTEMPTS = 40;
+const DLP_POLL_INTERVAL_MS = 1_500;
+
+/**
+ * Upload an oversized UTF-8 text payload (>46KB) out-of-band via AWS Quick's official
+ * 3-step AIDP attachment pipeline (`upload-attachment` -> `attachment-dlp-status` -> `files/upload/{threadId}`),
+ * allowing 400KB+ contexts to be delivered in a single ~300-byte WS `user_message` frame
+ * instead of multi-turn 50KB chunking.
+ */
+export async function uploadOAuthTextAttachment(
+  cred: OAuthCredential,
+  threadId: string,
+  filename: string,
+  textContent: string,
+  proxyUrl?: string,
+  signal?: AbortSignal,
+): Promise<QuickFileAttachment> {
+  if (signal?.aborted) throw new Error("Attachment upload aborted by client.");
+  let { accessToken } = await resolveOAuthAccessToken(cred, false, proxyUrl);
+  const buf = Buffer.from(textContent, "utf8");
+  const contentSha256 = crypto.createHash("sha256").update(buf).digest("hex");
+  const mimeType = "text/plain";
+
+  // Step 1: Upload raw bytes (with 1 forced-refresh retry on 401)
+  const upUrl =
+    `https://${cred.wsHost}/integration/quick-work/upload-attachment` +
+    `?name=${encodeURIComponent(filename)}` +
+    `&contentType=${encodeURIComponent(mimeType)}` +
+    `&contentLength=${buf.byteLength}`;
+  let upRes = await fetchViaOptionalProxy(
+    upUrl,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": QUICK_DESKTOP_USER_AGENT,
+        "Content-Type": "application/octet-stream",
+        "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+      },
+      body: textContent,
+      ...(signal ? { signal } : {}),
+    },
+    proxyUrl,
+  );
+  if (upRes.status === 401) {
+    ({ accessToken } = await resolveOAuthAccessToken(cred, true, proxyUrl));
+    upRes = await fetchViaOptionalProxy(
+      upUrl,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": QUICK_DESKTOP_USER_AGENT,
+          "Content-Type": "application/octet-stream",
+          "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+        },
+        body: textContent,
+        ...(signal ? { signal } : {}),
+      },
+      proxyUrl,
+    );
+  }
+  if (!upRes.ok) {
+    throw new Error(`upload-attachment failed (${upRes.status})`);
+  }
+  const upJson = (await upRes.json()) as { attachmentId?: string; id?: string };
+  const attachmentId = (upJson.attachmentId || upJson.id || "").trim();
+  if (!attachmentId) {
+    throw new Error("upload-attachment returned empty attachmentId");
+  }
+
+  // Step 2: Poll DLP status (up to 40 × 1.5s = 60s; transient 429/5xx/network jitter retries;
+  // terminal FAILED/ERROR/BLOCK or timeout throws cleanly instead of proceeding unscanned).
+  const dlpUrl = `https://${cred.wsHost}/integration/quick-work/attachment-dlp-status?attachmentId=${encodeURIComponent(attachmentId)}`;
+  let dlpReady = false;
+  let refreshedOnDlp401 = false;
+  for (let poll = 0; poll < MAX_DLP_POLL_ATTEMPTS; poll += 1) {
+    if (signal?.aborted) throw new Error("Attachment DLP poll aborted by client.");
+    let dlpRes: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
+    try {
+      dlpRes = await fetchViaOptionalProxy(
+        dlpUrl,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            "User-Agent": QUICK_DESKTOP_USER_AGENT,
+            "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+          },
+          ...(signal ? { signal } : {}),
+        },
+        proxyUrl,
+      );
+    } catch (err) {
+      if (signal?.aborted || poll + 1 >= MAX_DLP_POLL_ATTEMPTS) throw err;
+      const jitterMs = 750 + Math.floor(Math.random() * 750);
+      await sleepWithAbort(jitterMs, signal);
+      continue;
+    }
+
+    if (dlpRes.status === 401 && !refreshedOnDlp401) {
+      refreshedOnDlp401 = true;
+      ({ accessToken } = await resolveOAuthAccessToken(cred, true, proxyUrl));
+      continue;
+    }
+    if (dlpRes.status === 429 || dlpRes.status >= 500) {
+      if (poll + 1 >= MAX_DLP_POLL_ATTEMPTS) {
+        throw new Error(`attachment-dlp-status failed (${dlpRes.status})`);
+      }
+      const jitterMs = 750 + Math.floor(Math.random() * 750);
+      await sleepWithAbort(jitterMs, signal);
+      continue;
+    }
+    if (!dlpRes.ok) {
+      throw new Error(`attachment-dlp-status failed (${dlpRes.status})`);
+    }
+    const dlpJson = (await dlpRes.json()) as {
+      dlpJobStatus?: string;
+      status?: string;
+      policyAction?: string;
+      action?: string;
+    };
+    const decision = evaluateDlpPollResponse(dlpJson);
+    if (decision.state === "failed") {
+      throw new Error(decision.reason);
+    }
+    if (decision.state === "ready") {
+      dlpReady = true;
+      break;
+    }
+    if (poll + 1 < MAX_DLP_POLL_ATTEMPTS) {
+      await sleepWithAbort(DLP_POLL_INTERVAL_MS, signal);
+    }
+  }
+  if (!dlpReady) {
+    throw new Error(`Attachment DLP scan timed out after ${Math.round((MAX_DLP_POLL_ATTEMPTS * DLP_POLL_INTERVAL_MS) / 1000)}s.`);
+  }
+
+  // Step 3: Bind attachment to the session workspace via qbs-event `files/upload/{threadId}`
+  const bindData = (await callOAuthQbsEvent(
+    cred,
+    `files/upload/${threadId}`,
+    "POST",
+    { attachmentId },
+    proxyUrl,
+    signal,
+  )) as { path?: string; files?: Array<{ path?: string }> };
+  const serverPath = String(bindData?.path || bindData?.files?.[0]?.path || "").trim();
+  if (!serverPath) {
+    throw new Error("files/upload did not return a workspace serverPath");
+  }
+
+  return {
+    type: "file",
+    name: filename,
+    size: buf.byteLength,
+    mimeType,
+    path: serverPath,
+    attachmentId,
+    contentSha256,
+  };
 }
 
 export async function listOAuthCloudSessions(

@@ -4,7 +4,11 @@ import type { NormalizedImage } from "../core/types.js";
 const SECRET_REDACTION_PATTERNS: Array<[RegExp, string]> = [
   [/\bsk-aq-[A-Za-z0-9_-]{6,}\b/g, "sk-aq-[REDACTED]"],
   [/\badm_[A-Za-z0-9._-]{10,}\b/g, "adm_[REDACTED]"],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?\b/g, "[REDACTED_JWT]"]
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]*)?\b/g, "[REDACTED_JWT]"],
+  [/\boauth:[A-Za-z0-9+/=_-]{16,}/g, "oauth:[REDACTED]"],
+  [/\bweb:[^\s"',;]{16,}/g, "web:[REDACTED]"],
+  [/\baoa[A-Za-z0-9._-]{20,}\b/g, "aoa[REDACTED]"],
+  [/(\b(?:https?|socks5h?):\/\/)([^:@\s/]+):([^\s/]+)@/gi, "$1***:***@"],
 ];
 
 export function redactSecrets(input: string): string {
@@ -22,7 +26,12 @@ export function safeStringEquals(a: string, b: string): boolean {
 }
 
 export function normalizeBaseModelId(modelId: string): string {
-  let base = modelId.split("[")[0]?.trim().toLowerCase() ?? "";
+  let raw = modelId.trim().toLowerCase();
+  // Strip leading aggregator/provider prefixes (e.g. `[aws]-`, `quick/`, `amazon-quick/`) BEFORE
+  // splitting on trailing `[effort=...]` params so `[aws]-quick-advanced` never collapses to `""`.
+  raw = raw.replace(/^\[[^\]]+\][-_/]?/, "");
+  raw = raw.replace(/^(?:amazon-quick|aws-quick|quick|aws|anthropic)\//, "");
+  let base = raw.split("[")[0]?.trim() ?? "";
   base = base.replace(/\([^)]*\)$/, "").trim();
   if (base === "default") return "auto";
   if (base.endsWith("-fast") && base !== "quick-fast") base = base.slice(0, -"-fast".length);

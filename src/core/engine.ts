@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 import dns from "node:dns/promises";
+import http from "node:http";
+import https from "node:https";
 import net from "node:net";
 import sharp from "sharp";
 import WebSocket from "ws";
@@ -16,11 +18,14 @@ import {
   QUICK_APP_VERSION,
   QUICK_DESKTOP_USER_AGENT,
   resolveOAuthAccessToken,
+  uploadOAuthTextAttachment,
+  type QuickFileAttachment,
 } from "../aws-quick/oauth-client.js";
 import {
-  getSharedOutpost,
+  assertSafeWsHost,
   parseQuickCredential,
   stopSharedOutpost,
+  withSharedOutpostLock,
 } from "../aws-quick/outpost-singleton.js";
 import { buildWebWsConnection } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
@@ -52,6 +57,34 @@ export interface QuickImageAttachment {
   mimeType: string;
   contentSha256: string;
   data: string;
+}
+
+export type QuickAttachment = QuickImageAttachment | QuickFileAttachment;
+
+/**
+ * Build a compact inline wrapper prompt when an oversized (>46KB) conversation/context
+ * has been uploaded out-of-band as a `.txt` attachment, preserving the recent tail inline
+ * so the model immediately sees the latest user request while inspecting the file for earlier details.
+ */
+export function buildOutOfBandContextPrompt(
+  fullPrompt: string,
+  filename: string,
+  maxTailChars = 3_500,
+): string {
+  const totalChars = fullPrompt.length;
+  let tailStart = Math.max(0, totalChars - maxTailChars);
+  if (tailStart > 0) {
+    const nextNl = fullPrompt.indexOf("\n", tailStart);
+    if (nextNl !== -1 && nextNl < tailStart + 400) {
+      tailStart = nextNl + 1;
+    }
+  }
+  const tailText = fullPrompt.slice(tailStart).trimStart();
+  return [
+    `[The full conversation/context (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Read the attached file for earlier context/details, then respond directly to the latest request below.]`,
+    "",
+    tailText,
+  ].join("\n");
 }
 
 const MAX_REMOTE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -124,16 +157,21 @@ function extForImageMime(mimeType: string): string {
  * Convert OpenAI/Anthropic NormalizedImage entries into AWS Quick `user_message.payload.attachments`.
  * Supports inline base64, `data:image/...;base64,...` URIs, and remote `http(s)://` image URLs.
  */
+const MAX_INLINE_IMAGES = 10;
+
 export async function buildQuickImageAttachments(
   images: readonly NormalizedImage[] | undefined,
   signal?: AbortSignal,
   totalBase64Budget = MAX_TOTAL_IMAGE_BASE64_CHARS,
 ): Promise<QuickImageAttachment[]> {
   if (!images || images.length === 0) return [];
+  // Keep the most recent images when a long conversation history accumulates >10 screenshots
+  // so the combined base64 payload always fits inside AWS Quick's 50KB single-frame limit.
+  const boundedImages = images.length > MAX_INLINE_IMAGES ? images.slice(-MAX_INLINE_IMAGES) : images;
   const out: QuickImageAttachment[] = [];
 
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i]!;
+  for (let i = 0; i < boundedImages.length; i++) {
+    const img = boundedImages[i]!;
     let mimeType = "image/png";
     let rawBase64 = "";
 
@@ -153,17 +191,13 @@ export async function buildQuickImageAttachments(
         mimeType = dataMatch[1] || "image/png";
         rawBase64 = dataMatch[2] || "";
       } else if (/^https?:\/\//i.test(url)) {
-        const { res } = await fetchSafeRemoteImage(url, signal);
-        const ct = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+        const { contentType, buf } = await fetchSafeRemoteImage(url, signal);
+        const ct = contentType.split(";")[0]?.trim().toLowerCase();
         if (!ct || !ct.startsWith("image/")) {
           throw new GatewayError("Remote image URL did not return an image/* Content-Type.", 400, "invalid_image_type");
         }
         mimeType = ct;
-        const arr = Buffer.from(await res.arrayBuffer());
-        if (arr.byteLength > MAX_REMOTE_IMAGE_BYTES) {
-          throw new GatewayError("Remote image exceeds 10 MB limit.", 400, "image_too_large");
-        }
-        rawBase64 = arr.toString("base64");
+        rawBase64 = buf.toString("base64");
       } else {
         continue;
       }
@@ -171,7 +205,8 @@ export async function buildQuickImageAttachments(
 
     if (!rawBase64) continue;
     const effectiveTotalBudget = Math.max(12_000, Math.min(MAX_TOTAL_IMAGE_BASE64_CHARS, totalBase64Budget));
-    const perImageBudget = Math.max(8_000, Math.floor(effectiveTotalBudget / images.length));
+    // Scale per-image budget strictly by image count (floor 2.4KB) so 6-10 images never exceed 50KB total.
+    const perImageBudget = Math.max(2_400, Math.floor(effectiveTotalBudget / boundedImages.length));
     const rawBuf = Buffer.from(rawBase64, "base64");
     const fitted = await compressImageForQuickFrame(rawBuf, mimeType, perImageBudget);
     const contentSha256 = crypto.createHash("sha256").update(fitted.buf).digest("hex");
@@ -190,6 +225,19 @@ export async function buildQuickImageAttachments(
 }
 
 const MAX_REMOTE_IMAGE_REDIRECTS = 3;
+const MAX_WS_RECV_BUF_BYTES = 16 * 1024 * 1024;
+
+function appendWsRecvBuf(recvBuf: Buffer<ArrayBuffer>, data: Buffer | ArrayBuffer | Buffer[]): Buffer<ArrayBuffer> {
+  const chunk = (Buffer.isBuffer(data)
+    ? data
+    : Array.isArray(data)
+      ? Buffer.concat(data)
+      : Buffer.from(data)) as Buffer<ArrayBuffer>;
+  if (recvBuf.length + chunk.length > MAX_WS_RECV_BUF_BYTES) {
+    throw new GatewayError("Upstream WebSocket frame buffer exceeded 16 MB limit.", 502, "upstream_frame_too_large");
+  }
+  return recvBuf.length === 0 ? chunk : (Buffer.concat([recvBuf, chunk]) as Buffer<ArrayBuffer>);
+}
 
 function isPrivateOrReservedIpv4(ip: string): boolean {
   const parts = ip.split(".").map((s) => Number(s));
@@ -200,26 +248,103 @@ function isPrivateOrReservedIpv4(ip: string): boolean {
   if (a === 172 && b >= 16 && b <= 31) return true;
   if (a === 192 && b === 168) return true;
   if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  if (a === 192 && b === 0 && (parts[2] === 0 || parts[2] === 2)) return true; // IETF protocol / TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmark
+  if (a === 198 && b === 51 && parts[2] === 100) return true; // TEST-NET-2
+  if (a === 203 && b === 0 && parts[2] === 113) return true; // TEST-NET-3
   if (a >= 224) return true; // multicast / reserved
   return false;
 }
 
-function isPrivateOrReservedIp(raw: string): boolean {
+/**
+ * Expands any valid IPv6 literal (including `::` shorthand, zone IDs, and embedded dotted-quad IPv4)
+ * into its canonical 8 × 16-bit integer groups.
+ */
+function parseIpv6ToGroups(raw: string): number[] | null {
+  const withoutZone = raw.split("%")[0]!.toLowerCase();
+  let normalized = withoutZone;
+  const lastColon = normalized.lastIndexOf(":");
+  if (lastColon >= 0 && normalized.slice(lastColon + 1).includes(".")) {
+    const ipv4Tail = normalized.slice(lastColon + 1);
+    if (!net.isIPv4(ipv4Tail)) return null;
+    const octets = ipv4Tail.split(".").map((s) => Number(s));
+    const hi = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const lo = ((octets[2]! << 8) | octets[3]!).toString(16);
+    normalized = `${normalized.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+  const halves = normalized.split("::");
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(":").filter(Boolean) : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(":").filter(Boolean) : [];
+  const missing = 8 - (left.length + right.length);
+  if (halves.length === 1 && missing !== 0) return null;
+  if (halves.length === 2 && missing < 1) return null;
+  const full = [...left, ...Array<string>(missing).fill("0"), ...right];
+  if (full.length !== 8) return null;
+  const groups: number[] = [];
+  for (const g of full) {
+    if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+    groups.push(parseInt(g, 16));
+  }
+  return groups;
+}
+
+function groupsToIpv4(hi: number, lo: number): string {
+  return `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+}
+
+export function isPrivateOrReservedIp(raw: string): boolean {
   const ip = raw.trim().toLowerCase().replace(/^\[|\]$/g, "");
   if (net.isIPv4(ip)) return isPrivateOrReservedIpv4(ip);
   if (net.isIPv6(ip)) {
-    if (ip === "::" || ip === "::1") return true;
-    if (ip.startsWith("fc") || ip.startsWith("fd")) return true; // ULA fc00::/7
-    if (/^fe[89ab]/.test(ip)) return true; // link-local fe80::/10
-    if (ip.startsWith("ff")) return true; // multicast
-    const v4Mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
-    if (v4Mapped) return isPrivateOrReservedIpv4(v4Mapped[1]!);
+    const g = parseIpv6ToGroups(ip);
+    if (!g) return true;
+    const [g0, g1, g2, g3, g4, g5, g6, g7] = g as [number, number, number, number, number, number, number, number];
+    const allZero = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 0;
+    const isLoopback = g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0 && g6 === 0 && g7 === 1;
+    if (allZero || isLoopback) return true;
+    // IPv4-mapped ::ffff:0:0/96 (covers both dotted ::ffff:127.0.0.1 and WHATWG hex ::ffff:7f00:1)
+    if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) {
+      return isPrivateOrReservedIpv4(groupsToIpv4(g6, g7));
+    }
+    // IPv4-compatible ::/96 (deprecated RFC 4291, e.g. ::7f00:1)
+    if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) {
+      return isPrivateOrReservedIpv4(groupsToIpv4(g6, g7));
+    }
+    // IPv4-translated ::ffff:0:0:0/96 (RFC 2765)
+    if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0xffff && g5 === 0) {
+      return isPrivateOrReservedIpv4(groupsToIpv4(g6, g7));
+    }
+    // NAT64 well-known 64:ff9b::/96 & local-use 64:ff9b:1::/48
+    if (g0 === 0x0064 && g1 === 0xff9b && ((g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) || g2 === 0x0001)) {
+      return true;
+    }
+    // 6to4 2002::/16 (embeds IPv4 in g1..g2)
+    if (g0 === 0x2002) {
+      return isPrivateOrReservedIpv4(groupsToIpv4(g1, g2));
+    }
+    // Teredo 2001:0000::/32 (tunneling)
+    if (g0 === 0x2001 && g1 === 0x0000) return true;
+    // Discard 0100::/64
+    if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) return true;
+    // Documentation 2001:db8::/32
+    if (g0 === 0x2001 && g1 === 0x0db8) return true;
+    // ULA fc00::/7
+    if ((g0 & 0xfe00) === 0xfc00) return true;
+    // Link-local fe80::/10 & deprecated site-local fec0::/10
+    if ((g0 & 0xffc0) === 0xfe80 || (g0 & 0xffc0) === 0xfec0) return true;
+    // Multicast ff00::/8
+    if ((g0 & 0xff00) === 0xff00) return true;
     return false;
   }
   return true;
 }
 
-async function assertSafeRemoteImageUrl(rawUrl: string): Promise<URL> {
+export async function assertSafeRemoteImageUrl(rawUrl: string): Promise<{
+  parsed: URL;
+  pinnedIp: string;
+  family: 4 | 6;
+}> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -233,47 +358,149 @@ async function assertSafeRemoteImageUrl(rawUrl: string): Promise<URL> {
     throw new GatewayError("Image URL must not embed credentials.", 400, "invalid_image_url");
   }
   const host = parsed.hostname.toLowerCase().replace(/\.$/, "");
-  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) {
+  const bareHost = host.replace(/^\[|\]$/g, "");
+  if (!bareHost || bareHost === "localhost" || bareHost.endsWith(".localhost") || bareHost.endsWith(".local") || bareHost.endsWith(".internal")) {
     throw new GatewayError("Blocked private/internal image URL host.", 400, "ssrf_blocked");
   }
-  if (net.isIP(host)) {
-    if (isPrivateOrReservedIp(host)) {
+  const ipVer = net.isIP(bareHost);
+  if (ipVer === 4 || ipVer === 6) {
+    if (isPrivateOrReservedIp(bareHost)) {
       throw new GatewayError("Blocked private/internal image URL IP.", 400, "ssrf_blocked");
     }
-    return parsed;
+    return { parsed, pinnedIp: bareHost, family: ipVer };
   }
-  let addrs: { address: string }[];
+  let addrs: { address: string; family: number }[];
   try {
-    addrs = await dns.lookup(host, { all: true, verbatim: true });
+    addrs = await dns.lookup(bareHost, { all: true, verbatim: true });
   } catch {
     throw new GatewayError("Failed to resolve image URL hostname.", 400, "invalid_image_url");
   }
   if (!addrs.length || addrs.some((a) => isPrivateOrReservedIp(a.address))) {
     throw new GatewayError("Blocked image URL resolving to private/internal IP.", 400, "ssrf_blocked");
   }
-  return parsed;
+  const first = addrs[0]!;
+  return {
+    parsed,
+    pinnedIp: first.address,
+    family: first.family === 6 ? 6 : 4,
+  };
 }
 
-async function fetchSafeRemoteImage(initialUrl: string, signal?: AbortSignal): Promise<{ res: Response }> {
+export function pinnedHttpGet(
+  parsed: URL,
+  pinnedIp: string,
+  family: 4 | 6,
+  signal?: AbortSignal,
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; buf: Buffer }> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new GatewayError("Remote image request aborted.", 499, "request_aborted"));
+      return;
+    }
+    const isHttps = parsed.protocol === "https:";
+    const mod = isHttps ? https : http;
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+    const bareHostname = parsed.hostname.replace(/^\[|\]$/g, "");
+    const req = mod.request(
+      {
+        hostname: bareHostname,
+        port: parsed.port ? Number(parsed.port) : isHttps ? 443 : 80,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "GET",
+        headers: {
+          Host: parsed.host,
+          "User-Agent": "aws-quick2api/image-fetch",
+        },
+        ...(isHttps && !net.isIP(bareHostname) ? { servername: bareHostname } : {}),
+        // Pin DNS resolution directly to the validated IP to eliminate DNS Rebinding (TOCTOU).
+        // Node >=20 enables `autoSelectFamily` by default and passes `{ all: true }` to custom lookup.
+        lookup: (_hostname, opts, cb) => {
+          if (opts && typeof opts === "object" && opts.all) {
+            (cb as unknown as (err: NodeJS.ErrnoException | null, addrs: Array<{ address: string; family: number }>) => void)(
+              null,
+              [{ address: pinnedIp, family }],
+            );
+          } else {
+            cb(null, pinnedIp, family);
+          }
+        },
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400) {
+          res.resume();
+          done(() => resolve({ status, headers: res.headers, buf: Buffer.alloc(0) }));
+          return;
+        }
+        const declaredLen = Number(res.headers["content-length"] || "0");
+        if (Number.isFinite(declaredLen) && declaredLen > MAX_REMOTE_IMAGE_BYTES) {
+          res.destroy();
+          req.destroy();
+          done(() => reject(new GatewayError("Remote image exceeds 10 MB limit.", 400, "image_too_large")));
+          return;
+        }
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        res.on("data", (chunk: Buffer) => {
+          const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          totalBytes += b.byteLength;
+          if (totalBytes > MAX_REMOTE_IMAGE_BYTES) {
+            res.destroy();
+            req.destroy();
+            done(() => reject(new GatewayError("Remote image exceeds 10 MB limit.", 400, "image_too_large")));
+            return;
+          }
+          chunks.push(b);
+        });
+        res.on("end", () => {
+          done(() => resolve({ status, headers: res.headers, buf: Buffer.concat(chunks) }));
+        });
+        res.on("error", (err) => done(() => reject(err)));
+      },
+    );
+    const onAbort = () => {
+      req.destroy();
+      done(() => reject(new GatewayError("Remote image request aborted.", 499, "request_aborted")));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      req.destroy();
+      done(() => reject(new GatewayError("Timed out fetching remote image URL.", 400, "invalid_image_url")));
+    }, 15_000);
+    timer.unref?.();
+    req.on("error", (err) => done(() => reject(err)));
+    req.end();
+  });
+}
+
+async function fetchSafeRemoteImage(
+  initialUrl: string,
+  signal?: AbortSignal,
+): Promise<{ contentType: string; buf: Buffer }> {
   let current = initialUrl;
   for (let hop = 0; hop <= MAX_REMOTE_IMAGE_REDIRECTS; hop++) {
-    const parsed = await assertSafeRemoteImageUrl(current);
-    const res = await fetch(parsed.toString(), {
-      redirect: "manual",
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
-    });
+    const { parsed, pinnedIp, family } = await assertSafeRemoteImageUrl(current);
+    const res = await pinnedHttpGet(parsed, pinnedIp, family, signal);
     if (res.status >= 300 && res.status < 400) {
-      const loc = res.headers.get("location");
+      const loc = typeof res.headers.location === "string" ? res.headers.location : undefined;
       if (!loc || hop === MAX_REMOTE_IMAGE_REDIRECTS) {
         throw new GatewayError("Too many or invalid redirects for image URL.", 400, "invalid_image_url");
       }
       current = new URL(loc, parsed).toString();
       continue;
     }
-    if (!res.ok) {
+    if (res.status < 200 || res.status >= 300) {
       throw new GatewayError(`Failed to fetch image URL (${res.status}).`, 400, "invalid_image_url");
     }
-    return { res };
+    const ct = typeof res.headers["content-type"] === "string" ? res.headers["content-type"] : "";
+    return { contentType: ct, buf: res.buf };
   }
   throw new GatewayError("Too many redirects for image URL.", 400, "invalid_image_url");
 }
@@ -496,6 +723,7 @@ export function splitPromptIntoSafeChunks(
  */
 const WARM_THREAD_TTL_MS = 30 * 60 * 1000;
 const PARKED_WS_IDLE_TTL_MS = 15 * 60 * 1000;
+const PARKED_WS_TOKEN_REFRESH_MS = 12 * 60 * 1000;
 const MAX_WARM_THREADS = 256;
 const MAX_PARKED_WS = 32;
 // AWS Quick enforces a hard ceiling of 5 active WebSocket connections per account.
@@ -519,28 +747,40 @@ export function classifyUpstreamError(finalErr: GatewayError): {
     /message.?size|payload.?size|frame.?limit|context.?limit|too.?large|too.?long|max.?length/i.test(lower);
   const isSessionLifecycleErr =
     /thread.?expired|session.?expired|conversation.?expired/i.test(lower);
+  // Check proxy/transport errors BEFORE auth so `Proxy CONNECT failed (407 Proxy Authentication Required)`
+  // and `SOCKS5 username/password authentication failed` never permanently disable a healthy AWS account.
+  const isExplicitProxyOrNetErr =
+    /proxy connect failed|socks5.*(?:authentication|handshake|connect)|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower);
+  // Check explicit quota exhaustion BEFORE generic HTTP 429 so `QuotaExceededException`, `monthly limit exceeded`,
+  // and 429 responses carrying explicit quota text trip quota circuit-breaking instead of 3s transient backoff.
   const isQuotaErr =
     !isPayloadOrContextSizeErr &&
     !isConnLimitErr &&
+    !isExplicitProxyOrNetErr &&
     (finalErr.code === "quota_exhausted" ||
       finalErr.status === 402 ||
-      /quota|usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|limit.?exceeded|insufficient.?(?:quota|credits?|balance)|exhausted/i.test(lower));
+      /usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|insufficient.?(?:quota|credits?|balance)|quota.?exceeded|exceeded\s+(?:your\s+)?(?:current\s+)?quota|quota\s+(?:has\s+been\s+)?(?:exhausted|exceeded|insufficient)|monthly\s+limit\s+exceeded|reached (?:your|its) (?:usage|session|monthly) limit/i.test(lower));
   const isRateLimitErr =
+    !isExplicitProxyOrNetErr &&
     !isQuotaErr &&
-    (isConnLimitErr || finalErr.status === 429 || /rate.?limit|too many requests|throttl/i.test(lower));
+    (isConnLimitErr ||
+      finalErr.status === 429 ||
+      /rate.?limit|too many requests|toomanyrequestsexception|throttl/i.test(lower));
   const isAuthErr =
+    !isExplicitProxyOrNetErr &&
+    !isRateLimitErr &&
+    !isQuotaErr &&
     finalErr.code !== "model_not_available" &&
     !isSessionLifecycleErr &&
     (finalErr.status === 401 ||
       finalErr.status === 403 ||
-      /unauthorized|invalid.?grant|invalid refresh token|oidc refresh_token failed \(400\)|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+      /unauthorized|invalid.?grant|invalid.?client|unauthorized.?client|expired.?token|invalid refresh token|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
   const isProxyOrConnErr =
-    !isQuotaErr &&
-    !isRateLimitErr &&
-    !isAuthErr &&
-    (finalErr.status === 502 ||
-      finalErr.status === 503 ||
-      /proxy connect failed|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower));
+    isExplicitProxyOrNetErr ||
+    (!isQuotaErr &&
+      !isRateLimitErr &&
+      !isAuthErr &&
+      (finalErr.status === 502 || finalErr.status === 503));
 
   return {
     isConnLimitErr,
@@ -580,9 +820,11 @@ interface ParkedWsHandle {
   outpostId: string;
   pingTimer: NodeJS.Timeout;
   idleTimer: NodeJS.Timeout;
+  tokenRefreshTimer?: NodeJS.Timeout;
   onIdleClose: () => void;
   onIdleError: () => void;
   onIdleMessage: () => void;
+  onIdlePong: () => void;
 }
 
 interface WarmThreadEntry {
@@ -603,12 +845,12 @@ export interface QuickChatAgentInfo {
   isSystem: boolean;
 }
 
-export const DEFAULT_CODING_AGENT_NAME = "Quick2API Bridge";
-export const LEGACY_CODING_AGENT_NAMES = ["Quick2API Bridge", "Quick2API Coding Bridge"];
+export const DEFAULT_CODING_AGENT_NAME = "Coding Assistant";
+export const LEGACY_CODING_AGENT_NAMES = ["Coding Assistant", "Quick2API Bridge", "Quick2API Coding Bridge"];
 export const DEFAULT_CODING_AGENT_DESCRIPTION =
-  "Minimal AI assistant configured for external API clients.";
+  "General software engineering and coding assistant.";
 export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
-  "You are a helpful AI assistant accessed via an external API client. Follow the user's instructions and any structured output or tool-request format specified by the client directly and concisely. When the client provides external tool schemas, emit the requested structured call as a proposal for the user's local client to review and execute.";
+  "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly.";
 
 export class QuickExecutionEngine {
   private readonly config: GatewayConfig;
@@ -642,9 +884,11 @@ export class QuickExecutionEngine {
   private detachParkedWs(handle: ParkedWsHandle, closeSocket: boolean): void {
     clearInterval(handle.pingTimer);
     clearTimeout(handle.idleTimer);
+    if (handle.tokenRefreshTimer) clearInterval(handle.tokenRefreshTimer);
     handle.ws.off("close", handle.onIdleClose);
     handle.ws.off("error", handle.onIdleError);
     handle.ws.off("message", handle.onIdleMessage);
+    handle.ws.off("pong", handle.onIdlePong);
     if (closeSocket) {
       try {
         handle.ws.close();
@@ -758,8 +1002,23 @@ export class QuickExecutionEngine {
     ws?: WebSocket;
     outpostId?: string;
     encodeFrame?: (frame: Record<string, unknown>) => Uint8Array | string;
+    apiKey?: string;
+    proxyUrl?: string;
   }): boolean {
-    const { scope, conversationKey, slotId, isIncognito, chatAgentId, prefixHashes, threadId, ws, outpostId, encodeFrame } = params;
+    const {
+      scope,
+      conversationKey,
+      slotId,
+      isIncognito,
+      chatAgentId,
+      prefixHashes,
+      threadId,
+      ws,
+      outpostId,
+      encodeFrame,
+      apiKey,
+      proxyUrl,
+    } = params;
     const keys = Array.from(
       new Set(prefixHashes.filter(Boolean).map((h) => this.warmKey(scope, conversationKey, slotId, isIncognito, h, chatAgentId))),
     );
@@ -834,20 +1093,60 @@ export class QuickExecutionEngine {
       const onIdleClose = () => handleDeadIdleWs();
       const onIdleError = () => handleDeadIdleWs();
       const onIdleMessage = () => {
-        // Ignore unsolicited trailing keepalive/status frames while parked.
+        // Any inbound frame proves the socket is alive; reset missed-pong counter.
+        missedPongs = 0;
       };
+      let missedPongs = 0;
+      const onIdlePong = () => {
+        missedPongs = 0;
+      };
+
       const pingTimer = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState !== WebSocket.OPEN) {
+          handleDeadIdleWs();
+          return;
+        }
+        if (missedPongs >= 2) {
+          // Half-open dead NAT/proxy socket: terminate immediately so the next turn never hangs.
           try {
-            ws.send(encodeFrame({ type: "ping", payload: { timestamp: Date.now() } }));
-          } catch {
-            handleDeadIdleWs();
-          }
-        } else {
+            ws.terminate();
+          } catch { }
+          handleDeadIdleWs();
+          return;
+        }
+        missedPongs += 1;
+        try {
+          ws.ping();
+          ws.send(encodeFrame({ type: "ping", payload: { timestamp: Date.now() } }));
+        } catch {
           handleDeadIdleWs();
         }
       }, 25_000);
       pingTimer.unref?.();
+
+      // Official client parity: refresh JWT over long-lived parked OAuth sockets every 12m
+      // so reused warm connections never fail mid-session due to token expiry.
+      let tokenRefreshTimer: NodeJS.Timeout | undefined;
+      const parsedForRefresh = apiKey ? parseQuickCredential(apiKey) : undefined;
+      if (parsedForRefresh?.mode === "oauth" && parsedForRefresh.oauth) {
+        const oauthCred = parsedForRefresh.oauth;
+        tokenRefreshTimer = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN || !entry.parkedWs) {
+            handleDeadIdleWs();
+            return;
+          }
+          void resolveOAuthAccessToken(oauthCred, false, proxyUrl)
+            .then(({ accessToken }) => {
+              if (ws.readyState === WebSocket.OPEN && entry.parkedWs) {
+                ws.send(encodeFrame({ type: "token_refresh", token: accessToken }));
+              }
+            })
+            .catch(() => {
+              handleDeadIdleWs();
+            });
+        }, PARKED_WS_TOKEN_REFRESH_MS);
+        tokenRefreshTimer.unref?.();
+      }
 
       const idleTtl = Math.min(warmTtlMs, PARKED_WS_IDLE_TTL_MS);
       const idleTimer = setTimeout(() => handleDeadIdleWs(), idleTtl);
@@ -856,15 +1155,18 @@ export class QuickExecutionEngine {
       ws.on("close", onIdleClose);
       ws.on("error", onIdleError);
       ws.on("message", onIdleMessage);
+      ws.on("pong", onIdlePong);
 
       entry.parkedWs = {
         ws,
         outpostId: outpostId || "web0",
         pingTimer,
         idleTimer,
+        ...(tokenRefreshTimer ? { tokenRefreshTimer } : {}),
         onIdleClose,
         onIdleError,
         onIdleMessage,
+        onIdlePong,
       };
       parkedSocket = true;
     }
@@ -974,22 +1276,23 @@ export class QuickExecutionEngine {
         ...(wsAgent ? { agent: wsAgent } : {}),
       });
     } else {
-      const outpost = await getSharedOutpost();
-      if (cred.mode === "token" && cred.jwt) {
-        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
-      } else {
-        outpost.setImportedToken(null);
-      }
-
-      const [session, oid] = await Promise.all([
-        outpost.getSncsSession(),
-        outpost.getOutpostId(),
-      ]);
+      const [session, oid] = await withSharedOutpostLock(async (outpost) => {
+        if (cred.mode === "token" && cred.jwt) {
+          outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+        } else {
+          outpost.setImportedToken(null);
+        }
+        return Promise.all([
+          outpost.getSncsSession(),
+          outpost.getOutpostId(),
+        ]);
+      });
+      const safeWsHost = assertSafeWsHost(session.wsHost);
       actorArn = session.actorArn;
       outpostId = oid;
       const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
       const wsUrl =
-        `wss://${session.wsHost}${wsPath}` +
+        `wss://${safeWsHost}${wsPath}` +
         `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
         `&token=${encodeURIComponent(session.jwt)}` +
         `&outpostId=${encodeURIComponent(outpostId)}` +
@@ -1049,9 +1352,16 @@ export class QuickExecutionEngine {
       });
 
       ws.on("message", (data: Buffer) => {
-        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
-        const { messages, consumed } = drainEventStream(recvBuf, 0);
-        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        let messages;
+        try {
+          recvBuf = appendWsRecvBuf(recvBuf, data);
+          const drained = drainEventStream(recvBuf, 0);
+          if (drained.consumed > 0) recvBuf = recvBuf.subarray(drained.consumed);
+          messages = drained.messages;
+        } catch {
+          done();
+          return;
+        }
         for (const esMsg of messages) {
           let decoded;
           try {
@@ -1121,19 +1431,21 @@ export class QuickExecutionEngine {
         ...(wsAgent ? { agent: wsAgent } : {}),
       });
     } else {
-      const outpost = await getSharedOutpost();
-      if (cred.mode === "token" && cred.jwt) {
-        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
-      } else {
-        outpost.setImportedToken(null);
-      }
-      const [session, oid] = await Promise.all([outpost.getSncsSession(), outpost.getOutpostId()]);
+      const [session, oid] = await withSharedOutpostLock(async (outpost) => {
+        if (cred.mode === "token" && cred.jwt) {
+          outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+        } else {
+          outpost.setImportedToken(null);
+        }
+        return Promise.all([outpost.getSncsSession(), outpost.getOutpostId()]);
+      });
       if (!session.jwt || !session.wsHost) {
         throw new GatewayError("AWS Quick session unavailable.", 502, "upstream_auth_error");
       }
+      const safeWsHost = assertSafeWsHost(session.wsHost);
       const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
       const wsUrl =
-        `wss://${session.wsHost}${wsPath}` +
+        `wss://${safeWsHost}${wsPath}` +
         `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
         `&token=${encodeURIComponent(session.jwt)}` +
         `&outpostId=${encodeURIComponent(oid)}` +
@@ -1176,9 +1488,16 @@ export class QuickExecutionEngine {
       timer.unref?.();
 
       ws.on("message", (data: Buffer) => {
-        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
-        const { messages, consumed } = drainEventStream(recvBuf, 0);
-        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        let messages;
+        try {
+          recvBuf = appendWsRecvBuf(recvBuf, data);
+          const drained = drainEventStream(recvBuf, 0);
+          if (drained.consumed > 0) recvBuf = recvBuf.subarray(drained.consumed);
+          messages = drained.messages;
+        } catch (err) {
+          done(() => reject(err instanceof Error ? err : new Error(String(err))));
+          return;
+        }
         for (const esMsg of messages) {
           let decoded;
           try { decoded = decodeFrame(esMsg); } catch { continue; }
@@ -1276,9 +1595,16 @@ export class QuickExecutionEngine {
       };
 
       ws.on("message", (data: Buffer) => {
-        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
-        const { messages, consumed } = drainEventStream(recvBuf, 0);
-        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        let messages;
+        try {
+          recvBuf = appendWsRecvBuf(recvBuf, data);
+          const drained = drainEventStream(recvBuf, 0);
+          if (drained.consumed > 0) recvBuf = recvBuf.subarray(drained.consumed);
+          messages = drained.messages;
+        } catch (err) {
+          done(() => reject(err instanceof Error ? err : new Error(String(err))));
+          return;
+        }
         for (const esMsg of messages) {
           let decoded;
           try { decoded = decodeFrame(esMsg); } catch { continue; }
@@ -1397,9 +1723,16 @@ export class QuickExecutionEngine {
       };
 
       ws.on("message", (data: Buffer) => {
-        recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
-        const { messages, consumed } = drainEventStream(recvBuf, 0);
-        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        let messages;
+        try {
+          recvBuf = appendWsRecvBuf(recvBuf, data);
+          const drained = drainEventStream(recvBuf, 0);
+          if (drained.consumed > 0) recvBuf = recvBuf.subarray(drained.consumed);
+          messages = drained.messages;
+        } catch (err) {
+          done(() => reject(err instanceof Error ? err : new Error(String(err))));
+          return;
+        }
         for (const esMsg of messages) {
           let decoded;
           try { decoded = decodeFrame(esMsg); } catch { continue; }
@@ -1532,9 +1865,22 @@ export class QuickExecutionEngine {
       usedProxy?: boolean;
     }) => void,
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
+    // Pre-lease input validation (P1-E): reject empty prompts and private/SSRF image URLs
+    // BEFORE acquiring an upstream account slot so malformed requests never consume pool capacity.
+    const allImages = [...(turn.images || []), ...(turn.incrementalImages || [])];
+    if (!turn.fullTranscriptText?.trim() && allImages.length === 0) {
+      throw new GatewayError("Empty prompt", 400, "invalid_request_error");
+    }
+    for (const img of allImages) {
+      if ("url" in img && img.url && !img.url.startsWith("data:")) {
+        await assertSafeRemoteImageUrl(img.url);
+      }
+    }
+
     const excluded = new Set<string>();
+    const retriedAuthRefreshSlots = new Set<string>();
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 5);
-    let remainingWaitBudgetMs = 6_000;
+    let remainingWaitBudgetMs = 18_000;
     let retriedSameSlotConnLimit = false;
 
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -1545,7 +1891,7 @@ export class QuickExecutionEngine {
         turn.conversationKey,
         {
           signal: turn.signal,
-          maxWaitMs: Math.max(0, Math.min(4_000, remainingWaitBudgetMs)),
+          maxWaitMs: Math.max(0, Math.min(15_000, remainingWaitBudgetMs)),
         },
       );
       remainingWaitBudgetMs = Math.max(0, remainingWaitBudgetMs - (Date.now() - waitStartedAt));
@@ -1639,15 +1985,44 @@ export class QuickExecutionEngine {
             err = fallbackErr;
           }
         }
-        const finalErr = mapSdkError(err);
-        const msg = finalErr.message || "";
-        const {
+        let finalErr = mapSdkError(err);
+        let msg = finalErr.message || "";
+        let {
           isConnLimitErr,
           isQuotaErr,
           isRateLimitErr,
           isAuthErr,
           isProxyOrConnErr,
         } = classifyUpstreamError(finalErr);
+
+        // Official client parity: on 401/403 auth errors for OAuth accounts, force-refresh the access
+        // token and retry the same slot once before ever marking a healthy account as auth-failed.
+        if (
+          isAuthErr &&
+          !yieldedOutput &&
+          !turn.signal?.aborted &&
+          !retriedAuthRefreshSlots.has(lease.slotId)
+        ) {
+          const parsedCred = parseQuickCredential(lease.apiKey);
+          if (parsedCred.mode === "oauth" && parsedCred.oauth) {
+            retriedAuthRefreshSlots.add(lease.slotId);
+            try {
+              await resolveOAuthAccessToken(parsedCred.oauth, true, lease.proxyUrl);
+              attempt -= 1;
+              continue;
+            } catch (refreshErr) {
+              finalErr = mapSdkError(refreshErr);
+              msg = finalErr.message || "";
+              ({
+                isConnLimitErr,
+                isQuotaErr,
+                isRateLimitErr,
+                isAuthErr,
+                isProxyOrConnErr,
+              } = classifyUpstreamError(finalErr));
+            }
+          }
+        }
 
         const evictedParked = isConnLimitErr
           ? this.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
@@ -1673,8 +2048,12 @@ export class QuickExecutionEngine {
           keyPool.reportQuotaExhausted(lease.apiKey, turn.requestedModel, msg);
         } else if (isConnLimitErr) {
           keyPool.reportConnLimit(lease.apiKey);
-        } else if (isRateLimitErr || isProxyOrConnErr) {
-          keyPool.reportRateLimit(lease.apiKey);
+        } else if (isRateLimitErr) {
+          const retryAfterMatch = /retry[-_\s]?after[\s:=]+(\d+(?:\.\d+)?)/i.exec(msg);
+          const retryAfterMs = retryAfterMatch ? Number(retryAfterMatch[1]) * 1_000 : undefined;
+          keyPool.reportRateLimit(lease.apiKey, retryAfterMs);
+        } else if (isProxyOrConnErr) {
+          keyPool.reportTransientError(lease.apiKey);
         } else if (isAuthErr) {
           keyPool.reportAuthFailure(lease.apiKey, msg);
         }
@@ -1757,12 +2136,18 @@ export class QuickExecutionEngine {
       reusedWs.on("close", onTempReusedDead);
     }
 
+    const isOAuthAccount = parseQuickCredential(lease.apiKey).mode === "oauth";
     const buildPromptAndAttachments = async (incremental: boolean) => {
       const sourceImages = incremental ? (turn.incrementalImages ?? []) : turn.images;
       const rawPromptText = incremental ? turn.incrementalUserText : turn.fullTranscriptText;
       const approxTextBytes =
         jsonStringUtf8Bytes(rawPromptText || "") + jsonStringUtf8Bytes(customPrompt || "");
-      const adaptiveImageBudget = Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
+      // On OAuth accounts, oversized text (>42KB) will be uploaded out-of-band as a ~300B `.txt` attachment,
+      // so images keep a generous 34KB frame budget instead of getting crushed down to 8KB.
+      const willUseOutOfBandText = isOAuthAccount && approxTextBytes > 42_000;
+      const adaptiveImageBudget = willUseOutOfBandText
+        ? 34_000
+        : Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
       const atts = await buildQuickImageAttachments(sourceImages, turn.signal, adaptiveImageBudget);
       const text = rawPromptText?.trim() || (atts.length > 0 ? "Please analyze the attached image(s)." : "");
       if (!text) {
@@ -1772,7 +2157,7 @@ export class QuickExecutionEngine {
     };
 
     let prompt: string;
-    let attachments: QuickImageAttachment[];
+    let attachments: QuickAttachment[];
     try {
       const built = await buildPromptAndAttachments(isWarmIncremental);
       prompt = built.promptText;
@@ -1867,11 +2252,86 @@ export class QuickExecutionEngine {
       this.workingSessionIds.set(lease.slotId, workingSessionId);
     }
     const threadId = warmThreadId || crypto.randomUUID();
+    const effectiveProxy = lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+
+    // Official AWS Quick out-of-band `.txt` attachment path for oversized prompts (>46KB):
+    // Delivers 50KB–95MB contexts in 1 single ~300-byte WS frame (~2s upload) instead of N sequential
+    // 50KB WS chunks, preserving full warm_incremental reuse on Turn N+1 and eliminating chunk ACK issues.
+    if (cred.mode === "oauth" && cred.oauth) {
+      const currentAttBytes = attachments.length > 0 ? Buffer.byteLength(JSON.stringify(attachments), "utf8") : 0;
+      const currentFrameBudget = currentAttBytes > 0
+        ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - currentAttBytes)
+        : MAX_WS_PAYLOAD_UTF8_BYTES;
+      const safeSingleFrameTotal = Math.max(4_096, currentFrameBudget - WS_FRAME_ENVELOPE_MARGIN_BYTES);
+      const estimatedTotalBytes = jsonStringUtf8Bytes(prompt) + jsonStringUtf8Bytes(customPrompt || "");
+      if (estimatedTotalBytes > safeSingleFrameTotal && !turn.signal?.aborted) {
+        const uploadTimeoutSignal = turn.signal
+          ? AbortSignal.any([turn.signal, AbortSignal.timeout(65_000)])
+          : AbortSignal.timeout(65_000);
+        try {
+          const fileName = `conversation_context_${threadId.slice(0, 8)}.txt`;
+          const fileAtt = await uploadOAuthTextAttachment(
+            cred.oauth,
+            threadId,
+            fileName,
+            prompt,
+            effectiveProxy,
+            uploadTimeoutSignal,
+          );
+          attachments = [...attachments, fileAtt];
+          prompt = buildOutOfBandContextPrompt(prompt, fileName);
+        } catch (uploadErr) {
+          const reason = uploadErr instanceof Error ? uploadErr.message : String(uploadErr || "unknown");
+          // Never bypass an explicit AWS Quick DLP policy block by resending the blocked payload via inline chunks.
+          if (/blocked by aws quick dlp policy/i.test(reason)) {
+            throw new GatewayError(redactSecrets(reason), 400, "content_filtered");
+          }
+          console.warn(
+            JSON.stringify({
+              event: "oauth_attachment_fallback_to_chunking",
+              slotId: lease.slotId,
+              bytes: estimatedTotalBytes,
+              reason: redactSecrets(reason).slice(0, 200),
+            }),
+          );
+        }
+      }
+    }
+
+    const attachmentsBytes = attachments.length > 0 ? Buffer.byteLength(JSON.stringify(attachments), "utf8") : 0;
+    const frameBudgetBytes = attachmentsBytes > 0
+      ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - attachmentsBytes)
+      : MAX_WS_PAYLOAD_UTF8_BYTES;
+    const MAX_INLINE_CHUNKS = 12;
+    const { chunks, effectiveCustomPrompt } = splitPromptIntoSafeChunks(prompt, customPrompt, frameBudgetBytes);
+    const totalChunks = chunks.length;
+    if (totalChunks > MAX_INLINE_CHUNKS) {
+      if (reusedWs) {
+        reusedWs.on("error", () => {});
+        try {
+          reusedWs.close();
+        } catch { }
+      }
+      throw new GatewayError(
+        `Prompt requires ${totalChunks} inline chunks (max ${MAX_INLINE_CHUNKS} / ~550KB). Use an OAuth credential for native out-of-band attachment upload or shorten the context.`,
+        413,
+        "payload_too_large",
+      );
+    }
+    if (totalChunks > 1) {
+      console.info(
+        JSON.stringify({
+          event: "inline_chunked_turn",
+          slotId: lease.slotId,
+          chunks: totalChunks,
+          mode: selection.agentMode,
+        }),
+      );
+    }
 
     let ws: WebSocket;
     let actorArn: string | undefined;
     let outpostId = warmHit?.reusedOutpostId || "web0";
-    const effectiveProxy = lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     const wsAgent = getProxyAgent(effectiveProxy);
 
     if (reusedWs && reusedWs.readyState === WebSocket.OPEN) {
@@ -1940,17 +2400,17 @@ export class QuickExecutionEngine {
           ...(wsAgent ? { agent: wsAgent } : {}),
         });
       } else {
-        const outpost = await getSharedOutpost();
-        if (cred.mode === "token" && cred.jwt) {
-          outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
-        } else {
-          outpost.setImportedToken(null);
-        }
-
-        const [session, oid] = await Promise.all([
-          outpost.getSncsSession(),
-          outpost.getOutpostId(),
-        ]);
+        const [session, oid] = await withSharedOutpostLock(async (outpost) => {
+          if (cred.mode === "token" && cred.jwt) {
+            outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+          } else {
+            outpost.setImportedToken(null);
+          }
+          return Promise.all([
+            outpost.getSncsSession(),
+            outpost.getOutpostId(),
+          ]);
+        });
         if (!session.jwt || !session.wsHost) {
           throw new GatewayError(
             "AWS Quick session unavailable. Please sign in to Amazon Quick.app or import a valid credential.",
@@ -1958,13 +2418,14 @@ export class QuickExecutionEngine {
             "upstream_auth_error",
           );
         }
+        const safeWsHost = assertSafeWsHost(session.wsHost);
         actorArn = session.actorArn;
         outpostId = oid;
 
         const replayContext = `v1;setup;${crypto.randomBytes(32).toString("base64url")}`;
         const wsPath = session.wsPath || "/streaming/quickwork-chat-bidirectional-stream";
         const wsUrl =
-          `wss://${session.wsHost}${wsPath}` +
+          `wss://${safeWsHost}${wsPath}` +
           `?surfaceType=${encodeURIComponent(SURFACE_TYPE)}` +
           `&token=${encodeURIComponent(session.jwt)}` +
           `&outpostId=${encodeURIComponent(outpostId)}` +
@@ -2009,14 +2470,9 @@ export class QuickExecutionEngine {
         notify = resolve;
       });
 
-    const attachmentsBytes = attachments.length > 0 ? Buffer.byteLength(JSON.stringify(attachments), "utf8") : 0;
-    const frameBudgetBytes = attachmentsBytes > 0
-      ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - attachmentsBytes)
-      : MAX_WS_PAYLOAD_UTF8_BYTES;
-    const { chunks, effectiveCustomPrompt } = splitPromptIntoSafeChunks(prompt, customPrompt, frameBudgetBytes);
-    const totalChunks = chunks.length;
     let activeChunkIndex = 0;
     let advancingChunk = false;
+    let awaitingChunkAck = false;
 
     const timer = setTimeout(() => {
       if (!ended) {
@@ -2026,7 +2482,7 @@ export class QuickExecutionEngine {
           ws.close();
         } catch { }
       }
-    }, (this.config.runMaxTimeoutMs || 120_000) + Math.max(0, totalChunks - 1) * 15_000);
+    }, (this.config.runMaxTimeoutMs || 120_000) + Math.max(0, totalChunks - 1) * 50_000);
 
     const onAbort = () => {
       if (!ended) {
@@ -2249,7 +2705,7 @@ export class QuickExecutionEngine {
             prefixHashes: nextHashes,
             threadId: realThreadId,
             // Never park a WS that finished via post-usage watchdog (late upstream frames could contaminate next turn).
-            ...(allowParkWs ? { ws, outpostId, encodeFrame } : {}),
+            ...(allowParkWs ? { ws, outpostId, encodeFrame, apiKey: lease.apiKey, proxyUrl: lease.proxyUrl } : {}),
           });
         }
       }
@@ -2275,12 +2731,13 @@ export class QuickExecutionEngine {
     const sendChunkMessage = (idx: number) => {
       if (ws.readyState !== WebSocket.OPEN || ended) return;
       const isFinal = idx >= totalChunks - 1;
+      awaitingChunkAck = !isFinal;
       const baseChunkText =
         totalChunks === 1
           ? chunks[idx]!
           : isFinal
-            ? `[Part ${idx + 1}/${totalChunks} — final part of the message; please respond directly to the full message above.]\n\n${chunks[idx]!}`
-            : `[Part ${idx + 1}/${totalChunks} — more parts follow; please acknowledge briefly with OK.]\n\n${chunks[idx]!}`;
+            ? `[Part ${idx + 1}/${totalChunks} — FINAL PART. All previous parts are now complete. Do NOT reply with ACK or OK; now fully answer the user's request above.]\n\n${chunks[idx]!}`
+            : `[Part ${idx + 1}/${totalChunks} — context upload in progress; more parts follow. Reply only with "ACK ${idx + 1}/${totalChunks}".]\n\n${chunks[idx]!}`;
       const chunkText = baseChunkText;
       ws.send(
         encodeFrame({
@@ -2301,7 +2758,9 @@ export class QuickExecutionEngine {
             ...(isFinal && effectiveCustomPrompt ? { custom_prompt: effectiveCustomPrompt } : {}),
             ...(isFinal && attachments.length > 0 ? { attachments } : {}),
             message_id: crypto.randomUUID(),
-            agent_mode: isFinal ? selection.agentMode : "fast",
+            // Always keep the user's requested agent_mode across all chunks so KV cache stays warm
+            // on the same model tier and logs never show unexpected model downgrades (e.g. opus -> haiku).
+            agent_mode: selection.agentMode,
             ...(chatAgentId ? { chat_agent_id: chatAgentId } : {}),
             ...(isFinal && selection.agentMode !== "fast" ? { thinking_effort: selection.thinkingEffort } : {}),
             auto_routing: isFinal && turn.requestedModel.trim().toLowerCase() === "auto",
@@ -2327,11 +2786,23 @@ export class QuickExecutionEngine {
     };
 
     const onWsMessage = (data: Buffer) => {
-      recvBuf = Buffer.concat([recvBuf, Buffer.isBuffer(data) ? data : Buffer.from(data)]);
-      const { messages, consumed } = drainEventStream(recvBuf, 0);
-      if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+      let drainedMessages;
+      try {
+        recvBuf = appendWsRecvBuf(recvBuf, data);
+        const { messages, consumed } = drainEventStream(recvBuf, 0);
+        if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+        drainedMessages = messages;
+      } catch (err) {
+        ended = true;
+        push({
+          type: "__error",
+          error: err instanceof Error ? err : new Error(String(err)),
+        });
+        try { ws.close(); } catch { }
+        return;
+      }
 
-      for (const esMsg of messages) {
+      for (const esMsg of drainedMessages) {
         let decoded;
         try {
           decoded = decodeFrame(esMsg);
@@ -2355,29 +2826,44 @@ export class QuickExecutionEngine {
         const evType = String(ev.type || "");
         const payload = (ev.payload && typeof ev.payload === "object" ? ev.payload : {}) as Record<string, unknown>;
 
-        // Intermediate context chunks (for >46.5KB prompts): advance on message_complete,
-        // with a 15s post-turn_usage fallback (matching per-chunk outer budget) if AWS omits message_complete.
-        const advanceIntermediateChunk = () => {
-          if (advancingChunk || ended || activeChunkIndex >= totalChunks - 1) return;
+        // Intermediate context chunks (for >46.5KB prompts): strictly advance AT MOST ONCE per sent
+        // intermediate chunk via `awaitingChunkAck` on `message_complete` (ignoring trailing `stream_ended`
+        // so late frames can never double-advance), with a 45s post-turn_usage fallback that re-arms on delta.
+        const advanceIntermediateChunk = (forChunkIdx: number) => {
+          if (!awaitingChunkAck || advancingChunk || ended || activeChunkIndex !== forChunkIdx || activeChunkIndex >= totalChunks - 1) return;
+          awaitingChunkAck = false;
           clearPostUsageTimer();
           advancingChunk = true;
+          const drainDelayMs = activeChunkIndex === totalChunks - 2 ? 400 : 250;
           chunkAdvanceTimer = setTimeout(() => {
             chunkAdvanceTimer = null;
+            if (ended || activeChunkIndex !== forChunkIdx) {
+              advancingChunk = false;
+              return;
+            }
             activeChunkIndex += 1;
             advancingChunk = false;
             sendChunkMessage(activeChunkIndex);
-          }, 250);
+          }, drainDelayMs);
         };
         if (advancingChunk) {
           if (evType !== "error" && evType !== "guardrail_blocked") continue;
         }
         if (activeChunkIndex < totalChunks - 1) {
+          const curIdx = activeChunkIndex;
           if (evType === "message_complete") {
-            advanceIntermediateChunk();
+            advanceIntermediateChunk(curIdx);
+            continue;
+          } else if (evType === "text_delta" || evType === "thinking_delta") {
+            // If postUsageTimer was already armed, re-arm (reset) it instead of clearing without fallback
+            if (postUsageTimer) {
+              clearPostUsageTimer();
+              postUsageTimer = setTimeout(() => advanceIntermediateChunk(curIdx), 45_000);
+            }
             continue;
           } else if (evType === "turn_usage") {
             clearPostUsageTimer();
-            postUsageTimer = setTimeout(() => advanceIntermediateChunk(), 15_000);
+            postUsageTimer = setTimeout(() => advanceIntermediateChunk(curIdx), 45_000);
             continue;
           } else if (evType === "error" || evType === "guardrail_blocked") {
             // Fall through to normal error handling below

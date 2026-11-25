@@ -5,7 +5,7 @@ import {
   listOAuthCloudSessions,
   resolveOAuthAccessToken,
 } from "../aws-quick/oauth-client.js";
-import { getSharedOutpost, parseQuickCredential } from "../aws-quick/outpost-singleton.js";
+import { parseQuickCredential, withSharedOutpostLock } from "../aws-quick/outpost-singleton.js";
 import { fetchWebProfileUsage, listWebCloudSessions } from "../aws-quick/web-client.js";
 import { maskSecretKey } from "../core/key-pool.js";
 
@@ -143,17 +143,18 @@ async function fetchSingleAwsQuickQuota(
       cloudSessions = cs;
     } else {
       apiKeyName = cred.mode === "outpost" ? "local-outpost" : "imported-token";
-      const outpost = await getSharedOutpost();
-      if (cred.mode === "token" && cred.jwt) {
-        outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
-      } else {
-        outpost.setImportedToken(null);
-      }
-      const [session, u, cs] = await Promise.all([
-        outpost.getSncsSession(force),
-        outpost.getProfileUsage(),
-        outpost.listCloudSessions(100).catch(() => null),
-      ]);
+      const [session, u, cs] = await withSharedOutpostLock(async (outpost) => {
+        if (cred.mode === "token" && cred.jwt) {
+          outpost.setImportedToken({ jwt: cred.jwt, wsHost: cred.wsHost, outpostId: cred.outpostId });
+        } else {
+          outpost.setImportedToken(null);
+        }
+        return Promise.all([
+          outpost.getSncsSession(force),
+          outpost.getProfileUsage(),
+          outpost.listCloudSessions(100).catch(() => null),
+        ]);
+      });
       usage = u;
       cloudSessions = cs;
       accountId = session.accountId;

@@ -126,7 +126,7 @@ export function buildToolBridgePrompt(
         ? `Output the \`<tool_call>\` block named "${toolChoice.name}" in this turn.`
         : opts?.compactForCustomAgent
           ? "When a tool above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text."
-          : "Whenever the user's request can be fulfilled by one of the external tool schemas above (reading/editing files, searching code, running shell commands, or calling MCP tools), ALWAYS output the corresponding `<tool_call>` request block instead of declining due to missing local devices. Only answer in plain prose when no schema applies.";
+          : "Whenever a client tool schema above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text.";
 
   const fastPriorityLine = opts?.preferClientToolsOverWorkspace
     ? "Prefer the `<tool_call>` schemas above over built-in workspace tools."

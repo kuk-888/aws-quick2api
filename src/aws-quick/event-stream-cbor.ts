@@ -106,26 +106,64 @@ export function cborEncode(val: unknown): Uint8Array {
   return new Uint8Array(out);
 }
 
+const MAX_CBOR_DEPTH = 32;
+const MAX_CBOR_ITEMS = 65_536;
+const MAX_CBOR_BYTES = 16 * 1024 * 1024;
+const MAX_EVENT_STREAM_FRAME_BYTES = 16 * 1024 * 1024;
+const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function readCborArg(buf: Uint8Array, pos: number, ai: number): [number, number] {
   if (ai < 24) return [ai, pos];
-  if (ai === 24) return [buf[pos], pos + 1];
-  if (ai === 25) return [(buf[pos] << 8) | buf[pos + 1], pos + 2];
+  if (ai === 24) {
+    if (pos + 1 > buf.length) throw new Error("Truncated CBOR uint8 argument");
+    return [buf[pos]!, pos + 1];
+  }
+  if (ai === 25) {
+    if (pos + 2 > buf.length) throw new Error("Truncated CBOR uint16 argument");
+    return [(buf[pos]! << 8) | buf[pos + 1]!, pos + 2];
+  }
   if (ai === 26) {
+    if (pos + 4 > buf.length) throw new Error("Truncated CBOR uint32 argument");
     return [
-      ((buf[pos] << 24) | (buf[pos + 1] << 16) | (buf[pos + 2] << 8) | buf[pos + 3]) >>> 0,
+      ((buf[pos]! << 24) | (buf[pos + 1]! << 16) | (buf[pos + 2]! << 8) | buf[pos + 3]!) >>> 0,
       pos + 4,
     ];
   }
   if (ai === 27) {
+    if (pos + 8 > buf.length) throw new Error("Truncated CBOR uint64 argument");
     let v = 0;
-    for (let i = 0; i < 8; i++) v = v * 256 + buf[pos + i];
+    for (let i = 0; i < 8; i++) v = v * 256 + buf[pos + i]!;
+    if (!Number.isSafeInteger(v)) throw new Error("CBOR uint64 exceeds Number.MAX_SAFE_INTEGER");
     return [v, pos + 8];
   }
   throw new Error(`Unsupported CBOR additional info: ${ai}`);
 }
 
-function decodeCborAt(buf: Uint8Array, pos: number): [unknown, number] {
-  const initial = buf[pos++];
+interface CborDecodeState {
+  items: number;
+}
+
+function setSafeMapProp(map: Record<string, unknown>, key: string, value: unknown): void {
+  if (FORBIDDEN_OBJECT_KEYS.has(key)) return;
+  Object.defineProperty(map, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+function decodeCborAt(buf: Uint8Array, pos: number, depth: number, state: CborDecodeState): [unknown, number] {
+  if (depth > MAX_CBOR_DEPTH) {
+    throw new Error(`CBOR nesting depth exceeds limit (${MAX_CBOR_DEPTH})`);
+  }
+  if (++state.items > MAX_CBOR_ITEMS) {
+    throw new Error(`CBOR item count exceeds limit (${MAX_CBOR_ITEMS})`);
+  }
+  if (pos >= buf.length) {
+    throw new Error("Unexpected end of CBOR buffer");
+  }
+  const initial = buf[pos++]!;
   const major = initial >> 5;
   const ai = initial & 0x1f;
 
@@ -141,11 +179,17 @@ function decodeCborAt(buf: Uint8Array, pos: number): [unknown, number] {
       const parts: Uint8Array[] = [];
       let total = 0;
       while (pos < buf.length && buf[pos] !== 0xff) {
-        const [chunk, p] = decodeCborAt(buf, pos);
+        const [chunk, p] = decodeCborAt(buf, pos, depth + 1, state);
         const bytes = chunk instanceof Uint8Array ? chunk : new Uint8Array(0);
-        parts.push(bytes);
         total += bytes.length;
+        if (total > MAX_CBOR_BYTES) {
+          throw new Error(`CBOR byte string exceeds limit (${MAX_CBOR_BYTES})`);
+        }
+        parts.push(bytes);
         pos = p;
+      }
+      if (pos >= buf.length || buf[pos] !== 0xff) {
+        throw new Error("Unterminated indefinite-length CBOR byte string");
       }
       const out = new Uint8Array(total);
       let off = 0;
@@ -158,31 +202,44 @@ function decodeCborAt(buf: Uint8Array, pos: number): [unknown, number] {
     if (major === 3) {
       let str = '';
       while (pos < buf.length && buf[pos] !== 0xff) {
-        const [chunk, p] = decodeCborAt(buf, pos);
+        const [chunk, p] = decodeCborAt(buf, pos, depth + 1, state);
         str += String(chunk ?? '');
+        if (str.length > MAX_CBOR_BYTES) {
+          throw new Error(`CBOR text string exceeds limit (${MAX_CBOR_BYTES})`);
+        }
         pos = p;
+      }
+      if (pos >= buf.length || buf[pos] !== 0xff) {
+        throw new Error("Unterminated indefinite-length CBOR text string");
       }
       return [str, pos + 1];
     }
     if (major === 4) {
       const arr: unknown[] = [];
       while (pos < buf.length && buf[pos] !== 0xff) {
-        const [item, p] = decodeCborAt(buf, pos);
+        const [item, p] = decodeCborAt(buf, pos, depth + 1, state);
         arr.push(item);
         pos = p;
+      }
+      if (pos >= buf.length || buf[pos] !== 0xff) {
+        throw new Error("Unterminated indefinite-length CBOR array");
       }
       return [arr, pos + 1];
     }
     if (major === 5) {
       const map: Record<string, unknown> = {};
       while (pos < buf.length && buf[pos] !== 0xff) {
-        const [key, p1] = decodeCborAt(buf, pos);
-        const [val, p2] = decodeCborAt(buf, p1);
-        map[String(key)] = val;
+        const [key, p1] = decodeCborAt(buf, pos, depth + 1, state);
+        const [val, p2] = decodeCborAt(buf, p1, depth + 1, state);
+        setSafeMapProp(map, String(key), val);
         pos = p2;
+      }
+      if (pos >= buf.length || buf[pos] !== 0xff) {
+        throw new Error("Unterminated indefinite-length CBOR map");
       }
       return [map, pos + 1];
     }
+    throw new Error(`Unsupported indefinite-length CBOR major type: ${major}`);
   }
 
   const [arg, nextPos] = readCborArg(buf, pos, ai);
@@ -194,24 +251,36 @@ function decodeCborAt(buf: Uint8Array, pos: number): [unknown, number] {
     case 1:
       return [-1 - arg, pos];
     case 2:
+      if (arg > MAX_CBOR_BYTES || pos + arg > buf.length) {
+        throw new Error("CBOR byte string length out of bounds");
+      }
       return [buf.slice(pos, pos + arg), pos + arg];
     case 3:
+      if (arg > MAX_CBOR_BYTES || pos + arg > buf.length) {
+        throw new Error("CBOR text string length out of bounds");
+      }
       return [textDecoder.decode(buf.slice(pos, pos + arg)), pos + arg];
     case 4: {
+      if (arg > MAX_CBOR_ITEMS || arg > buf.length - pos) {
+        throw new Error("CBOR array length out of bounds");
+      }
       const arr: unknown[] = [];
       for (let i = 0; i < arg; i++) {
-        const [item, p] = decodeCborAt(buf, pos);
+        const [item, p] = decodeCborAt(buf, pos, depth + 1, state);
         arr.push(item);
         pos = p;
       }
       return [arr, pos];
     }
     case 5: {
+      if (arg > MAX_CBOR_ITEMS || arg * 2 > buf.length - pos) {
+        throw new Error("CBOR map length out of bounds");
+      }
       const map: Record<string, unknown> = {};
       for (let i = 0; i < arg; i++) {
-        const [k, p1] = decodeCborAt(buf, pos);
-        const [v, p2] = decodeCborAt(buf, p1);
-        map[String(k)] = v;
+        const [k, p1] = decodeCborAt(buf, pos, depth + 1, state);
+        const [v, p2] = decodeCborAt(buf, p1, depth + 1, state);
+        setSafeMapProp(map, String(k), v);
         pos = p2;
       }
       return [map, pos];
@@ -222,7 +291,7 @@ function decodeCborAt(buf: Uint8Array, pos: number): [unknown, number] {
 }
 
 export function cborDecode(buf: Uint8Array): unknown {
-  const [val] = decodeCborAt(buf, 0);
+  const [val] = decodeCborAt(buf, 0, 0, { items: 0 });
   return val;
 }
 
@@ -262,37 +331,50 @@ export function drainEventStream(buffer: Uint8Array, offset = 0): { messages: Ev
     const view = new DataView(buffer.buffer, buffer.byteOffset + pos, 12);
     const totalLen = view.getUint32(0, false);
     const headersLen = view.getUint32(4, false);
-    if (totalLen < 16 || pos + totalLen > buffer.length) break;
+    if (totalLen < 16 || totalLen > MAX_EVENT_STREAM_FRAME_BYTES || headersLen > totalLen - 16) {
+      throw new Error(`Invalid EventStream frame dimensions (totalLen=${totalLen}, headersLen=${headersLen})`);
+    }
+    if (pos + totalLen > buffer.length) break;
 
     const headers: Record<string, unknown> = {};
     let j = pos + 12;
     const headersEnd = j + headersLen;
     while (j < headersEnd) {
-      const nlen = buffer[j++];
+      const nlen = buffer[j++]!;
+      if (j + nlen >= headersEnd) break;
       const name = textDecoder.decode(buffer.subarray(j, j + nlen));
       j += nlen;
-      const vt = buffer[j++];
+      const vt = buffer[j++]!;
       if (vt === HV_STRING) {
-        const vlen = (buffer[j] << 8) | buffer[j + 1];
+        if (j + 2 > headersEnd) break;
+        const vlen = (buffer[j]! << 8) | buffer[j + 1]!;
         j += 2;
-        headers[name] = textDecoder.decode(buffer.subarray(j, j + vlen));
+        if (j + vlen > headersEnd) break;
+        setSafeMapProp(headers, name, textDecoder.decode(buffer.subarray(j, j + vlen)));
         j += vlen;
       } else if (vt === 0) {
-        headers[name] = true;
+        setSafeMapProp(headers, name, true);
       } else if (vt === 1) {
-        headers[name] = false;
+        setSafeMapProp(headers, name, false);
       } else if (vt === 2) {
-        headers[name] = buffer[j++];
+        if (j + 1 > headersEnd) break;
+        setSafeMapProp(headers, name, buffer[j++]!);
       } else if (vt === 3) {
+        if (j + 2 > headersEnd) break;
         j += 2;
       } else if (vt === 4) {
+        if (j + 4 > headersEnd) break;
         j += 4;
       } else if (vt === 5 || vt === 8) {
+        if (j + 8 > headersEnd) break;
         j += 8;
       } else if (vt === 6) {
-        const bl = (buffer[j] << 8) | buffer[j + 1];
+        if (j + 2 > headersEnd) break;
+        const bl = (buffer[j]! << 8) | buffer[j + 1]!;
+        if (j + 2 + bl > headersEnd) break;
         j += 2 + bl;
       } else if (vt === 9) {
+        if (j + 16 > headersEnd) break;
         j += 16;
       } else {
         break;

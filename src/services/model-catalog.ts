@@ -77,23 +77,103 @@ function parseEffort(raw: unknown): QuickThinkingEffort | undefined {
   return undefined;
 }
 
+function matchKnownModel(requestedModel: string | undefined): {
+  found: SDKModel | undefined;
+  bracketParams?: string;
+  suffixEffort?: QuickThinkingEffort;
+  aliasAgentMode?: QuickAgentMode;
+  aliasThinkingEffort?: QuickThinkingEffort;
+} {
+  const raw = (requestedModel || "").trim() || DEFAULT_MODEL;
+  // Strip leading gateway/provider prefixes BEFORE bracket-param parsing so `[aws]-quick-smart` doesn't collide with `[effort=high]`
+  const strippedRaw = raw.replace(/^(?:(?:amazon-)?quick\/|aws-quick\/|\[(?:quick|aws)\]-)+/i, "").trim() || DEFAULT_MODEL;
+  const match = /^([^\[]+?)(?:\[(.*)\])?$/.exec(strippedRaw);
+  let baseRaw = (match?.[1] || strippedRaw).trim().toLowerCase();
+
+  // Extract optional parenthesized effort e.g. `quick-smart(high)` or `claude-opus-5.5(max)`
+  let suffixEffort: QuickThinkingEffort | undefined;
+  const parenMatch = /\(([^)]+)\)$/.exec(baseRaw);
+  if (parenMatch) {
+    suffixEffort = parseEffort(parenMatch[1]);
+    baseRaw = baseRaw.slice(0, parenMatch.index).trim();
+  }
+
+  let baseId = baseRaw;
+
+  // Extract optional hyphenated effort suffix e.g. `claude-opus-5-5-high`, `quick-smart-low`, `quick-balanced-thinking`
+  if (!AWS_QUICK_MODELS.some((m) => m.id === baseId)) {
+    const hypMatch = /^(.+?)-(off|none|low|medium|mid|high|xhigh|max|thinking)$/i.exec(baseId);
+    if (hypMatch) {
+      const parsed = hypMatch[2]!.toLowerCase() === "thinking" ? "high" : parseEffort(hypMatch[2]);
+      if (parsed) {
+        suffixEffort = suffixEffort ?? parsed;
+        baseId = hypMatch[1]!.trim();
+      }
+    }
+  }
+
+  const exactMatch =
+    AWS_QUICK_MODELS.find((m) => m.id === baseId) ??
+    AWS_QUICK_MODELS.find((m) => m.id === baseId.replace(/\./g, "-"));
+  const legacyAlias = exactMatch
+    ? undefined
+    : QUICK_MODEL_ALIASES[baseId] ?? QUICK_MODEL_ALIASES[baseId.replace(/\./g, "-")];
+  const aliasTarget = legacyAlias ? AWS_QUICK_MODELS.find((m) => m.id === legacyAlias.id) : undefined;
+  const directMatch = exactMatch ?? aliasTarget;
+  // Family heuristics keep loosely-named requests (`opus`, `sonnet-think`, `haiku`) working
+  // now that the catalog advertises only the three Claude 5.5 IDs.
+  const aliasMatch =
+    directMatch ??
+    (/advanced|opus|\bsmart\b/i.test(baseId)
+      ? AWS_QUICK_MODELS.find((m) => m.id === "claude-opus-5-5")
+      : /haiku|\bfast\b/i.test(baseId)
+        ? AWS_QUICK_MODELS.find((m) => m.id === "claude-haiku-5-5")
+        : /sonnet|\bbalanced\b/i.test(baseId)
+          ? AWS_QUICK_MODELS.find((m) => m.id === "claude-sonnet-5-5")
+          : undefined);
+
+  return {
+    found: aliasMatch,
+    bracketParams: match?.[2],
+    suffixEffort,
+    aliasAgentMode: aliasTarget ? legacyAlias?.agentMode : undefined,
+    aliasThinkingEffort: aliasTarget ? legacyAlias?.thinkingEffort : undefined,
+  };
+}
+
+/**
+ * Resolves a requested model ID, provider prefix, or Claude alias (e.g. `quick/claude-opus-5-5-high`,
+ * `[aws]-quick-advanced`) to its canonical `AWS_QUICK_MODELS` ID, or `null` if unknown.
+ * Used by route-level `DISABLED_MODELS`, Sub-Key allowlist, and `assertModelExists` checks so
+ * aliases work on public routes and prefixes can never bypass model restrictions.
+ */
+export function resolveKnownModelId(requestedModel: string | undefined): string | null {
+  if (!requestedModel || !requestedModel.trim()) return null;
+  let stripped = requestedModel.trim().toLowerCase();
+  stripped = stripped.replace(/^\[[^\]]+\][-_/]?/, "");
+  stripped = stripped.replace(/^(?:amazon-quick|aws-quick|quick|aws|anthropic)\//, "");
+  const base = stripped.split("[")[0]?.replace(/\([^)]*\)$/, "").trim() ?? "";
+  // Map `auto` / `default` to the actual default model (`DEFAULT_MODEL`) so DISABLED_MODELS
+  // and sub-key allowlists cannot be bypassed via `model: "auto"` or `model: "default"`.
+  if (base === "auto" || base === "default") return AWS_QUICK_MODELS[1]!.id;
+  return matchKnownModel(requestedModel).found?.id ?? null;
+}
+
 export function resolveModelSelection(
   requestedModel: string | undefined,
   body: Record<string, unknown> = {},
   _modelSchema?: SDKModel,
 ): { selection: ModelSelection; canonicalId: string } {
-  const raw = (requestedModel || "").trim() || DEFAULT_MODEL;
-  const match = /^([^\[]+?)(?:\[(.*)\])?$/.exec(raw);
-  const requestedBase = (match?.[1] || DEFAULT_MODEL).trim().toLowerCase().replace(/\([^)]*\)$/, "").trim();
-  const alias = QUICK_MODEL_ALIASES[requestedBase];
-  const baseId = alias?.id ?? requestedBase;
-  const found = AWS_QUICK_MODELS.find((m) => m.id === baseId) ?? AWS_QUICK_MODELS[1]!;
-  const agentMode = alias?.agentMode ?? found.agentMode;
-  let effort: QuickThinkingEffort = alias?.thinkingEffort ?? found.thinkingEffort;
+  const { found: matched, bracketParams, suffixEffort, aliasAgentMode, aliasThinkingEffort } =
+    matchKnownModel(requestedModel);
+  const found = matched ?? AWS_QUICK_MODELS[1]!;
+  const agentMode = aliasAgentMode ?? found.agentMode;
+
+  let effort: QuickThinkingEffort = suffixEffort ?? aliasThinkingEffort ?? found.thinkingEffort;
 
   // Check bracket param e.g. claude-sonnet-5-5[effort=high]
-  if (match?.[2]) {
-    for (const part of match[2].split(",")) {
+  if (bracketParams) {
+    for (const part of bracketParams.split(",")) {
       const [k, v] = part.split("=").map((s) => s.trim());
       if (k === "effort" || k === "thinking_effort") {
         const parsed = parseEffort(v);

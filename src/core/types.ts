@@ -58,7 +58,7 @@ export type ToolChoiceMode =
 export interface ParsedProtocolTurn {
   requestedModel: string;
   rawBody: Record<string, unknown>;
-  /** Deterministic or header-derived conversation key for CPA-style 1h sticky Session Affinity. */
+  /** Deterministic or header-derived conversation key for sticky session affinity. */
   conversationKey?: string;
   systemPrompt?: string;
   fullTranscriptText: string;
@@ -144,7 +144,7 @@ export interface GatewayConfig {
   /** Persisted auto-disable state per slot (`KEY_AUTO_DISABLED`), so recovery survives restarts. */
   keyAutoDisabled?: Record<string, AutoDisabledState>;
   lbStrategy: LbStrategy;
-  /** CPA-style sticky session affinity so multi-turn conversations stay on the same account. */
+  /** Sticky session affinity so multi-turn conversations stay on the same account. */
   sessionAffinityEnabled: boolean;
   sessionAffinityTtlMs: number;
   /** Automatically disable/trip accounts that run out of quota or return 401/402. */

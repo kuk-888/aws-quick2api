@@ -11,7 +11,7 @@ export interface VersionCheckResult {
   checkedAt: string | null;
 }
 
-function readPackageVersion(): string {
+export function readPackageVersion(): string {
   const candidates = [
     path.resolve(process.cwd(), "package.json"),
     path.resolve(process.cwd(), "../package.json"),
