@@ -108,7 +108,7 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 
 > **Dynamic Routing**: Underlying models are assigned server-side and may change with AWS upstream routing policies. The actual routed model is surfaced in the thinking block, OpenAI `system_fingerprint`, and console request logs.
 >
-> **Aliases & Overrides**: Parenthetical hints (e.g. `quick-balanced(Sonnet)`) are accepted automatically. Reasoning effort can be overridden per request via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax (`quick-balanced[effort=high]`).
+> **Aliases & Overrides**: Parenthetical hints (e.g. `quick-balanced(Sonnet)`, `quick-smart(max)`) are accepted automatically. Reasoning effort (`off` / `low` / `medium` / `high` / `max`) can be overridden and passed through natively via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, `-max` suffixes, or bracket syntax (`quick-smart[effort=max]`).
 
 ---
 
@@ -184,7 +184,7 @@ See [.env.example](./.env.example) for the full template:
 
 - **Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`)**: Not enforced upstream; accepted for client compatibility and reported via response headers.
 - **`response_format` (`json_object` / `json_schema`) & `n > 1`**: Not supported; returns an explicit `400` error.
-- **Attachments**: Image inputs (PNG/JPG/WebP/GIF) are supported. Because AWS Quick enforces a 50 KB single-frame WebSocket limit, oversized images are automatically downscaled and JPEG-compressed (`sharp`) to fit; for dense small-font tables or code screenshots, cropping to the target area yields sharper OCR. PDF, document, and audio attachments are not supported yet.
+- **Attachments**: Image inputs (PNG/JPG/WebP/GIF) are supported. Because AWS Quick currently enforces a 50 KB single-frame WebSocket limit for inline images, oversized images are automatically downscaled and JPEG-compressed (`sharp`) within the shared frame budget; 1–2 cropped screenshots remain sharp and reliable, while sending 4+ dense small-font screenshots in a single turn degrades OCR accuracy due to tighter per-image budget (**out-of-band native attachment upload for images is planned for `v0.1.18`**). PDF, document, and audio attachments are not supported yet.
 - **Non-chat endpoints**: Embeddings, image generation, TTS, and Whisper are not supported.
 
 ---

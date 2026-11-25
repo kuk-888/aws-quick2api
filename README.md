@@ -116,7 +116,7 @@ flowchart LR
 
 > **说明**：底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，上表基于 Free / 常规套餐多次实测结果整理（后续可能随 AWS 上游调度策略调整）。实际路由到的底层模型会实时显示在思考块、OpenAI `system_fingerprint` 以及控制台请求日志中。
 >
-> **别名与参数覆盖**：兼容带括号说明的写法（如 `quick-balanced(Sonnet)`），支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking` 或方括号语法（`quick-balanced[effort=high]`）按请求覆盖思考强度。
+> **别名与参数覆盖**：兼容带括号说明的写法（如 `quick-balanced(Sonnet)`、`quick-smart(max)`），支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking`、`-max` 后缀或方括号语法（`quick-smart[effort=max]`）按请求覆盖并原生透传思考强度（`off` / `low` / `medium` / `high` / `max`）。
 
 ---
 
@@ -192,7 +192,7 @@ docker compose pull && docker compose up -d
 
 - **采样参数（`temperature` / `top_p` / `max_tokens` / `stop` / `seed`）**：上游不强制执行；网关兼容接收并通过响应头声明。
 - **`response_format`（`json_object` / `json_schema`）与 `n > 1`**：暂不支持，返回明确 `400` 错误。
-- **附件**：支持常见图片（PNG/JPG/WebP/GIF）。受 AWS Quick 50 KB 单帧 WebSocket 上限约束，大图会自动通过 `sharp` 缩放并压缩为 JPEG 发送；如需精读密集小字表格或代码，建议局部截图以获得更高清晰度。暂不支持 PDF、文档和音频。
+- **附件**：支持常见图片（PNG/JPG/WebP/GIF）。当前版本受 AWS Quick 50 KB 单帧 WebSocket 上限约束，大图会按总预算自动通过 `sharp` 缩放并压缩为 JPEG 发送；日常 1–2 张局部截图识别清晰稳定，若单轮同时发送 4 张以上高分密集小字截图，因多图均分帧预算会出现压缩模糊与识别降级（**已规划在下一版本 `v0.1.18` 将图片接入原生带外附件通道优化**）。暂不支持 PDF、文档和音频。
 - **非对话接口**：不支持 Embeddings、文生图、TTS 与 Whisper。
 
 ---

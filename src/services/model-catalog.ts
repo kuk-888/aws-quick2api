@@ -19,7 +19,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Balanced speed and depth (typically routes to Sonnet / GPT Terra; supports reasoning)",
     agentMode: "balanced",
     thinkingEffort: "off",
-    parameters: [{ id: "effort", values: ["off", "low", "medium", "high"] }],
+    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "max"] }],
   },
   {
     id: "quick-balanced-think",
@@ -28,7 +28,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Balanced mode with reasoning enabled by default (typically routes to Sonnet)",
     agentMode: "balanced",
     thinkingEffort: "medium",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
+    parameters: [{ id: "effort", values: ["low", "medium", "high", "max"] }],
   },
   {
     id: "quick-smart",
@@ -37,7 +37,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Deeper reasoning and highest quality (typically routes to Opus / GPT Sol; supports reasoning)",
     agentMode: "smart",
     thinkingEffort: "off",
-    parameters: [{ id: "effort", values: ["off", "low", "medium", "high"] }],
+    parameters: [{ id: "effort", values: ["off", "low", "medium", "high", "max"] }],
   },
   {
     id: "quick-smart-think",
@@ -46,7 +46,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Smart mode with high reasoning enabled by default (typically routes to Opus)",
     agentMode: "smart",
     thinkingEffort: "high",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
+    parameters: [{ id: "effort", values: ["low", "medium", "high", "max"] }],
   },
   {
     id: "quick-advanced",
@@ -55,7 +55,7 @@ export const AWS_QUICK_MODELS: SDKModel[] = [
     description: "Advanced mode with always-on deep reasoning (requires Advanced entitlement)",
     agentMode: "advanced",
     thinkingEffort: "high",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
+    parameters: [{ id: "effort", values: ["low", "medium", "high", "max"] }],
   },
 ];
 
@@ -73,7 +73,8 @@ function parseEffort(raw: unknown): QuickThinkingEffort | undefined {
   if (k === "off" || k === "none" || k === "disabled" || k === "false") return "off";
   if (k === "low" || k === "minimal") return "low";
   if (k === "medium" || k === "mid") return "medium";
-  if (k === "high" || k === "xhigh" || k === "max") return "high";
+  if (k === "high") return "high";
+  if (k === "xhigh" || k === "max") return "max";
   return undefined;
 }
 

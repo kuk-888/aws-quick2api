@@ -1,5 +1,5 @@
 export type QuickAgentMode = "fast" | "balanced" | "smart" | "advanced";
-export type QuickThinkingEffort = "off" | "low" | "medium" | "high";
+export type QuickThinkingEffort = "off" | "low" | "medium" | "high" | "max";
 
 export interface SDKModelParameter {
   id: string;
