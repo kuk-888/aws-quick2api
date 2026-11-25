@@ -1320,45 +1320,29 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             <div class="setting-row">
               <div class="setting-info">
                 <h3>自动创建 / 绑定极简编程 Agent (AUTO_ENSURE_CODING_AGENT)</h3>
-                <p>默认开启。首次调用尚未绑定 Agent 的账号时，自动通过 AWS Quick 协议查找已有自定义 Agent 或创建极简编程 Agent 并持久化绑定，大幅提升 Opus / Sonnet 工具与本地文件调用稳定性并消除长篇防拒答提示词污染。</p>
+                <p>默认开启。首次调用未绑定 Agent 的账号时自动创建并绑定极简编程 Agent，提升工具调用稳定性；支持自定义新建 Agent 的默认提示词模板。</p>
               </div>
-              <label class="switch"><input type="checkbox" id="cfgAutoEnsureCodingAgent" checked /><span class="slider"></span></label>
-            </div>
-
-            <div class="setting-row" style="flex-direction:column;align-items:stretch;gap:8px;">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
-                <div class="setting-info">
-                  <h3>自定义 Agent 默认提示词模板 (CUSTOM_AGENT_PROMPT)</h3>
-                  <p>新建或自动创建自定义 Agent 时写入的默认指令模板，保存后立即热生效（留空则使用内置默认模板；已创建的旧 Agent 可在「凭证池 → Agent」里一键编辑更新）。</p>
-                </div>
-                <button type="button" class="btn-xs" id="resetAgentPromptBtn" style="flex-shrink:0;">恢复默认</button>
+              <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+                <span id="agentPromptStateBadge" class="badge" style="font-size:11px;">默认模板</span>
+                <button type="button" class="btn-xs" id="editAgentPromptBtn">编辑模板</button>
+                <label class="switch"><input type="checkbox" id="cfgAutoEnsureCodingAgent" checked /><span class="slider"></span></label>
               </div>
-              <textarea id="cfgCustomAgentPrompt" rows="3" style="width:100%;resize:vertical;line-height:1.5;" placeholder="留空将使用内置极简默认模板"></textarea>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)</h3>
-                <p>默认关闭。开启后，仅当上游返回 content_filtered 且尚未向客户端输出正文时，由辅助模型将最后一条用户提问自动重述为防御性工程措辞，并死守用户请求的原模型重试 1 次（热会话优先使用原生 edit_message 分支保留前文缓存，绝不降级偷换主回答模型）。</p>
+                <h3>内容过滤触发时自动重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)</h3>
+                <p>默认关闭。仅当上游返回 content_filtered 且未吐正文时，用辅助模型将敏感措辞改写为中性专业表达，并死守原模型重试 1 次（热会话优先走原生 edit_message 分支）。</p>
               </div>
-              <label class="switch"><input type="checkbox" id="cfgAutoRephraseOnContentFilter" /><span class="slider"></span></label>
-            </div>
-
-            <div class="setting-row" id="cfgRephrasePromptWrap" style="display:none;flex-direction:column;align-items:stretch;gap:10px;background:var(--subtle);border-radius:6px;padding:12px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-                <div class="setting-info">
-                  <h3>防御性重述提示词模板与辅助模型 (CONTENT_FILTER_REPHRASE_PROMPT)</h3>
-                  <p>仅用于重述被误拦的提问本身，绝不替代最终回答模型；留空或点击「恢复默认」将使用内置模板。</p>
-                </div>
-                <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
-                  <select id="cfgContentFilterRephraseModel" style="min-width:170px;">
-                    <option value="quick-fast">quick-fast (Haiku 5.5 · 推荐)</option>
-                    <option value="quick-balanced">quick-balanced (Sonnet 5.5)</option>
-                  </select>
-                  <button type="button" class="btn-xs" id="resetRephrasePromptBtn">恢复默认</button>
-                </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">
+                <select id="cfgContentFilterRephraseModel" style="min-width:140px;display:none;" aria-label="重述辅助模型">
+                  <option value="quick-fast">quick-fast (推荐)</option>
+                  <option value="quick-balanced">quick-balanced</option>
+                </select>
+                <span id="rephrasePromptStateBadge" class="badge" style="font-size:11px;display:none;">默认模板</span>
+                <button type="button" class="btn-xs" id="editRephrasePromptBtn" style="display:none;">编辑模板</button>
+                <label class="switch"><input type="checkbox" id="cfgAutoRephraseOnContentFilter" /><span class="slider"></span></label>
               </div>
-              <textarea id="cfgContentFilterRephrasePrompt" rows="5" style="width:100%;resize:vertical;line-height:1.5;font-size:12px;" placeholder="留空将使用内置防御性工程重述模板"></textarea>
             </div>
           </div>
 
@@ -1563,6 +1547,27 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         <div style="display:flex;align-items:center;gap:8px;margin-left:auto;">
           <button id="recheckVersionBtn" type="button">重新检查更新</button>
           <button class="btn-solid" data-click="closeUpdateModal">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Prompt Template Editor Modal -->
+  <div class="modal-mask" id="promptEditorModal" role="dialog" aria-modal="true" aria-labelledby="promptEditorTitle" style="z-index:75;">
+    <div class="modal-card" style="max-width: 580px;">
+      <div class="panel-hdr">
+        <h2 id="promptEditorTitle">编辑提示词模板</h2>
+        <button class="btn-xs btn-ghost" id="promptEditorCloseBtn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body" style="gap:10px;">
+        <p id="promptEditorDesc" style="font-size:12.5px;color:var(--fg-muted);line-height:1.5;margin:0;"></p>
+        <textarea id="promptEditorTextarea" rows="6" class="mono" style="width:100%;resize:vertical;line-height:1.5;font-size:12px;"></textarea>
+      </div>
+      <div class="modal-foot" style="justify-content:space-between;">
+        <button type="button" id="promptEditorResetBtn">恢复默认</button>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button type="button" id="promptEditorCancelBtn">取消</button>
+          <button type="button" class="btn-solid" id="promptEditorSaveBtn">保存并生效</button>
         </div>
       </div>
     </div>
@@ -2850,26 +2855,20 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       if ($("cfgIncognitoMode")) $("cfgIncognitoMode").checked = settings.incognitoMode !== false;
       if ($("cfgAutoEnsureCodingAgent")) $("cfgAutoEnsureCodingAgent").checked = settings.autoEnsureCodingAgent !== false;
       window.__defaultCustomAgentPrompt = settings.defaultCustomAgentPrompt || "";
-      window.__activeCustomAgentPrompt = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
-      if ($("cfgCustomAgentPrompt")) {
-        $("cfgCustomAgentPrompt").value = settings.customAgentPrompt || settings.defaultCustomAgentPrompt || "";
-      }
+      window.__activeCustomAgentPrompt = settings.customAgentPrompt || "";
       window.__defaultContentFilterRephrasePrompt = settings.defaultContentFilterRephrasePrompt || "";
+      window.__activeContentFilterRephrasePrompt = settings.contentFilterRephrasePrompt || "";
       const rephraseOn = settings.autoRephraseOnContentFilter === true;
       if ($("cfgAutoRephraseOnContentFilter")) {
         $("cfgAutoRephraseOnContentFilter").checked = rephraseOn;
-      }
-      if ($("cfgRephrasePromptWrap")) {
-        $("cfgRephrasePromptWrap").style.display = rephraseOn ? "flex" : "none";
-      }
-      if ($("cfgContentFilterRephrasePrompt")) {
-        $("cfgContentFilterRephrasePrompt").value =
-          settings.contentFilterRephrasePrompt || settings.defaultContentFilterRephrasePrompt || "";
       }
       if ($("cfgContentFilterRephraseModel")) {
         $("cfgContentFilterRephraseModel").value =
           settings.contentFilterRephraseModel || settings.defaultContentFilterRephraseModel || "quick-fast";
         syncSelectUi($("cfgContentFilterRephraseModel"));
+      }
+      if (typeof window.__syncPromptUiState === "function") {
+        window.__syncPromptUiState();
       }
 
       $("affinityTableBody").innerHTML = affinities.length ? affinities.map((a) =>
@@ -4800,45 +4799,88 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
-    if ($("resetAgentPromptBtn")) {
-      $("resetAgentPromptBtn").onclick = () => {
-        if ($("cfgCustomAgentPrompt")) {
-          $("cfgCustomAgentPrompt").value = window.__defaultCustomAgentPrompt || "";
-        }
+    window.__syncPromptUiState = () => {
+      const hasCustomAgent = !!(window.__activeCustomAgentPrompt && window.__activeCustomAgentPrompt.trim() && window.__activeCustomAgentPrompt.trim() !== (window.__defaultCustomAgentPrompt || "").trim());
+      if ($("agentPromptStateBadge")) {
+        $("agentPromptStateBadge").textContent = hasCustomAgent ? tr("已自定义", "Custom") : tr("默认模板", "Default");
+      }
+      const rephraseOn = $("cfgAutoRephraseOnContentFilter") ? $("cfgAutoRephraseOnContentFilter").checked : false;
+      const hasCustomRephrase = !!(window.__activeContentFilterRephrasePrompt && window.__activeContentFilterRephrasePrompt.trim() && window.__activeContentFilterRephrasePrompt.trim() !== (window.__defaultContentFilterRephrasePrompt || "").trim());
+      if ($("rephrasePromptStateBadge")) {
+        $("rephrasePromptStateBadge").style.display = rephraseOn ? "inline-flex" : "none";
+        $("rephrasePromptStateBadge").textContent = hasCustomRephrase ? tr("已自定义", "Custom") : tr("默认模板", "Default");
+      }
+      if ($("editRephrasePromptBtn")) {
+        $("editRephrasePromptBtn").style.display = rephraseOn ? "inline-flex" : "none";
+      }
+      if ($("cfgContentFilterRephraseModel")) {
+        $("cfgContentFilterRephraseModel").style.display = rephraseOn ? "inline-block" : "none";
+        syncSelectUi($("cfgContentFilterRephraseModel"));
+      }
+    };
+
+    let activePromptKind = "";
+    function openPromptEditor(kind) {
+      activePromptKind = kind;
+      const isAgent = kind === "agent";
+      const defVal = isAgent ? (window.__defaultCustomAgentPrompt || "") : (window.__defaultContentFilterRephrasePrompt || "");
+      const curVal = isAgent ? (window.__activeCustomAgentPrompt || "") : (window.__activeContentFilterRephrasePrompt || "");
+      $("promptEditorTitle").textContent = isAgent
+        ? tr("编辑极简编程 Agent 默认模板", "Edit Coding Agent Default Prompt")
+        : tr("编辑内容过滤自动重述模板", "Edit Content-Filter Rephrase Prompt");
+      $("promptEditorDesc").textContent = isAgent
+        ? tr("新建或自动创建自定义 Agent 时写入的默认指令（留空或恢复默认将使用内置模板）。", "Default instruction written when creating a new Coding Agent (blank or reset uses built-in).")
+        : tr("仅在触发上游 content_filtered 时用于中性改写提问本身，不改变用户原意也不替代主模型。", "Used only to neutrally rephrase blocked prompts without changing user intent or downgrading the main model.");
+      $("promptEditorTextarea").value = curVal.trim() || defVal;
+      $("promptEditorModal").classList.add("open");
+    }
+    function closePromptEditor() {
+      $("promptEditorModal").classList.remove("open");
+      activePromptKind = "";
+    }
+    if ($("editAgentPromptBtn")) $("editAgentPromptBtn").onclick = () => openPromptEditor("agent");
+    if ($("editRephrasePromptBtn")) $("editRephrasePromptBtn").onclick = () => openPromptEditor("rephrase");
+    if ($("promptEditorCloseBtn")) $("promptEditorCloseBtn").onclick = closePromptEditor;
+    if ($("promptEditorCancelBtn")) $("promptEditorCancelBtn").onclick = closePromptEditor;
+    if ($("promptEditorModal")) {
+      $("promptEditorModal").onclick = (e) => { if (e.target === $("promptEditorModal")) closePromptEditor(); };
+    }
+    if ($("promptEditorResetBtn")) {
+      $("promptEditorResetBtn").onclick = () => {
+        $("promptEditorTextarea").value = activePromptKind === "agent"
+          ? (window.__defaultCustomAgentPrompt || "")
+          : (window.__defaultContentFilterRephrasePrompt || "");
+      };
+    }
+    if ($("promptEditorSaveBtn")) {
+      $("promptEditorSaveBtn").onclick = async () => {
+        const val = $("promptEditorTextarea").value.trim();
+        const isAgent = activePromptKind === "agent";
+        const defVal = (isAgent ? (window.__defaultCustomAgentPrompt || "") : (window.__defaultContentFilterRephrasePrompt || "")).trim();
+        const normalized = val === defVal ? "" : val;
+        try {
+          const patch = isAgent ? { customAgentPrompt: normalized } : { contentFilterRephrasePrompt: normalized };
+          await api("/v1/admin/settings", { method: "POST", body: JSON.stringify(patch) });
+          if (isAgent) window.__activeCustomAgentPrompt = normalized;
+          else window.__activeContentFilterRephrasePrompt = normalized;
+          window.__syncPromptUiState();
+          closePromptEditor();
+          notify(tr("提示词模板已保存并热生效。", "Prompt template saved and applied."));
+        } catch (e) { notify(e.message, true); }
       };
     }
 
     if ($("cfgAutoRephraseOnContentFilter")) {
       $("cfgAutoRephraseOnContentFilter").onchange = () => {
-        const on = $("cfgAutoRephraseOnContentFilter").checked;
-        if ($("cfgRephrasePromptWrap")) {
-          $("cfgRephrasePromptWrap").style.display = on ? "flex" : "none";
-        }
-        if (on && $("cfgContentFilterRephrasePrompt") && !$("cfgContentFilterRephrasePrompt").value.trim()) {
-          $("cfgContentFilterRephrasePrompt").value = window.__defaultContentFilterRephrasePrompt || "";
-        }
-      };
-    }
-
-    if ($("resetRephrasePromptBtn")) {
-      $("resetRephrasePromptBtn").onclick = () => {
-        if ($("cfgContentFilterRephrasePrompt")) {
-          $("cfgContentFilterRephrasePrompt").value = window.__defaultContentFilterRephrasePrompt || "";
-        }
-        if ($("cfgContentFilterRephraseModel")) {
-          $("cfgContentFilterRephraseModel").value = "quick-fast";
-          syncSelectUi($("cfgContentFilterRephraseModel"));
-        }
+        window.__syncPromptUiState();
       };
     }
 
     $("saveRoutingBtn").onclick = async () => {
       try {
-        const promptVal = $("cfgCustomAgentPrompt") ? $("cfgCustomAgentPrompt").value.trim() : "";
+        const promptVal = (window.__activeCustomAgentPrompt || "").trim();
         const isBuiltInDefault = promptVal === (window.__defaultCustomAgentPrompt || "").trim();
-        const rephrasePromptVal = $("cfgContentFilterRephrasePrompt")
-          ? $("cfgContentFilterRephrasePrompt").value.trim()
-          : "";
+        const rephrasePromptVal = (window.__activeContentFilterRephrasePrompt || "").trim();
         const isBuiltInRephraseDefault =
           rephrasePromptVal === (window.__defaultContentFilterRephrasePrompt || "").trim();
         await api("/v1/admin/settings", {

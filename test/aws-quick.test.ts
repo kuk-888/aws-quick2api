@@ -1039,7 +1039,7 @@ describe("Credential parser & ClientKeyStore", () => {
 
       // Dashboard HTML still renders valid JS with the new customAgentPrompt, editChatAgent, and 5h burst bar
       const html = renderDashboardHtml("/dashboard", "testnonce");
-      assert.ok(html.includes("cfgCustomAgentPrompt"));
+      assert.ok(html.includes("editAgentPromptBtn"));
       assert.ok(html.includes("cfgAutoEnsureCodingAgent"));
       assert.ok(html.includes("modalChatAgentInput"));
       assert.ok(html.includes("editChatAgent"));
@@ -2117,7 +2117,8 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.equal(cfg.autoRephraseOnContentFilter, false);
       assert.equal(cfg.contentFilterRephrasePrompt, undefined);
       assert.equal(cfg.contentFilterRephraseModel, DEFAULT_CONTENT_FILTER_REPHRASE_MODEL);
-      assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("defensive"));
+      assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("content moderation"));
+      assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("neutral"));
 
       const pool = new UpstreamKeyPool(cfg);
       assert.equal(pool.getSettings().autoRephraseOnContentFilter, false);
@@ -2150,9 +2151,10 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
 
       const html = renderDashboardHtml("/dashboard", "test-nonce");
       assert.ok(html.includes("cfgAutoRephraseOnContentFilter"));
-      assert.ok(html.includes("cfgContentFilterRephrasePrompt"));
+      assert.ok(html.includes("editRephrasePromptBtn"));
       assert.ok(html.includes("cfgContentFilterRephraseModel"));
-      assert.ok(html.includes("resetRephrasePromptBtn"));
+      assert.ok(html.includes("promptEditorModal"));
+      assert.ok(html.includes("promptEditorResetBtn"));
       assert.ok(html.includes("无损升级说明"));
       assert.ok(html.includes("防误拦重述"));
     } finally {

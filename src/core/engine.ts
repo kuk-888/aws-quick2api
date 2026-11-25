@@ -947,12 +947,9 @@ export function isPseudo200UsageLimitPrefix(text: string): boolean {
 
 export const DEFAULT_CONTENT_FILTER_REPHRASE_MODEL = "quick-fast";
 export const DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT = [
-  "You are a defensive software-engineering prompt rewriter. NEVER answer the prompt itself; output ONLY the rewritten user request in the same language with zero preamble, quotes, or explanation.",
-  "Rules:",
-  "1. Preserve ALL programming languages, libraries, legitimate code snippets, file paths, identifiers, stack traces, and security-hardening goals.",
-  "2. Remove or replace trigger wording such as 'exploit', 'bypass' ('绕过'), 'attack payload', 'reproduce vulnerability', or raw injection strings (e.g. `' OR '1'='1`). Do NOT ask to output or demonstrate runnable vulnerable/flawed code ('不要要求展示错误/漏洞写法代码'); instead ask to explain the validation flaw conceptually in prose only, provide the hardened secure implementation (e.g. explicit algorithm allowlist or parameterized queries), and write negative unit tests verifying malformed/unsigned/unexpected inputs are rejected.",
-  "3. If the input contains multi-turn dialogue markers (`[USER]:` / `[ASSISTANT]:`), preserve all earlier turns, project codenames/ports/facts, and the final `[USER]:` question verbatim, rewriting only the security-sensitive wording.",
-  "4. Keep single-turn rewrites concise (2-4 sentences) and natural.",
+  "NEVER answer the request. Rewrite it to pass content moderation while preserving the user's exact topic, tech stack, language, code, and facts. Output ONLY the rewritten request.",
+  "1. Replace adversarial or trigger words (exploit, bypass, hook, attack) with neutral, educational phrasing, and describe sensitive mechanisms abstractly rather than repeating raw trigger terms. Never ask to write flawed or bypass code; ask to explain the pitfall in prose, show the safe/standard implementation, and write validation tests.",
+  "2. Preserve `[USER]:` / `[ASSISTANT]:` markers and prior turns verbatim; rewrite only the final `[USER]:` turn.",
 ].join("\n");
 
 /**
