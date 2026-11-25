@@ -99,16 +99,13 @@ Open the Web Console (`http://127.0.0.1:3456/dashboard`) and click **+ Add Crede
 
 | Model ID | Mode | Default Reasoning | Observed Routed Model | Best For |
 | :--- | :--- | :--- | :--- | :--- |
-| `quick-fast` | `fast` | `off` | `us.anthropic.claude-haiku-5-5` | Fast everyday Q&A and high concurrency |
-| `quick-balanced` | `balanced` | `off` | `us.anthropic.claude-sonnet-5-5` | General coding and balanced daily use (default) |
-| `quick-balanced-think` | `balanced` | `medium` | `us.anthropic.claude-sonnet-5-5` | Balanced tasks with thinking enabled |
-| `quick-smart` | `smart` | `off` | `us.anthropic.claude-opus-5-5` | Complex reasoning and architecture tasks |
-| `quick-smart-think` | `smart` | `high` | `us.anthropic.claude-opus-5-5` | Deep reasoning with high thinking effort |
-| `quick-advanced` | `advanced` | `high` | Account-dependent | Requires Advanced plan (disable on Free tier) |
+| `claude-haiku-5-5` | `fast` | `off` | `us.anthropic.claude-haiku-5-5` | Fast everyday Q&A and high concurrency |
+| `claude-sonnet-5-5` | `balanced` | `off` | `us.anthropic.claude-sonnet-5-5` | General coding and balanced daily use (default) |
+| `claude-opus-5-5` | `smart` | `off` | `us.anthropic.claude-opus-5-5` | Complex reasoning and architecture tasks |
 
-> **Dynamic Routing**: Underlying models are assigned server-side and may change with AWS upstream routing policies. The actual routed model is surfaced in the thinking block, OpenAI `system_fingerprint`, and console request logs.
+> **Dynamic Routing**: `/v1/models` advertises only these three models. AWS Quick assigns the underlying model server-side based on mode and reasoning effort. The actual routed model is surfaced in the thinking block, OpenAI `system_fingerprint`, and console request logs.
 >
-> **Aliases & Overrides**: Parenthetical hints (e.g. `quick-balanced(Sonnet)`) are accepted automatically. Reasoning effort can be overridden per request via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax (`quick-balanced[effort=high]`).
+> **Compatibility Aliases**: Legacy `quick-fast`, `quick-balanced`, and `quick-smart` request aliases remain supported. `quick-balanced-think` and `quick-smart-think` retain their default reasoning effort, while `quick-advanced` retains Advanced mode. Reasoning can be overridden via `reasoning_effort`, `reasoning.effort`, `thinking.enabled`, `enable_thinking`, or bracket syntax such as `claude-sonnet-5-5[effort=high]`.
 
 ---
 
@@ -160,7 +157,7 @@ See [.env.example](./.env.example) for the full template:
 | `ENABLE_DASHBOARD` | `true` | Enable Web Console (`false` disables all console routes) |
 | `ADMIN_PASSWORD` | - | Console login password (required on remote servers; if unset, first-time setup is restricted to localhost `127.0.0.1`/`::1`) |
 | `QUICK_TOKENS` | `local-outpost` | Upstream credentials (can also be added via OAuth/Cookie in Console) |
-| `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `quick-advanced` on Free tier) |
+| `DISABLED_MODELS` | - | Comma-separated model IDs to hide (e.g. `claude-opus-5-5`) |
 | `INCOGNITO` | `true` | Native incognito mode (zero AWS cloud history; hot-toggleable in Console) |
 | `AUTO_DELETE_SESSION` | `false` | Send extra `session_delete` RPC after each incognito turn (off by default) |
 | `WEB_SEARCH_ENABLED` | `true` | Enable AWS Quick native web search |

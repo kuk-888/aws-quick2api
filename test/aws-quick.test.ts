@@ -48,7 +48,7 @@ import {
 } from "../src/protocols/openai.js";
 import { anthropicMessagesAdapter, parseAnthropicMessagesRequest } from "../src/protocols/anthropic.js";
 import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
-import { AWS_QUICK_MODELS, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
+import { AWS_QUICK_MODELS, canonicalizeModelId, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
 import { ClientGatewayKeyManager } from "../src/services/client-keys.js";
 import { checkLatestVersion } from "../src/services/update-checker.js";
 import { establishSocks5Tunnel, fetchViaOptionalProxy, maskProxyUrl, validateProxyUrl } from "../src/utils/proxy-agent.js";
@@ -100,27 +100,57 @@ describe("EventStream + CBOR codec", () => {
 });
 
 describe("Model catalog & parameter resolution", () => {
-  it("maps modes and reasoning_effort overrides", () => {
-    const r1 = resolveModelSelection("quick-balanced", { reasoning_effort: "high" });
+  it("maps Claude IDs and legacy aliases to AWS Quick modes", () => {
+    const cases = [
+      ["claude-haiku-5-5", "fast", "off"],
+      ["quick-fast", "fast", "off"],
+      ["claude-sonnet-5-5", "balanced", "off"],
+      ["quick-balanced", "balanced", "off"],
+      ["claude-opus-5-5", "smart", "off"],
+      ["quick-smart", "smart", "off"],
+    ] as const;
+    for (const [model, mode, effort] of cases) {
+      const result = resolveModelSelection(model);
+      assert.equal(result.selection.agentMode, mode);
+      assert.equal(result.selection.thinkingEffort, effort);
+      assert.equal(result.canonicalId, model.startsWith("quick-") ? canonicalizeModelId(model) : model);
+    }
+  });
+
+  it("preserves reasoning overrides and legacy think defaults", () => {
+    const r1 = resolveModelSelection("claude-sonnet-5-5", { reasoning_effort: "high" });
     assert.equal(r1.selection.agentMode, "balanced");
     assert.equal(r1.selection.thinkingEffort, "high");
 
-    const r2 = resolveModelSelection("quick-fast", { reasoning_effort: "high" });
+    const r2 = resolveModelSelection("claude-haiku-5-5", { reasoning_effort: "high" });
     assert.equal(r2.selection.agentMode, "fast");
     assert.equal(r2.selection.thinkingEffort, "off");
 
-    const r3 = resolveModelSelection("quick-smart[effort=low]", {});
+    const r3 = resolveModelSelection("claude-opus-5-5[effort=low]");
     assert.equal(r3.selection.agentMode, "smart");
     assert.equal(r3.selection.thinkingEffort, "low");
 
-    const r4 = resolveModelSelection("quick-balanced", { thinking: { type: "enabled" } });
+    const r4 = resolveModelSelection("claude-sonnet-5-5", { thinking: { type: "enabled" } });
     assert.equal(r4.selection.thinkingEffort, "high");
+
+    assert.equal(resolveModelSelection("quick-balanced-think").selection.thinkingEffort, "medium");
+    assert.equal(resolveModelSelection("quick-smart-think").selection.thinkingEffort, "high");
+    assert.equal(resolveModelSelection("quick-advanced").selection.agentMode, "advanced");
   });
 
-  it("formats OpenAI /v1/models list", () => {
+  it("advertises only the three Claude 5.5 models", () => {
     const list = formatOpenAiModelList(AWS_QUICK_MODELS);
-    assert.equal(list.length, 6);
-    assert.equal(list[0]!.owned_by, "aws-quick");
+    assert.deepEqual(list.map((model) => model.id), [
+      "claude-haiku-5-5",
+      "claude-sonnet-5-5",
+      "claude-opus-5-5",
+    ]);
+    assert.deepEqual(list.map((model) => model.name), [
+      "Claude Haiku 5.5",
+      "Claude Sonnet 5.5",
+      "Claude Opus 5.5",
+    ]);
+    assert.ok(list.every((model) => model.owned_by === "anthropic"));
   });
 });
 

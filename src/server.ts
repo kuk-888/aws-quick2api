@@ -647,7 +647,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         clientKeys.assertModelPermitted(clientAuth, targetId);
         const catalogKey = keyPool.enabledKeyCount() > 0 ? keyPool.peekKeyForCatalog() : "";
         const models = formatOpenAiModelList(await listLiveModels(catalogKey, options.modelListFetcher));
-        // Variant ids such as `quick-balanced[effort=high]` are accepted by POST; accept them here too.
+        // Variant ids such as `claude-sonnet-5-5[effort=high]` are accepted by POST; accept them here too.
         const found =
           models.find((m) => m.id === targetId) ??
           (() => {

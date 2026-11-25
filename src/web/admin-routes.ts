@@ -18,7 +18,7 @@ import { isRecord } from "../protocols/common.js";
 import { openAiChatAdapter } from "../protocols/openai.js";
 import type { ClientGatewayKeyManager } from "../services/client-keys.js";
 import type { ModelAccessController } from "../services/model-access.js";
-import { listLiveModels } from "../services/model-catalog.js";
+import { DEFAULT_MODEL, listLiveModels } from "../services/model-catalog.js";
 import type { UsageLedger, LedgerRange } from "../services/usage-ledger.js";
 import type { AccountQuotaReport } from "../services/quota-service.js";
 import type { RequestTraceLogger } from "../services/request-logger.js";
@@ -416,7 +416,7 @@ export async function tryHandleWebAdminRoute(
       throw new GatewayError("`prompt` string required.", 400, "invalid_request_error");
     }
     const chatBody = {
-      model: typeof body.model === "string" ? body.model : "quick-balanced",
+      model: typeof body.model === "string" ? body.model : DEFAULT_MODEL,
       stream: false,
       messages: [{ role: "user", content: body.prompt }]
     };

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parseOAuthCredential } from "../aws-quick/oauth-client.js";
 import { parseWebCurlOrCredential, serializeWebCredential } from "../aws-quick/web-client.js";
+import { canonicalizeModelId, isBuiltInModelId } from "../services/model-catalog.js";
 import type { BotQuotaView, QuickPlanQuotaView } from "../services/quota-service.js";
 import { evictQuotaCachesForKey } from "../services/quota-service.js";
 import { normalizeBaseModelId, redactSecrets } from "../utils/hash.js";
@@ -143,8 +144,8 @@ export function computeKeySlotId(key: string): string {
 }
 
 export function classifyModelQuotaPool(requestedModel: string): "auto" | "api" {
-  const base = normalizeBaseModelId(requestedModel || "auto");
-  if (!base || base === "auto" || base === "default" || base.startsWith("quick-")) {
+  const base = canonicalizeModelId(normalizeBaseModelId(requestedModel || "auto"));
+  if (!base || base === "auto" || base === "default" || base.startsWith("quick-") || isBuiltInModelId(base)) {
     return "auto";
   }
   return "api";

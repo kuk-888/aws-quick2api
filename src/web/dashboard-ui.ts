@@ -1091,12 +1091,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               <div id="ckPaneTest" style="display:none;flex-direction:column;gap:12px;">
                 <div style="display:flex;gap:10px;flex-wrap:wrap;">
                   <select id="pgModel" style="min-width:240px;" class="mono">
-                    <option value="quick-balanced">quick-balanced</option>
-                    <option value="quick-balanced-think">quick-balanced-think</option>
-                    <option value="quick-fast">quick-fast</option>
-                    <option value="quick-smart">quick-smart</option>
-                    <option value="quick-smart-think">quick-smart-think</option>
-                    <option value="quick-advanced">quick-advanced</option>
+                    <option value="claude-haiku-5-5">claude-haiku-5-5</option>
+                    <option value="claude-sonnet-5-5" selected>claude-sonnet-5-5</option>
+                    <option value="claude-opus-5-5">claude-opus-5-5</option>
                   </select>
                   <input id="pgPrompt" type="text" value="请先思考一下：为什么 0.1 + 0.2 在浮点数里不等于 0.3？用一句话总结。" style="flex:1;min-width:240px;" />
                   <button type="button" class="btn-solid" id="pgSendBtn">发送测试</button>
@@ -1113,7 +1110,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             <div class="panel-hdr">
               <div>
                 <h2>对外开放模型列表与启停管理 (Model Access Control)</h2>
-                <p>参数传法：① 模型名后缀如 <span class="mono">quick-balanced[effort=high]</span>、<span class="mono">quick-smart[effort=medium]</span>；② 标准请求体 <span class="mono">reasoning_effort</span> / Claude <span class="mono">thinking</span>（网关会自动映射为 AWS Quick 的 <span class="mono">agent_mode</span> 与 <span class="mono">thinking_effort</span>）</p>
+                <p>参数传法：① 模型名后缀如 <span class="mono">claude-sonnet-5-5[effort=high]</span>、<span class="mono">claude-opus-5-5[effort=medium]</span>；② 标准请求体 <span class="mono">reasoning_effort</span> / Claude <span class="mono">thinking</span>（网关会自动映射为 AWS Quick 的 <span class="mono">agent_mode</span> 与 <span class="mono">thinking_effort</span>）</p>
               </div>
               <button id="refreshModelsBtn">刷新上游模型目录</button>
             </div>
@@ -1675,7 +1672,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "累计 Token / 最近调用": "Tokens / Last Used",
       "对外开放模型列表与启停管理 (Model Access Control)": "Model Access Control",
       "刷新上游模型目录": "Refresh Catalog",
-      "搜索模型 ID 或名称...": "Search model ID or name (e.g. quick-balanced, quick-smart)...",
+      "搜索模型 ID 或名称...": "Search model ID or name (e.g. claude-sonnet-5-5, claude-opus-5-5)...",
       "全部额度池": "All Pools",
       "全部模型": "All Models",
       "仅已启用": "Enabled Only",
@@ -3178,12 +3175,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
 
     function modelRoleLabel(id) {
-      if (id === "quick-fast") return tr("轻量极速 · 日常问答", "Fast · Everyday tasks");
-      if (id === "quick-balanced") return tr("均衡主力 · 代码与通用", "Balanced · Coding & general");
-      if (id === "quick-balanced-think") return tr("均衡主力 · 深度思考", "Balanced · Deep thinking");
-      if (id === "quick-smart") return tr("旗舰推理 · 复杂任务", "Flagship · Complex reasoning");
-      if (id === "quick-smart-think") return tr("旗舰推理 · 深度思考", "Flagship · Deep thinking");
-      if (id === "quick-advanced") return tr("高级工作流 · 需高阶权限", "Advanced · Paid tier");
+      if (id === "claude-haiku-5-5") return tr("轻量极速 · 日常问答", "Fast · Everyday tasks");
+      if (id === "claude-sonnet-5-5") return tr("均衡主力 · 代码与通用", "Balanced · Coding & general");
+      if (id === "claude-opus-5-5") return tr("旗舰推理 · 复杂任务", "Flagship · Complex reasoning");
       return "—";
     }
 
@@ -3308,8 +3302,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const keyStr = rawToken || tr("<请先创建或选择一把子密钥>", "<SELECT_OR_CREATE_SUB_KEY>");
       const allowedList = ck && !ck.allowAllModels && (ck.allowedModels || []).length
         ? ck.allowedModels
-        : ["quick-fast", "quick-balanced", "quick-balanced-think", "quick-smart", "quick-smart-think"];
-      const sampleModel = allowedList[0] || "quick-balanced";
+        : ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"];
+      const sampleModel = allowedList[0] || "claude-sonnet-5-5";
       if ($("ckConnectTitle")) {
         $("ckConnectTitle").textContent = ck
           ? tr("快捷接入与在线测试 · 当前密钥：", "Quick Connect & Test · ") + ck.name

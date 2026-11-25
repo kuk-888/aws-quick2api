@@ -107,16 +107,13 @@ flowchart LR
 
 | 模型 ID | 模式 | 默认思考强度 | 实测大概率路由底层模型 | 适用场景 |
 | :--- | :--- | :--- | :--- | :--- |
-| `quick-fast` | `fast` | `off` | `us.anthropic.claude-haiku-5-5` | 轻量极速、日常问答与高并发 |
-| `quick-balanced` | `balanced` | `off` | `us.anthropic.claude-sonnet-5-5` | 均衡主力、日常代码与通用任务（默认） |
-| `quick-balanced-think` | `balanced` | `medium` | `us.anthropic.claude-sonnet-5-5` | 均衡主力 + 深度思考 |
-| `quick-smart` | `smart` | `off` | `us.anthropic.claude-opus-5-5` | 旗舰推理、复杂任务与架构设计 |
-| `quick-smart-think` | `smart` | `high` | `us.anthropic.claude-opus-5-5` | 旗舰推理 + 高强度深度思考 |
-| `quick-advanced` | `advanced` | `high` | 视账号 Advanced 权限而定 | 高级工作流（Free 套餐建议在管理台禁用） |
+| `claude-haiku-5-5` | `fast` | `off` | `us.anthropic.claude-haiku-5-5` | 轻量极速、日常问答与高并发 |
+| `claude-sonnet-5-5` | `balanced` | `off` | `us.anthropic.claude-sonnet-5-5` | 均衡主力、日常代码与通用任务（默认） |
+| `claude-opus-5-5` | `smart` | `off` | `us.anthropic.claude-opus-5-5` | 旗舰推理、复杂任务与架构设计 |
 
-> **说明**：底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，上表基于 Free / 常规套餐多次实测结果整理（后续可能随 AWS 上游调度策略调整）。实际路由到的底层模型会实时显示在思考块、OpenAI `system_fingerprint` 以及控制台请求日志中。
+> **说明**：`/v1/models` 只公开以上三个模型。底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，实际路由到的模型会显示在思考块、OpenAI `system_fingerprint` 以及控制台请求日志中。
 >
-> **别名与参数覆盖**：兼容带括号说明的写法（如 `quick-balanced(Sonnet)`），支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking` 或方括号语法（`quick-balanced[effort=high]`）按请求覆盖思考强度。
+> **兼容别名**：旧 `quick-fast`、`quick-balanced`、`quick-smart` 仍可作为请求别名；`quick-balanced-think` 与 `quick-smart-think` 保留默认思考强度，`quick-advanced` 保留 Advanced 模式。支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking` 或方括号语法（如 `claude-sonnet-5-5[effort=high]`）按请求覆盖思考强度。
 
 ---
 
@@ -168,7 +165,7 @@ docker compose pull && docker compose up -d
 | `ENABLE_DASHBOARD` | `true` | 是否启用 Web 管理台（`false` 关闭全部管理台路由） |
 | `ADMIN_PASSWORD` | - | 管理台密码（公网部署必填；留空时仅允许 `127.0.0.1`/`::1` 初始化） |
 | `QUICK_TOKENS` | `local-outpost` | 上游凭证（也可启动后直接在管理台用 OAuth 或 Cookie 添加） |
-| `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（Free 账号建议填 `quick-advanced`） |
+| `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（如 `claude-opus-5-5`） |
 | `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换） |
 | `AUTO_DELETE_SESSION` | `false` | 无痕模式下回合结束后是否额外发 `session_delete`（默认关闭） |
 | `WEB_SEARCH_ENABLED` | `true` | 开启 AWS Quick 原生联网搜索 |

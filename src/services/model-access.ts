@@ -3,7 +3,7 @@ import { persistDisabledModelsToEnvFile } from "../core/config.js";
 import { classifyModelQuotaPool } from "../core/key-pool.js";
 import { GatewayError, type GatewayConfig } from "../core/types.js";
 import { normalizeBaseModelId as normalizeCanonicalBaseModelId } from "../utils/hash.js";
-import { DEFAULT_MODEL } from "./model-catalog.js";
+import { canonicalizeModelId, DEFAULT_MODEL } from "./model-catalog.js";
 
 export interface ManagedModelEntry {
   id: string;
@@ -15,12 +15,12 @@ export interface ManagedModelEntry {
 }
 
 /**
- * Normalize a requested model string (e.g. `quick-balanced[effort=high]` or `quick-smart-think`)
- * into its canonical base model ID (`quick-balanced`, `quick-smart-think`).
+ * Normalize a requested model string (e.g. `claude-sonnet-5-5[effort=high]` or a
+ * legacy `quick-*` alias) into its canonical public model ID.
  */
 export function normalizeBaseModelId(rawModel: string | undefined): string {
   const norm = normalizeCanonicalBaseModelId(rawModel || DEFAULT_MODEL);
-  return norm || DEFAULT_MODEL;
+  return canonicalizeModelId(norm || DEFAULT_MODEL);
 }
 
 /**

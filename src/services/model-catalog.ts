@@ -1,63 +1,63 @@
-import type { ModelSelection, QuickThinkingEffort, SDKModel } from "../aws-quick/types.js";
+import type { ModelSelection, QuickAgentMode, QuickThinkingEffort, SDKModel } from "../aws-quick/types.js";
 
-export const DEFAULT_MODEL = "quick-balanced";
+export const DEFAULT_MODEL = "claude-sonnet-5-5";
 
 export const AWS_QUICK_MODELS: SDKModel[] = [
   {
-    id: "quick-fast",
-    name: "AWS Quick Fast (Haiku / GPT Luna)",
-    displayName: "Quick Fast (Haiku)",
-    description: "Fastest option for everyday tasks (typically routes to Haiku / GPT Luna)",
+    id: "claude-haiku-5-5",
+    name: "Claude Haiku 5.5",
+    displayName: "Claude Haiku 5.5",
+    description: "Fastest option for everyday tasks (AWS Quick fast mode)",
     agentMode: "fast",
     thinkingEffort: "off",
     parameters: [],
   },
   {
-    id: "quick-balanced",
-    name: "AWS Quick Balanced (Sonnet / GPT Terra)",
-    displayName: "Quick Balanced (Sonnet)",
-    description: "Balanced speed and depth (typically routes to Sonnet / GPT Terra; supports reasoning)",
+    id: "claude-sonnet-5-5",
+    name: "Claude Sonnet 5.5",
+    displayName: "Claude Sonnet 5.5",
+    description: "Balanced speed and depth for coding and general tasks (AWS Quick balanced mode)",
     agentMode: "balanced",
     thinkingEffort: "off",
     parameters: [{ id: "effort", values: ["off", "low", "medium", "high"] }],
   },
   {
-    id: "quick-balanced-think",
-    name: "AWS Quick Balanced Think (Sonnet)",
-    displayName: "Quick Balanced Think (Sonnet)",
-    description: "Balanced mode with reasoning enabled by default (typically routes to Sonnet)",
-    agentMode: "balanced",
-    thinkingEffort: "medium",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
-  },
-  {
-    id: "quick-smart",
-    name: "AWS Quick Smart (Opus / GPT Sol)",
-    displayName: "Quick Smart (Opus)",
-    description: "Deeper reasoning and highest quality (typically routes to Opus / GPT Sol; supports reasoning)",
+    id: "claude-opus-5-5",
+    name: "Claude Opus 5.5",
+    displayName: "Claude Opus 5.5",
+    description: "Deep reasoning and highest quality for complex tasks (AWS Quick smart mode)",
     agentMode: "smart",
     thinkingEffort: "off",
     parameters: [{ id: "effort", values: ["off", "low", "medium", "high"] }],
-  },
-  {
-    id: "quick-smart-think",
-    name: "AWS Quick Smart Think (Opus)",
-    displayName: "Quick Smart Think (Opus)",
-    description: "Smart mode with high reasoning enabled by default (typically routes to Opus)",
-    agentMode: "smart",
-    thinkingEffort: "high",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
-  },
-  {
-    id: "quick-advanced",
-    name: "AWS Quick Advanced (Opus Max)",
-    displayName: "Quick Advanced",
-    description: "Advanced mode with always-on deep reasoning (requires Advanced entitlement)",
-    agentMode: "advanced",
-    thinkingEffort: "high",
-    parameters: [{ id: "effort", values: ["low", "medium", "high"] }],
   },
 ];
+
+interface QuickModelAlias {
+  id: string;
+  agentMode?: QuickAgentMode;
+  thinkingEffort?: QuickThinkingEffort;
+}
+
+/** Legacy request aliases stay usable, but only the three Claude IDs are advertised. */
+const QUICK_MODEL_ALIASES: Record<string, QuickModelAlias> = {
+  "quick-fast": { id: "claude-haiku-5-5" },
+  "quick-balanced": { id: "claude-sonnet-5-5" },
+  "quick-balanced-think": { id: "claude-sonnet-5-5", thinkingEffort: "medium" },
+  "quick-smart": { id: "claude-opus-5-5" },
+  "quick-smart-think": { id: "claude-opus-5-5", thinkingEffort: "high" },
+  "quick-advanced": { id: "claude-opus-5-5", agentMode: "advanced", thinkingEffort: "high" },
+};
+
+const BUILT_IN_MODEL_IDS = new Set(AWS_QUICK_MODELS.map((model) => model.id));
+
+export function isBuiltInModelId(modelId: string): boolean {
+  return BUILT_IN_MODEL_IDS.has(modelId);
+}
+
+export function canonicalizeModelId(rawModel: string): string {
+  const base = rawModel.trim().toLowerCase().split("[")[0]?.replace(/\([^)]*\)$/, "").trim() || DEFAULT_MODEL;
+  return QUICK_MODEL_ALIASES[base]?.id ?? base;
+}
 
 export async function listLiveModels(
   _apiKey: string,
@@ -84,13 +84,14 @@ export function resolveModelSelection(
 ): { selection: ModelSelection; canonicalId: string } {
   const raw = (requestedModel || "").trim() || DEFAULT_MODEL;
   const match = /^([^\[]+?)(?:\[(.*)\])?$/.exec(raw);
-  const baseId = (match?.[1] || DEFAULT_MODEL).trim().toLowerCase().replace(/\([^)]*\)$/, "").trim();
-
+  const requestedBase = (match?.[1] || DEFAULT_MODEL).trim().toLowerCase().replace(/\([^)]*\)$/, "").trim();
+  const alias = QUICK_MODEL_ALIASES[requestedBase];
+  const baseId = alias?.id ?? requestedBase;
   const found = AWS_QUICK_MODELS.find((m) => m.id === baseId) ?? AWS_QUICK_MODELS[1]!;
+  const agentMode = alias?.agentMode ?? found.agentMode;
+  let effort: QuickThinkingEffort = alias?.thinkingEffort ?? found.thinkingEffort;
 
-  let effort: QuickThinkingEffort = found.thinkingEffort;
-
-  // Check bracket param e.g. quick-balanced[effort=high]
+  // Check bracket param e.g. claude-sonnet-5-5[effort=high]
   if (match?.[2]) {
     for (const part of match[2].split(",")) {
       const [k, v] = part.split("=").map((s) => s.trim());
@@ -106,9 +107,9 @@ export function resolveModelSelection(
     ? (body.reasoning as { effort?: unknown })
     : undefined;
   const thinkingObj = body.thinking && typeof body.thinking === "object"
-    ? (body.thinking as { type?: string; budget_tokens?: number })
+    ? (body.thinking as { type?: unknown; budget_tokens?: unknown })
     : undefined;
-  const thinkingEffortFromObj: QuickThinkingEffort | undefined =
+  const thinkingEffortFromObj =
     thinkingObj?.type === "enabled"
       ? typeof thinkingObj.budget_tokens === "number" && thinkingObj.budget_tokens < 2048
         ? "low"
@@ -118,9 +119,9 @@ export function resolveModelSelection(
       : thinkingObj?.type === "disabled"
         ? "off"
         : undefined;
-  const enableThinkingEffort: QuickThinkingEffort | undefined =
+  const enableThinkingEffort =
     body.enable_thinking === true
-      ? found.agentMode === "balanced"
+      ? agentMode === "balanced"
         ? "medium"
         : "high"
       : body.enable_thinking === false
@@ -134,15 +135,15 @@ export function resolveModelSelection(
     thinkingEffortFromObj ||
     enableThinkingEffort;
 
-  if (bodyEffort && found.agentMode !== "fast") {
-    effort = found.agentMode === "advanced" && bodyEffort === "off" ? "high" : bodyEffort;
+  if (bodyEffort && agentMode !== "fast") {
+    effort = agentMode === "advanced" && bodyEffort === "off" ? "high" : bodyEffort;
   }
 
   return {
     selection: {
       model: found.id,
-      agentMode: found.agentMode,
-      thinkingEffort: found.agentMode === "fast" ? "off" : effort,
+      agentMode,
+      thinkingEffort: agentMode === "fast" ? "off" : effort,
     },
     canonicalId: found.id,
   };
@@ -159,7 +160,7 @@ export function formatOpenAiModelList(models: SDKModel[]): Array<{
     id: m.id,
     object: "model",
     created: 0,
-    owned_by: "aws-quick",
+    owned_by: "anthropic",
     ...(m.displayName ? { name: m.displayName } : {}),
   }));
 }

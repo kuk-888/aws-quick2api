@@ -2456,7 +2456,7 @@ export class QuickExecutionEngine {
             );
           } else if (selection.agentMode === "advanced" && payload.turn_fatal === true) {
             gatewayErr = new GatewayError(
-              "AWS Quick Advanced mode is not enabled on this account. Free-tier accounts should use quick-smart(Opus) or disable quick-advanced in Models.",
+              "AWS Quick Advanced mode is not enabled on this account. Free-tier accounts should use claude-opus-5-5 or disable the legacy quick-advanced alias in Models.",
               403,
               "model_not_available",
             );
@@ -2573,7 +2573,7 @@ export class QuickExecutionEngine {
   }
 
   /**
-   * Best-effort 15s `quick-fast` summary of an omitted middle section when a caller exceeds
+   * Best-effort 15s `claude-haiku-5-5` summary of an omitted middle section when a caller exceeds
    * `AUTO_COMPACT_OVERFLOW_TOKENS` (~850K tokens). Falls back cleanly to head+tail trim on any error.
    */
   private async summarizeOverflowMiddle(
@@ -2598,7 +2598,7 @@ export class QuickExecutionEngine {
     try {
       const summaryTurn: ParsedProtocolTurn = {
         scope: "internal-compact",
-        requestedModel: "quick-fast",
+        requestedModel: "claude-haiku-5-5",
         stream: false,
         systemPrompt: "You are a concise context compactor. Summarize the key facts, decisions, code identifiers, file paths, and open tasks from this earlier conversation excerpt in <= 400 words.",
         fullTranscriptText: middleSample,
