@@ -6,8 +6,16 @@ test
 !.env.example
 data
 gateway-keys.json
+env-key-tombstones.json
 usage-ledger.json
 admin-session.key
+account-identities.json
+effort-capabilities.json
+*.imported
+# SQLite runtime state (with WAL sidecars)
+*.db
+*.db-wal
+*.db-shm
 *.key
 *.tmp
 *.log
