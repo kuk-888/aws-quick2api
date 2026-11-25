@@ -5,7 +5,7 @@ import { closeAllOAuthServers } from "./aws-quick/oauth-client.js";
 import { findInsecurePlaceholderConfig, isPlaceholderSecret, loadConfigFromEnv, loadDotEnv } from "./core/config.js";
 import { QuickExecutionEngine, mapSdkError, type AgentFactory } from "./core/engine.js";
 import { UpstreamKeyPool } from "./core/key-pool.js";
-import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "./core/types.js";
+import { GatewayError, type GatewayConfig, type GatewayStreamEvent, type ParsedProtocolTurn } from "./core/types.js";
 import {
   anthropicMessagesAdapter,
   estimateAnthropicTokens,
@@ -422,7 +422,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
   async function* tapStreamWithTrace(
     events: AsyncGenerator<GatewayStreamEvent, void, unknown>,
     traceId: string | null,
-    clientKeyId?: string
+    clientKeyId?: string,
+    turn?: ParsedProtocolTurn
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     if (!traceId && !clientKeyId) {
       yield* events;
@@ -430,10 +431,17 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     }
     let doneReason: string | undefined;
     let settled = false;
+    // Split upstream reasoning from the gateway's own `[AWS Quick] mode=… effort=… routed=…` line so
+    // "thinking shown" can never be confused with "the model actually reasoned".
+    let thinkingChars = 0;
+    let routedHeaderChars = 0;
     try {
       for await (const ev of events) {
-        if (ev.type === "thinking") traceLogger.recordThinkingDelta(traceId, ev.text);
-        else if (ev.type === "text") traceLogger.recordTextDelta(traceId, ev.text);
+        if (ev.type === "thinking") {
+          traceLogger.recordThinkingDelta(traceId, ev.text);
+          if (ev.text.startsWith("[AWS Quick] mode=")) routedHeaderChars += ev.text.length;
+          else thinkingChars += ev.text.length;
+        } else if (ev.type === "text") traceLogger.recordTextDelta(traceId, ev.text);
         else if (ev.type === "tool_calls") traceLogger.recordToolCalls(traceId, ev.calls);
         else if (ev.type === "usage") {
           traceLogger.recordUsage(traceId, ev.metrics);
@@ -451,6 +459,19 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     } finally {
       if (!settled) {
         traceLogger.finishError(traceId, 499, "Client disconnected before stream completed");
+      }
+      if (turn) {
+        engine.recordTurnEffort(turn, { thinkingChars, routedHeaderChars });
+        const diag = engine.turnDiagnostics(turn);
+        if (diag) {
+          traceLogger.recordEffort(traceId, diag);
+          if (process.env.TURN_EFFORT_LOG !== "off") {
+            console.log(
+              `[turn] done model=${diag.model} mode=${diag.agentMode} effort=${diag.effortSent ?? "none(fast)"}` +
+                ` source=${diag.effortSource} thinking_chars=${thinkingChars} header_chars=${routedHeaderChars}`,
+            );
+          }
+        }
       }
     }
   }
@@ -792,7 +813,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           resolveLeaseReady();
         });
         const events = tapStreamWithLedger(
-          tapStreamWithTrace(rawEvents, traceId, clientKeyId),
+          tapStreamWithTrace(rawEvents, traceId, clientKeyId, turn),
           {
             model: turn.requestedModel,
             key: clientAuth.keyName || "master",

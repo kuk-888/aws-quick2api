@@ -891,6 +891,55 @@ export class QuickExecutionEngine {
     }
   >();
 
+  /**
+   * Content-free per-turn diagnostic: what the client asked for, what the gateway actually put on
+   * the wire (or omitted entirely), and why. Read by the request log so an operator can answer
+   * "why did this turn produce no thinking?" without guessing.
+   */
+  private readonly turnEffortDiagnostics = new WeakMap<
+    ParsedProtocolTurn,
+    {
+      model: string;
+      agentMode: string;
+      /** Tier before the per-account capability downgrade. */
+      effortRequested: QuickThinkingEffort;
+      /** Tier actually sent upstream; `null` when fast mode omits `thinking_effort`. */
+      effortSent: QuickThinkingEffort | null;
+      downgraded: boolean;
+      /** Which client input decided the tier (`model-default`, `thinking.budget_tokens=31999`, ...). */
+      effortSource: string;
+      account: string;
+      /** Characters of real upstream reasoning deltas seen in this turn. */
+      thinkingChars: number;
+      /** Characters of gateway-generated `[AWS Quick] mode=... effort=... routed=...` line. */
+      routedHeaderChars: number;
+    }
+  >();
+
+  /** Optionally invoked for every finished turn with its content-free effort diagnostics. */
+  recordTurnEffort(turn: ParsedProtocolTurn, patch: { thinkingChars?: number; routedHeaderChars?: number }): void {
+    const diag = this.turnEffortDiagnostics.get(turn);
+    if (!diag) return;
+    if (patch.thinkingChars !== undefined) diag.thinkingChars = patch.thinkingChars;
+    if (patch.routedHeaderChars !== undefined) diag.routedHeaderChars = patch.routedHeaderChars;
+  }
+
+  /** Content-free effort diagnostics for a turn, or undefined if it never reached the pool. */
+  turnDiagnostics(turn: ParsedProtocolTurn): Readonly<{
+    model: string;
+    agentMode: string;
+    effortRequested: QuickThinkingEffort;
+    effortSent: QuickThinkingEffort | null;
+    downgraded: boolean;
+    effortSource: string;
+    account: string;
+    thinkingChars: number;
+    routedHeaderChars: number;
+  }> | undefined {
+    const diag = this.turnEffortDiagnostics.get(turn);
+    return diag ? { ...diag } : undefined;
+  }
+
   private warmKey(
     scope: string | undefined,
     conversationKey: string | undefined,
@@ -2151,20 +2200,44 @@ export class QuickExecutionEngine {
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     // Resolve model BEFORE consuming any parked warm WS so there is no async vacuum window
     // where a parked WS has no error/close listeners or leaks if model resolution fails.
-    const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
+    const { selection, effortSource } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
     // Max-effort passthrough probe: forward `max` optimistically, but keep the tier this account
     // was already proven to reject (or a global kill switch) from ever reaching the wire.
     // Fast mode never sends `thinking_effort`, so it is neither probed nor recorded.
+    let effortRequested: QuickThinkingEffort = selection.thinkingEffort;
+    let effortSent: QuickThinkingEffort | null = null;
+    let effortDowngraded = false;
     if (selection.agentMode !== "fast") {
       const effortDecision = this.effortCapabilities.resolveEffort(lease.maskedKey, selection.thinkingEffort);
-      const requestedEffort = selection.thinkingEffort;
+      effortRequested = selection.thinkingEffort;
       selection.thinkingEffort = effortDecision.effort;
+      effortSent = effortDecision.effort;
+      effortDowngraded = effortDecision.downgraded;
       this.effortAttempts.set(turn, {
         accountKey: lease.maskedKey,
-        requestedEffort,
+        requestedEffort: effortRequested,
         sentEffort: effortDecision.effort,
         downgraded: effortDecision.downgraded,
       });
+    }
+    this.turnEffortDiagnostics.set(turn, {
+      model: selection.model,
+      agentMode: selection.agentMode,
+      effortRequested,
+      effortSent,
+      downgraded: effortDowngraded,
+      effortSource,
+      account: lease.maskedKey,
+      thinkingChars: 0,
+      routedHeaderChars: 0,
+    });
+    // One content-free line per turn: this is the request that actually goes upstream, so an
+    // operator can tell a client that never asked for thinking apart from a gateway that dropped it.
+    if (process.env.TURN_EFFORT_LOG !== "off") {
+      console.log(
+        `[turn] model=${selection.model} mode=${selection.agentMode} effort=${effortSent ?? "none(fast)"}` +
+          `${effortDowngraded ? ` (requested ${effortRequested}, fallback)` : ""} source=${effortSource} account=${lease.maskedKey}`,
+      );
     }
 
     const hasCustomAgent = Boolean(chatAgentId);

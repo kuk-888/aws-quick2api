@@ -17,7 +17,7 @@ export type RequestProtocolTag =
   | "anthropic-messages"
   | "playground";
 
-export interface RequestTraceSummary {
+export interface RequestTraceSummary extends RequestTraceEffort {
   id: string;
   startedAt: string;
   status: "running" | "success" | "error";
@@ -44,6 +44,22 @@ export interface RequestTraceSummary {
   transcriptTotalChars: number;
   outputChars: number;
   metrics?: TurnTokenMetrics;
+}
+
+/** Content-free record of the thinking tier that actually reached AWS Quick for this request. */
+export interface RequestTraceEffort {
+  agentMode?: string;
+  /** Tier the client asked for (after request parsing, before per-account capability). */
+  effortRequested?: string;
+  /** Tier actually sent upstream; null when fast mode omits `thinking_effort`. */
+  effortSent?: string | null;
+  effortDowngraded?: boolean;
+  /** Which client input decided the tier (`model-default`, `thinking.budget_tokens=31999`, ...). */
+  effortSource?: string;
+  /** Characters of real upstream reasoning deltas. */
+  thinkingChars?: number;
+  /** Characters of the gateway's own `[AWS Quick] mode=… effort=… routed=…` line. */
+  routedHeaderChars?: number;
 }
 
 /** Content-free diagnostics: lets an operator reason about session reuse without seeing any text. */
@@ -170,6 +186,32 @@ export class RequestTraceLogger {
     if (!rec) return;
     if (rec.ttftMs === null) rec.ttftMs = Date.now() - rec.startedAtMs;
     rec.hasThinking = true;
+    rec.thinkingChars = (rec.thinkingChars ?? 0) + text.length;
+  }
+
+  /** Stores the outbound effort decision; labels and counts only, never content. */
+  recordEffort(
+    traceId: string | null,
+    effort: {
+      agentMode?: string;
+      effortRequested?: string;
+      effortSent?: string | null;
+      downgraded?: boolean;
+      effortSource?: string;
+      thinkingChars?: number;
+      routedHeaderChars?: number;
+    },
+  ): void {
+    if (!traceId) return;
+    const rec = this.records.get(traceId);
+    if (!rec) return;
+    rec.agentMode = effort.agentMode;
+    rec.effortRequested = effort.effortRequested;
+    rec.effortSent = effort.effortSent;
+    rec.effortDowngraded = effort.downgraded;
+    rec.effortSource = effort.effortSource;
+    if (effort.thinkingChars !== undefined) rec.thinkingChars = effort.thinkingChars;
+    if (effort.routedHeaderChars !== undefined) rec.routedHeaderChars = effort.routedHeaderChars;
   }
 
   recordTextDelta(traceId: string | null, text: string): void {

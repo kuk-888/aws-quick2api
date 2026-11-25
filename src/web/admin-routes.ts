@@ -13,7 +13,7 @@ import { listWebCloudSessions } from "../aws-quick/web-client.js";
 import type { SDKModel } from "../aws-quick/types.js";
 import { DEFAULT_CODING_AGENT_INSTRUCTIONS, type QuickExecutionEngine } from "../core/engine.js";
 import type { PoolRoutingSettings, UpstreamKeyPool } from "../core/key-pool.js";
-import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "../core/types.js";
+import { GatewayError, type GatewayConfig, type GatewayStreamEvent, type ParsedProtocolTurn } from "../core/types.js";
 import { isRecord } from "../protocols/common.js";
 import { openAiChatAdapter } from "../protocols/openai.js";
 import type { ClientGatewayKeyManager } from "../services/client-keys.js";
@@ -50,7 +50,8 @@ export interface WebAdminContext {
   tapStreamWithTrace: (
     events: AsyncGenerator<GatewayStreamEvent, void, unknown>,
     traceId: string | null,
-    clientKeyId?: string
+    clientKeyId?: string,
+    turn?: ParsedProtocolTurn
   ) => AsyncGenerator<GatewayStreamEvent, void, unknown>;
   extractClientCredential: (req: http.IncomingMessage) => string;
   readJsonBody: (req: http.IncomingMessage, maxBytes: number) => Promise<unknown>;
@@ -429,7 +430,7 @@ export async function tryHandleWebAdminRoute(
       keyPool,
       (meta) => traceLogger.bindExecutionMeta(traceId, meta)
     );
-    const events = ctx.tapStreamWithTrace(rawEvents, traceId);
+    const events = ctx.tapStreamWithTrace(rawEvents, traceId, undefined, turn);
     const json = await openAiChatAdapter.collectJson(events, turn);
     sendJson(res, 200, json);
     return true;

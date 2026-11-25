@@ -171,6 +171,18 @@ describe("Model catalog & parameter resolution", () => {
     assert.equal(resolveModelSelection("quick-advanced").selection.agentMode, "advanced");
   });
 
+  it("reports which client input decided the thinking tier", () => {
+    assert.equal(resolveModelSelection("claude-opus-5-5").effortSource, "model-default");
+    assert.equal(resolveModelSelection("claude-opus-5-5[effort=max]").effortSource, "bracket");
+    assert.equal(resolveModelSelection("claude-opus-5-5-max").effortSource, "model-suffix");
+    assert.equal(resolveModelSelection("quick-smart-think").effortSource, "alias-default");
+    assert.equal(resolveModelSelection("claude-opus-5-5", { reasoning_effort: "high" }).effortSource, "reasoning_effort");
+    assert.equal(resolveModelSelection("claude-opus-5-5", { reasoning: { effort: "high" } }).effortSource, "reasoning.effort");
+    assert.equal(resolveModelSelection("claude-opus-5-5", { thinking: { type: "enabled", budget_tokens: 31999 } }).effortSource, "thinking.budget_tokens=31999");
+    assert.equal(resolveModelSelection("claude-opus-5-5", { thinking: { type: "enabled" } }).effortSource, "thinking.enabled");
+    assert.equal(resolveModelSelection("claude-opus-5-5", { enable_thinking: true }).effortSource, "enable_thinking");
+  });
+
   it("advertises only the three Claude 5.5 models", () => {
     const list = formatOpenAiModelList(AWS_QUICK_MODELS);
     assert.deepEqual(list.map((model) => model.id), [

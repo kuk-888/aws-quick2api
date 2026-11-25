@@ -168,13 +168,16 @@ export function resolveModelSelection(
   requestedModel: string | undefined,
   body: Record<string, unknown> = {},
   _modelSchema?: SDKModel,
-): { selection: ModelSelection; canonicalId: string } {
+): { selection: ModelSelection; canonicalId: string; effortSource: string } {
   const { found: matched, bracketParams, suffixEffort, aliasAgentMode, aliasThinkingEffort } =
     matchKnownModel(requestedModel);
   const found = matched ?? AWS_QUICK_MODELS[1]!;
   const agentMode = aliasAgentMode ?? found.agentMode;
 
   let effort: QuickThinkingEffort = suffixEffort ?? aliasThinkingEffort ?? found.thinkingEffort;
+  // Which input actually decided the tier. Surfaced in the request log so "the model produced no
+  // thinking" can be traced back to the client's own request instead of being guessed at.
+  let effortSource = suffixEffort ? "model-suffix" : aliasThinkingEffort ? "alias-default" : "model-default";
 
   // Check bracket param e.g. claude-sonnet-5-5[effort=high]
   if (bracketParams) {
@@ -182,7 +185,10 @@ export function resolveModelSelection(
       const [k, v] = part.split("=").map((s) => s.trim());
       if (k === "effort" || k === "thinking_effort") {
         const parsed = parseEffort(v);
-        if (parsed) effort = parsed;
+        if (parsed) {
+          effort = parsed;
+          effortSource = "bracket";
+        }
       }
     }
   }
@@ -220,15 +226,24 @@ export function resolveModelSelection(
         ? "off"
         : undefined;
 
-  const bodyEffort =
-    parseEffort(body.reasoning_effort) ||
-    parseEffort(body.effort) ||
-    parseEffort(reasoningObj?.effort) ||
-    thinkingEffortFromObj ||
-    enableThinkingEffort;
+  const bodyCandidates: Array<[QuickThinkingEffort | undefined, string]> = [
+    [parseEffort(body.reasoning_effort), "reasoning_effort"],
+    [parseEffort(body.effort), "effort"],
+    [parseEffort(reasoningObj?.effort), "reasoning.effort"],
+    [
+      thinkingEffortFromObj,
+      typeof thinkingBudget === "number"
+        ? `thinking.budget_tokens=${thinkingBudget}`
+        : `thinking.${String(thinkingObj?.type ?? "enabled")}`,
+    ],
+    [enableThinkingEffort, "enable_thinking"],
+  ];
+  const picked = bodyCandidates.find(([value]) => Boolean(value));
+  const bodyEffort = picked?.[0];
 
   if (bodyEffort && agentMode !== "fast") {
     effort = agentMode === "advanced" && bodyEffort === "off" ? "high" : bodyEffort;
+    effortSource = picked![1]!;
   }
 
   return {
@@ -238,6 +253,7 @@ export function resolveModelSelection(
       thinkingEffort: agentMode === "fast" ? "off" : effort,
     },
     canonicalId: found.id,
+    effortSource,
   };
 }
 

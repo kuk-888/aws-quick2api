@@ -3026,7 +3026,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
         const badges = [];
         if (r.usedProxy) badges.push('<span class="tag">' + esc(tr("代理", "Proxy")) + '</span>');
-        if (r.hasThinking) badges.push('<span class="tag">' + esc(tr("思考", "Thinking")) + '</span>');
+        // Distinguish real upstream reasoning from the gateway's own routed-model line: a turn can
+        // show "thinking" while the model never reasoned (effort=off), which is exactly the confusion
+        // this badge is meant to end.
+        if (r.thinkingChars > 0) badges.push('<span class="tag tag-ok">' + esc(tr("思考 ", "Thinking ")) + fmt(r.thinkingChars) + esc(tr(" 字", " ch")) + '</span>');
+        else if (r.hasThinking) badges.push('<span class="tag" style="opacity:0.7;" title="' + esc(tr("只有网关生成的路由提示，上游没有返回思考内容", "Only the gateway's routed-model line; upstream returned no reasoning")) + '">' + esc(tr("仅路由提示", "Header only")) + '</span>');
         if (r.emittedToolCallsCount > 0) badges.push('<span class="tag">' + esc(tr("调工具×", "Tools ×")) + r.emittedToolCallsCount + '</span>');
         if (r.toolCount > 0 && r.emittedToolCallsCount === 0) badges.push('<span class="tag" style="opacity:0.7;">' + esc(tr("挂", "")) + r.toolCount + esc(tr("工具", " tools")) + '</span>');
 
@@ -3048,7 +3052,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<td class="mono" style="white-space:nowrap;">' + new Date(r.startedAt).toLocaleTimeString() + '</td>' +
           '<td>' + stHtml + '</td>' +
           '<td><div class="mono" style="font-weight:500;">' + esc(r.requestedModel) + routedPillHtml + '</div>' +
-            '<div style="font-size:11px;color:var(--fg-muted);">' + esc(r.protocol) + (r.stream ? ' · SSE' : ' · JSON') + (r.client ? (' · ' + esc(r.client)) : '') + (r.clientKeyName ? (' · ' + esc(r.clientKeyName)) : '') + (r.clientIp ? (' · IP ' + esc(r.clientIp)) : '') + '</div></td>' +
+            '<div style="font-size:11px;color:var(--fg-muted);">' + esc(r.protocol) + (r.stream ? ' · SSE' : ' · JSON') + (r.client ? (' · ' + esc(r.client)) : '') + (r.clientKeyName ? (' · ' + esc(r.clientKeyName)) : '') + (r.clientIp ? (' · IP ' + esc(r.clientIp)) : '') + '</div>' +
+            (r.agentMode
+              ? '<div class="mono" style="font-size:10.5px;color:var(--fg-muted);margin-top:2px;" title="' + esc(tr("网关实际发给 AWS Quick 的 mode / thinking_effort 与决定该档位的客户端输入", "The mode / thinking_effort the gateway actually sent upstream, and which client input chose it")) + '">' +
+                esc('mode=' + r.agentMode + ' effort=' + (r.effortSent === null || r.effortSent === undefined ? 'none' : r.effortSent) + (r.effortDowngraded ? '(fallback)' : '') + ' src=' + (r.effortSource || '—')) +
+              '</div>'
+              : '') +
+            '</td>' +
           '<td><div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;"><span>' + esc(r.accountLabel || r.maskedKey || '—') + '</span>' + modeBadge + '</div></td>' +
           '<td style="max-width:340px;">' +
             (badges.length ? '<div style="display:flex;gap:4px;margin-bottom:3px;flex-wrap:wrap;">' + badges.join("") + '</div>' : '') +
@@ -3123,7 +3133,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<div class="kv-item"><span>' + esc(tr('执行模式 & 网络实发', 'Execution Mode & Payload')) + '</span><strong>' + esc(execModeLabel(d.execMode)) + '</strong><span style="margin-top:2px;">' + esc(savedNote) + '</span></div>' +
           '<div class="kv-item"><span>' + esc(tr('首包 TTFT / 总耗时 & Tokens', 'TTFT / Total & Tokens')) + '</span><strong class="mono">' + ttft + ' / ' + dur + '</strong><span class="mono" style="margin-top:2px;">' + esc(tr('新发入 ', 'In ')) + fmtTok(m.inputTokens) + esc(tr(' · 缓存读 ', ' · Cache ')) + fmtTok(m.cacheReadTokens) + esc(tr(' · 输出 ', ' · Out ')) + fmtTok(m.outputTokens) + '</span></div>' +
           row(esc(tr('消息数 / 附图', 'Messages / Images')), fmt(d.messageCount || 0) + ' / ' + fmt(d.imageCount || 0)) +
-          row(esc(tr('输出字数 / 思考 / 工具调用', 'Output Chars / Thinking / Tool Calls')), fmt(d.outputChars || 0) + ' / ' + (d.hasThinking ? tr('有', 'Yes') : tr('无', 'No')) + ' / ' + (d.emittedToolCallsCount || 0)) +
+          row(esc(tr('输出字数 / 真实思考 / 路由提示 / 工具调用', 'Output / Real Thinking / Routed Header / Tool Calls')), fmt(d.outputChars || 0) + ' / ' + fmt(d.thinkingChars || 0) + ' / ' + fmt(d.routedHeaderChars || 0) + ' / ' + (d.emittedToolCallsCount || 0)) +
+          row(esc(tr('上行档位 mode / effort', 'Upstream mode / effort')), esc((d.agentMode || '—') + ' / ' + (d.effortSent === null || d.effortSent === undefined ? 'none' : String(d.effortSent)) + (d.effortDowngraded ? ' (fallback from ' + String(d.effortRequested) + ')' : ''))) +
+          row(esc(tr('档位来源 (客户端输入)', 'Effort Source (client input)')), esc(d.effortSource || '—')) +
           row(esc(tr('会话指纹', 'Conversation Hash')), esc(fp.conversation || '—')) +
           row(esc(tr('前缀指纹 (上轮 → 本轮)', 'Prefix Hash (Prev → Cur)')), esc(fp.priorPrefix || '—') + ' → ' + esc(fp.currentPrefix || '—')) +
           row(esc(tr('挂载工具', 'Attached Tools')), tools.length ? esc(tools.join(', ')) : tr('无', 'None')) +
