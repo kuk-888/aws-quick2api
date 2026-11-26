@@ -197,8 +197,7 @@ async function callWebQbsProxy(
       await resp.text().catch(() => "");
       const backoffMs = 350 + Math.floor(Math.random() * 200);
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, backoffMs);
-        t.unref?.();
+        setTimeout(resolve, backoffMs);
       });
       continue;
     }
@@ -352,8 +351,7 @@ export async function uploadWebBinaryAttachment(
       await upResp.text().catch(() => "");
       const backoffMs = 350 + Math.floor(Math.random() * 200);
       await new Promise<void>((resolve) => {
-        const t = setTimeout(resolve, backoffMs);
-        t.unref?.();
+        setTimeout(resolve, backoffMs);
       });
       continue;
     }

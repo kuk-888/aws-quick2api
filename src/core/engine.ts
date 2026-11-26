@@ -1144,7 +1144,6 @@ export class QuickExecutionEngine {
                 turn.signal?.removeEventListener("abort", onAbort);
                 resolve();
               }, waitMs);
-              t.unref?.();
               turn.signal?.addEventListener("abort", onAbort, { once: true });
             });
             attempt -= 1;
@@ -1223,7 +1222,6 @@ export class QuickExecutionEngine {
                 turn.signal?.removeEventListener("abort", onAbort);
                 resolve();
               }, waitMs);
-              t.unref?.();
               turn.signal?.addEventListener("abort", onAbort, { once: true });
             });
             if (!turn.signal?.aborted) {
@@ -1444,7 +1442,6 @@ export class QuickExecutionEngine {
             turn.signal?.removeEventListener("abort", onAbort);
             resolve();
           }, settleMs);
-          t.unref?.();
           turn.signal?.addEventListener("abort", onAbort, { once: true });
           if (turn.signal?.aborted) onAbort();
         });

@@ -824,7 +824,6 @@ async function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
       signal?.removeEventListener("abort", onAbort);
       resolve();
     }, ms);
-    t.unref?.();
     signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
