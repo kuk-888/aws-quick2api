@@ -608,7 +608,11 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
     const iter = events[Symbol.asyncIterator]();
 
     let blockIndex = -1;
-    let openBlockKind: "thinking" | "text" | null = null;
+    let openBlockKind: "thinking" | "text" | "tool_use" | null = null;
+    let openToolStreamIndex: number | null = null;
+    const rawTcForStream = isRecord(turn.rawBody?.tool_choice) ? turn.rawBody.tool_choice : undefined;
+    const disableParallelStream = rawTcForStream?.disable_parallel_tool_use === true;
+    const allowedStreamToolIndices = new Set<number>();
     let metrics: TurnTokenMetrics = {
       inputTokens: turn.estimatedInputTokens,
       outputTokens: 1,
@@ -629,6 +633,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
       if (openBlockKind !== null) {
         yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
         openBlockKind = null;
+        openToolStreamIndex = null;
       }
     };
 
@@ -699,6 +704,35 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
             index: blockIndex,
             delta: { type: "text_delta", text: ev.text }
           });
+        } else if (ev.type === "tool_call_start") {
+          if (disableParallelStream && allowedStreamToolIndices.size >= 1) {
+            step = await iter.next();
+            continue;
+          }
+          allowedStreamToolIndices.add(ev.index);
+          hasEmittedTextOrTool = true;
+          yield* closeOpenBlock();
+          blockIndex += 1;
+          openBlockKind = "tool_use";
+          openToolStreamIndex = ev.index;
+          emittedAnyBlock = true;
+          yield sse("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "tool_use", id: ev.id, name: ev.name, input: {} }
+          });
+        } else if (ev.type === "tool_call_delta") {
+          if (openBlockKind === "tool_use" && openToolStreamIndex === ev.index && ev.argumentsDelta) {
+            yield sse("content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "input_json_delta", partial_json: ev.argumentsDelta }
+            });
+          }
+        } else if (ev.type === "tool_call_end") {
+          if (openBlockKind === "tool_use" && openToolStreamIndex === ev.index) {
+            yield* closeOpenBlock();
+          }
         } else if (ev.type === "tool_calls") {
           hasEmittedTextOrTool = true;
           yield* closeOpenBlock();

@@ -625,9 +625,28 @@ export function parseToolCallsFromText(
   };
 }
 
+export type StreamingToolCallEvent =
+  | { kind: "tool_call_start"; index: number; id: string; name: string }
+  | { kind: "tool_call_delta"; index: number; id: string; argumentsDelta: string }
+  | { kind: "tool_call_end"; index: number; call: NormalizedToolCall };
+
+interface ActiveStreamingCall {
+  index: number;
+  id: string;
+  name: string;
+  argsDepth: number;
+  inString: boolean;
+  escaped: boolean;
+  pendingCommaWs: string;
+  streamedArgs: string;
+}
+
+const STREAM_HEADER_RE = /^\s*\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"(?:arguments|input)"\s*:\s*(\S)/s;
+
 /**
- * Streaming helper that emits normal text immediately while buffering once `<tool_call` begins.
- * Zero buffering overhead when a response never emits `<tool_call>`.
+ * Streaming helper that emits normal text immediately AND streams `<tool_call>` JSON arguments
+ * incrementally as tokens arrive (eliminating 5-60s blank-screen stalls on large write/edit calls).
+ * Keeps legacy `feed()` / `flush()` intact for backward compatibility alongside `feedIncremental()` / `flushIncremental()`.
  */
 export class StreamingToolCallFilter {
   private readonly allowedToolNames?: ReadonlySet<string>;
@@ -638,9 +657,360 @@ export class StreamingToolCallFilter {
   private readonly fence: FenceState = { char: null, len: 0, linePrefix: "" };
   private lastEmittedChar = "";
 
+  // Incremental streaming state machine fields
+  private mode: "text" | "header" | "stream_args" | "post_args" | "buffered_block" = "text";
+  private blockBuf = "";
+  private nextToolIndex = 0;
+  private activeCall: ActiveStreamingCall | null = null;
+
   constructor(allowedToolNames?: ReadonlySet<string>, customToolNames?: ReadonlySet<string>) {
     this.allowedToolNames = allowedToolNames;
     this.customToolNames = customToolNames;
+  }
+
+  private emitBufferedToolCall(tc: NormalizedToolCall, events: StreamingToolCallEvent[]): void {
+    const index = this.nextToolIndex++;
+    events.push({ kind: "tool_call_start", index, id: tc.id, name: tc.name });
+    if (tc.argumentsJson) {
+      events.push({ kind: "tool_call_delta", index, id: tc.id, argumentsDelta: tc.argumentsJson });
+    }
+    events.push({ kind: "tool_call_end", index, call: tc });
+  }
+
+  /**
+   * Incremental streaming entry point: emits plain text AND real-time `tool_call_start` /
+   * `tool_call_delta` / `tool_call_end` events as `<tool_call>` blocks stream from upstream.
+   */
+  feedIncremental(delta: string): { text: string; events: StreamingToolCallEvent[] } {
+    const events: StreamingToolCallEvent[] = [];
+    if (!delta) return { text: "", events };
+    let textOut = "";
+    let input = delta;
+    const openLower = TOOL_CALL_OPEN.toLowerCase();
+    const closeLower = TOOL_CALL_CLOSE.toLowerCase();
+
+    while (input.length > 0) {
+      if (this.mode === "text") {
+        const combined = this.pending + input;
+        input = "";
+        const lower = combined.toLowerCase();
+        let searchFrom = 0;
+        let enteredTool = false;
+        while (searchFrom < combined.length) {
+          const idx = lower.indexOf(openLower, searchFrom);
+          if (idx === -1) break;
+          const prefix = combined.slice(searchFrom, idx);
+          updateFenceStateForSegment(this.fence, prefix);
+          const prevChar = idx > 0 ? combined[idx - 1] : this.lastEmittedChar;
+          const isInlineCode = prevChar === "`";
+          const inlineFenceLine = /^\s*(`{3,}|~{3,})/.test(this.fence.linePrefix);
+          if (!isInsideOpenFence(this.fence) && !inlineFenceLine && !isInlineCode) {
+            const before = combined.slice(0, idx);
+            if (before.length > 0) {
+              this.lastEmittedChar = before[before.length - 1]!;
+              textOut += before;
+            }
+            this.pending = "";
+            this.mode = "header";
+            this.blockBuf = "";
+            input = combined.slice(idx + TOOL_CALL_OPEN.length);
+            enteredTool = true;
+            break;
+          }
+          searchFrom = idx + openLower.length;
+        }
+        if (enteredTool) continue;
+
+        let holdLen = 0;
+        const maxCheck = Math.min(combined.length, openLower.length - 1);
+        for (let len = maxCheck; len >= 1; len--) {
+          if (openLower.startsWith(lower.slice(lower.length - len))) {
+            holdLen = len;
+            break;
+          }
+        }
+        const emit = holdLen > 0 ? combined.slice(0, combined.length - holdLen) : combined;
+        updateFenceStateForSegment(this.fence, emit.slice(searchFrom));
+        if (emit.length > 0) {
+          this.lastEmittedChar = emit[emit.length - 1]!;
+          textOut += emit;
+        }
+        this.pending = holdLen > 0 ? combined.slice(combined.length - holdLen) : "";
+        break;
+      }
+
+      if (this.mode === "header") {
+        this.blockBuf += input;
+        input = "";
+
+        // If `</tool_call>` already arrived in this chunk, resolve the full block cleanly right away.
+        const closeIdx = findToolCallCloseOutsideJsonStrings(this.blockBuf, 0);
+        if (closeIdx !== -1) {
+          const rawBlock = this.blockBuf.slice(0, closeIdx).trim();
+          const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+          const parsed = tryParseJsonObject(rawBlock);
+          const tc = parsed ? buildNormalizedToolCall(parsed, this.allowedToolNames, this.customToolNames) : null;
+          if (tc) {
+            this.emitBufferedToolCall(tc, events);
+          } else {
+            const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
+            textOut += rawText;
+            if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+          }
+          this.blockBuf = "";
+          this.fence.linePrefix = "";
+          this.mode = "text";
+          input = after;
+          continue;
+        }
+
+        // Wait until we see a non-whitespace prefix; if fenced markdown, fall back to buffered block mode.
+        const trimmedStart = this.blockBuf.trimStart();
+        if (!trimmedStart) break;
+        if (trimmedStart.startsWith("```")) {
+          this.mode = "buffered_block";
+          break;
+        }
+
+        const headerMatch = STREAM_HEADER_RE.exec(this.blockBuf);
+        if (headerMatch) {
+          let decodedName = "";
+          try {
+            decodedName = String(JSON.parse(`"${headerMatch[1]!}"`) || "").trim();
+          } catch {
+            decodedName = "";
+          }
+          const isAllowed =
+            Boolean(decodedName) &&
+            (!this.allowedToolNames || this.allowedToolNames.size === 0 || this.allowedToolNames.has(decodedName));
+          const firstValChar = headerMatch[2]!;
+          if (isAllowed && firstValChar === "{") {
+            const id = `call_${crypto.randomBytes(8).toString("hex")}`;
+            const index = this.nextToolIndex++;
+            this.activeCall = {
+              index,
+              id,
+              name: decodedName,
+              argsDepth: 1,
+              inString: false,
+              escaped: false,
+              pendingCommaWs: "",
+              streamedArgs: "{",
+            };
+            events.push({ kind: "tool_call_start", index, id, name: decodedName });
+            events.push({ kind: "tool_call_delta", index, id, argumentsDelta: "{" });
+            input = this.blockBuf.slice(headerMatch[0].length);
+            this.blockBuf = "";
+            this.mode = "stream_args";
+            continue;
+          }
+          // Disallowed tool name or non-object arguments (e.g. custom raw patch string): buffer safely.
+          this.mode = "buffered_block";
+          break;
+        }
+
+        // If header grew beyond 512 chars (e.g. `"arguments"` appeared before `"name"`), buffer cleanly.
+        if (this.blockBuf.length > 512) {
+          this.mode = "buffered_block";
+        }
+        break;
+      }
+
+      if (this.mode === "stream_args" && this.activeCall) {
+        const call = this.activeCall;
+        let deltaOut = "";
+        let finishedAt = -1;
+
+        for (let i = 0; i < input.length; i += 1) {
+          const ch = input[i]!;
+          if (call.inString) {
+            if (call.escaped) {
+              deltaOut += ch;
+              call.escaped = false;
+            } else if (ch === "\\") {
+              deltaOut += ch;
+              call.escaped = true;
+            } else if (ch === "\"") {
+              deltaOut += ch;
+              call.inString = false;
+            } else if (ch === "\n") {
+              deltaOut += "\\n";
+            } else if (ch === "\r") {
+              deltaOut += "\\r";
+            } else if (ch === "\t") {
+              deltaOut += "\\t";
+            } else {
+              const code = ch.charCodeAt(0);
+              if (code < 0x20) deltaOut += `\\u${code.toString(16).padStart(4, "0")}`;
+              else deltaOut += ch;
+            }
+            continue;
+          }
+
+          if (call.pendingCommaWs.length > 0) {
+            if (/\s/.test(ch)) {
+              call.pendingCommaWs += ch;
+              continue;
+            }
+            if (ch === "}" || ch === "]") {
+              // Drop invalid trailing comma outside strings; keep following whitespace if any.
+              call.pendingCommaWs = "";
+            } else {
+              deltaOut += call.pendingCommaWs;
+              call.pendingCommaWs = "";
+            }
+          }
+
+          if (ch === ",") {
+            call.pendingCommaWs = ",";
+            continue;
+          }
+          if (ch === "\"") {
+            call.inString = true;
+            deltaOut += ch;
+          } else if (ch === "{") {
+            call.argsDepth += 1;
+            deltaOut += ch;
+          } else if (ch === "}") {
+            call.argsDepth -= 1;
+            deltaOut += ch;
+            if (call.argsDepth === 0) {
+              finishedAt = i + 1;
+              break;
+            }
+          } else {
+            deltaOut += ch;
+          }
+        }
+
+        if (deltaOut.length > 0) {
+          call.streamedArgs += deltaOut;
+          events.push({ kind: "tool_call_delta", index: call.index, id: call.id, argumentsDelta: deltaOut });
+        }
+
+        if (finishedAt >= 0) {
+          const parsedObj = tryParseJsonObject(call.streamedArgs) ?? {};
+          const finalized: NormalizedToolCall = {
+            id: call.id,
+            name: call.name,
+            argumentsJson: call.streamedArgs,
+            argsObject: parsedObj,
+          };
+          events.push({ kind: "tool_call_end", index: call.index, call: finalized });
+          this.activeCall = null;
+          this.blockBuf = "";
+          this.mode = "post_args";
+          input = input.slice(finishedAt);
+          continue;
+        }
+        input = "";
+        break;
+      }
+
+      if (this.mode === "post_args") {
+        this.blockBuf += input;
+        input = "";
+        const closeIdx = this.blockBuf.toLowerCase().indexOf(closeLower);
+        if (closeIdx !== -1) {
+          const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+          this.blockBuf = "";
+          this.fence.linePrefix = "";
+          this.mode = "text";
+          input = after;
+          continue;
+        }
+        break;
+      }
+
+      if (this.mode === "buffered_block") {
+        this.blockBuf += input;
+        input = "";
+        const closeIdx = findToolCallCloseOutsideJsonStrings(this.blockBuf, 0);
+        if (closeIdx !== -1) {
+          const rawBlock = this.blockBuf.slice(0, closeIdx).trim();
+          const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+          const parsed = tryParseJsonObject(rawBlock);
+          const tc = parsed ? buildNormalizedToolCall(parsed, this.allowedToolNames, this.customToolNames) : null;
+          if (tc) {
+            this.emitBufferedToolCall(tc, events);
+          } else {
+            const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
+            textOut += rawText;
+            if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+          }
+          this.blockBuf = "";
+          this.fence.linePrefix = "";
+          this.mode = "text";
+          input = after;
+          continue;
+        }
+        break;
+      }
+    }
+
+    return { text: textOut, events };
+  }
+
+  /**
+   * Flushes any buffered tail at end-of-turn (closing truncated streaming arguments cleanly so
+   * protocol adapters never leave an open `tool_use` / `function_call` block unclosed).
+   */
+  flushIncremental(): { remainingText: string; events: StreamingToolCallEvent[] } {
+    const events: StreamingToolCallEvent[] = [];
+    if (this.mode === "text") {
+      const rem = this.pending;
+      this.pending = "";
+      return { remainingText: rem, events };
+    }
+    if (this.mode === "stream_args" && this.activeCall) {
+      const call = this.activeCall;
+      this.activeCall = null;
+      let tail = "";
+      if (call.inString) {
+        if (call.escaped) tail += "\\";
+        tail += "\"";
+      }
+      if (call.argsDepth > 0) {
+        tail += "}".repeat(call.argsDepth);
+      }
+      if (tail) {
+        call.streamedArgs += tail;
+        events.push({ kind: "tool_call_delta", index: call.index, id: call.id, argumentsDelta: tail });
+      }
+      const parsedObj = tryParseJsonObject(call.streamedArgs) ?? {};
+      events.push({
+        kind: "tool_call_end",
+        index: call.index,
+        call: {
+          id: call.id,
+          name: call.name,
+          argumentsJson: call.streamedArgs,
+          argsObject: parsedObj,
+        },
+      });
+      this.blockBuf = "";
+      this.mode = "text";
+      return { remainingText: "", events };
+    }
+    if (this.mode === "post_args") {
+      // Ignore trailing outer `}` + whitespace from the already-closed tool call; keep any unexpected prose.
+      const rem = this.blockBuf.replace(/^\s*\}\s*/, "").trim();
+      this.blockBuf = "";
+      this.mode = "text";
+      return { remainingText: rem, events };
+    }
+    // `header` or `buffered_block` truncated without `</tool_call>`
+    const { cleanText, toolCalls } = parseToolCallsFromText(
+      `${TOOL_CALL_OPEN}${this.blockBuf}`,
+      this.allowedToolNames,
+      this.customToolNames,
+    );
+    this.blockBuf = "";
+    this.mode = "text";
+    for (const tc of toolCalls) {
+      this.emitBufferedToolCall(tc, events);
+    }
+    return { remainingText: cleanText, events };
   }
 
   feed(delta: string): string {

@@ -27,7 +27,9 @@ export const MAX_INLINE_IMAGES = 10;
 export const MAX_INLINE_FILES = 5;
 export const MAX_HIGHRES_IMAGE_DIMENSION = 4096;
 export const MAX_HIGHRES_RAW_BYTES = 8 * 1024 * 1024;
-export const OAUTH_DIRECT_IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"]);
+// AWS Quick `upload-attachment` contentType enum strictly allows ONLY `image/png` and `image/jpeg` for images.
+// Other image formats (webp, gif, bmp, avif, etc.) must be transcoded via sharp before out-of-band upload.
+export const OAUTH_DIRECT_IMAGE_MIMES = new Set(["image/png", "image/jpeg"]);
 export const MAX_REMOTE_IMAGE_REDIRECTS = 3;
 export const MAX_WS_RECV_BUF_BYTES = 16 * 1024 * 1024;
 export const MAX_WS_PAYLOAD_UTF8_BYTES = 50_000;
@@ -224,9 +226,7 @@ export async function resolveRawImagePayloads(
       "invalid_request_error",
     );
   }
-  const resolved: Array<{ buf: Buffer; mimeType: string }> = [];
-
-  for (const img of images) {
+  const mapped = await mapWithConcurrency(images, 4, async (img) => {
     let mimeType = "image/png";
     let rawBase64 = "";
 
@@ -254,20 +254,24 @@ export async function resolveRawImagePayloads(
         mimeType = ct;
         rawBase64 = buf.toString("base64");
       } else {
-        continue;
+        return null;
       }
     }
-    if (!rawBase64) continue;
-    resolved.push({ buf: Buffer.from(rawBase64, "base64"), mimeType: mimeType.toLowerCase() });
-  }
-  return resolved;
+    if (!rawBase64) return null;
+    const buf = Buffer.from(rawBase64, "base64");
+    if (buf.byteLength === 0) return null;
+    const cleanMime = mimeType.split(";")[0]?.trim().toLowerCase() || "image/png";
+    return { buf, mimeType: cleanMime };
+  });
+  return mapped.filter((item): item is NonNullable<typeof item> => item !== null);
 }
 
 export async function prepareHighResImageForOutOfBand(
   buf: Buffer,
   mimeType: string,
 ): Promise<{ buf: Buffer; mimeType: string }> {
-  const normMime = mimeType === "image/jpg" ? "image/jpeg" : mimeType;
+  const baseMime = mimeType.split(";")[0]?.trim().toLowerCase() || "image/png";
+  const normMime = baseMime === "image/jpg" ? "image/jpeg" : baseMime;
   if (OAUTH_DIRECT_IMAGE_MIMES.has(normMime) && buf.byteLength <= MAX_HIGHRES_RAW_BYTES) {
     try {
       const meta = await sharp(buf).metadata();
@@ -281,7 +285,7 @@ export async function prepareHighResImageForOutOfBand(
     }
   }
   try {
-    const outBuf = await sharp(buf)
+    const outBuf = await sharp(buf, { failOn: "none" })
       .rotate()
       .resize({
         width: MAX_HIGHRES_IMAGE_DIMENSION,
@@ -294,7 +298,14 @@ export async function prepareHighResImageForOutOfBand(
       .toBuffer();
     return { buf: outBuf, mimeType: "image/jpeg" };
   } catch {
-    return { buf, mimeType: normMime };
+    if (OAUTH_DIRECT_IMAGE_MIMES.has(normMime)) {
+      return { buf, mimeType: normMime };
+    }
+    throw new GatewayError(
+      `Unsupported or corrupted image format (${normMime}); could not convert to JPEG/PNG for AWS Quick upload.`,
+      400,
+      "invalid_image",
+    );
   }
 }
 
@@ -310,8 +321,7 @@ export async function resolveNormalizedFiles(
       "invalid_request_error",
     );
   }
-  const out: Array<{ filename: string; mimeType: string; buf: Buffer }> = [];
-  for (const f of files) {
+  const mapped = await mapWithConcurrency(files, 4, async (f) => {
     let buf: Buffer;
     let mimeType = f.mimeType.trim().toLowerCase() || "application/octet-stream";
     if (f.data) {
@@ -324,15 +334,15 @@ export async function resolveNormalizedFiles(
         mimeType = remoteCt;
       }
     } else {
-      continue;
+      return null;
     }
-    if (buf.byteLength === 0) continue;
+    if (buf.byteLength === 0) return null;
     if (buf.byteLength > MAX_REMOTE_IMAGE_BYTES) {
       throw new GatewayError(`Attached file '${f.filename}' exceeds 10 MB limit.`, 400, "payload_too_large");
     }
-    out.push({ filename: f.filename, mimeType, buf });
-  }
-  return out;
+    return { filename: f.filename, mimeType, buf };
+  });
+  return mapped.filter((item): item is { filename: string; mimeType: string; buf: Buffer } => item !== null);
 }
 
 export async function compressResolvedImagesForQuickFrame(
@@ -343,22 +353,20 @@ export async function compressResolvedImagesForQuickFrame(
   const effectiveTotalBudget = Math.max(12_000, Math.min(MAX_TOTAL_IMAGE_BASE64_CHARS, totalBase64Budget));
   // Scale per-image budget strictly by image count (floor 2.4KB) so 6-10 images never exceed 50KB total.
   const perImageBudget = Math.max(2_400, Math.floor(effectiveTotalBudget / resolved.length));
-  const out: QuickImageAttachment[] = [];
 
-  for (const { buf, mimeType } of resolved) {
+  return mapWithConcurrency(resolved, 4, async ({ buf, mimeType }, idx) => {
     const fitted = await compressImageForQuickFrame(buf, mimeType, perImageBudget);
     const contentSha256 = crypto.createHash("sha256").update(fitted.buf).digest("hex");
     const ext = extForImageMime(fitted.mimeType);
-    out.push({
-      type: "image",
-      name: `user_image_${String(out.length + 1).padStart(3, "0")}.${ext}`,
+    return {
+      type: "image" as const,
+      name: `user_image_${String(idx + 1).padStart(3, "0")}.${ext}`,
       size: fitted.buf.byteLength,
       mimeType: fitted.mimeType,
       contentSha256,
       data: `data:${fitted.mimeType};base64,${fitted.base64}`,
-    });
-  }
-  return out;
+    };
+  });
 }
 
 /**

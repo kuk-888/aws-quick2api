@@ -836,9 +836,16 @@ export const openAiChatAdapter: ProtocolAdapter = {
 
     let sentRole = false;
     let sentDone = false;
+    const allowedStreamIndices = new Set<number>();
 
     for await (const ev of events) {
-      if (!sentRole && (ev.type === "thinking" || ev.type === "text" || ev.type === "tool_calls")) {
+      if (
+        !sentRole &&
+        (ev.type === "thinking" ||
+          ev.type === "text" ||
+          ev.type === "tool_call_start" ||
+          ev.type === "tool_calls")
+      ) {
         sentRole = true;
         yield makeChunk({ role: "assistant", content: "" });
       }
@@ -846,6 +853,29 @@ export const openAiChatAdapter: ProtocolAdapter = {
         yield makeChunk({ reasoning_content: ev.text });
       } else if (ev.type === "text") {
         yield makeChunk({ content: ev.text });
+      } else if (ev.type === "tool_call_start") {
+        if (disableParallel && allowedStreamIndices.size >= 1) continue;
+        allowedStreamIndices.add(ev.index);
+        yield makeChunk({
+          tool_calls: [{
+            index: ev.index,
+            id: ev.id,
+            type: "function",
+            function: { name: ev.name, arguments: "" }
+          }]
+        });
+      } else if (ev.type === "tool_call_delta") {
+        if (!allowedStreamIndices.has(ev.index)) continue;
+        if (ev.argumentsDelta) {
+          yield makeChunk({
+            tool_calls: [{
+              index: ev.index,
+              function: { arguments: ev.argumentsDelta }
+            }]
+          });
+        }
+      } else if (ev.type === "tool_call_end") {
+        // Already streamed start + deltas; nothing extra required for OpenAI Chat Completions.
       } else if (ev.type === "tool_calls") {
         const calls = disableParallel ? ev.calls.slice(0, 1) : ev.calls;
         yield makeChunk({
@@ -1039,6 +1069,106 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
     };
     const disableParallel = turn.rawBody?.parallel_tool_calls === false;
     let emittedCreated = false;
+    const toolMetaByName = new Map<string, NormalizedTool>();
+    for (const t of turn.tools) {
+      toolMetaByName.set(t.name, t);
+      if (t.wireName && !toolMetaByName.has(t.wireName)) toolMetaByName.set(t.wireName, t);
+    }
+    const allowedStreamToolIndices = new Set<number>();
+    let openTool: {
+      streamIndex: number;
+      outputIndex: number;
+      id: string;
+      callId: string;
+      wireName: string;
+      nsField: Record<string, string>;
+      args: string;
+    } | null = null;
+
+    const closeOpenTool = function* (finalArgsOverride?: string): Generator<string> {
+      if (!openTool) return;
+      const cur = openTool;
+      openTool = null;
+      const finalArgs = finalArgsOverride !== undefined ? finalArgsOverride : (cur.args || "{}");
+      const base = { id: cur.id, type: "function_call", call_id: cur.callId, name: cur.wireName, ...cur.nsField };
+      yield sse("response.function_call_arguments.done", {
+        item_id: cur.id,
+        output_index: cur.outputIndex,
+        name: cur.wireName,
+        arguments: finalArgs,
+      });
+      const item = { ...base, status: "completed", arguments: finalArgs };
+      output[cur.outputIndex] = item;
+      yield sse("response.output_item.done", { output_index: cur.outputIndex, item });
+    };
+
+    const emitSingleCompletedToolCall = function* (tc: import("../core/types.js").NormalizedToolCall): Generator<string> {
+      const index = output.length;
+      const meta = toolMetaByName.get(tc.name);
+      const kind = meta?.toolKind ?? "function";
+      const wireName = meta?.wireName ?? tc.name;
+      const nsField = meta?.toolNamespace ? { namespace: meta.toolNamespace } : {};
+      output.push({});
+      if (kind === "custom") {
+        const id = newId("ctc");
+        const inputStr = typeof tc.argsObject.input === "string" ? tc.argsObject.input : tc.argumentsJson;
+        const base = { id, type: "custom_tool_call", call_id: tc.id, name: wireName, ...nsField };
+        yield sse("response.output_item.added", { output_index: index, item: { ...base, status: "in_progress", input: "" } });
+        yield sse("response.custom_tool_call_input.delta", { item_id: id, output_index: index, delta: inputStr });
+        yield sse("response.custom_tool_call_input.done", { item_id: id, output_index: index, input: inputStr });
+        const item = { ...base, status: "completed", input: inputStr };
+        output[index] = item;
+        yield sse("response.output_item.done", { output_index: index, item });
+      } else if (kind === "local_shell") {
+        const id = newId("lsh");
+        const rawCmd = tc.argsObject.command;
+        const cmd = Array.isArray(rawCmd)
+          ? rawCmd.map((x) => String(x))
+          : typeof rawCmd === "string"
+            ? ["bash", "-lc", rawCmd]
+            : [];
+        const action = {
+          type: "exec",
+          command: cmd,
+          ...(typeof tc.argsObject.working_directory === "string"
+            ? { working_directory: tc.argsObject.working_directory }
+            : {}),
+          ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
+        };
+        const item = { id, type: "local_shell_call", call_id: tc.id, status: "completed", action };
+        yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
+        output[index] = item;
+        yield sse("response.output_item.done", { output_index: index, item });
+      } else if (kind === "shell") {
+        const id = newId("sh");
+        const rawCmds = tc.argsObject.commands ?? tc.argsObject.command;
+        const commands = Array.isArray(rawCmds)
+          ? rawCmds.map((x) => String(x))
+          : typeof rawCmds === "string"
+            ? [rawCmds]
+            : [];
+        const action = {
+          commands,
+          ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
+          ...(typeof tc.argsObject.max_output_length === "number"
+            ? { max_output_length: tc.argsObject.max_output_length }
+            : {}),
+        };
+        const item = { id, type: "shell_call", call_id: tc.id, status: "completed", action };
+        yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
+        output[index] = item;
+        yield sse("response.output_item.done", { output_index: index, item });
+      } else {
+        const id = newId("fc");
+        const base = { id, type: "function_call", call_id: tc.id, name: wireName, ...nsField };
+        yield sse("response.output_item.added", { output_index: index, item: { ...base, status: "in_progress", arguments: "" } });
+        yield sse("response.function_call_arguments.delta", { item_id: id, output_index: index, delta: tc.argumentsJson });
+        yield sse("response.function_call_arguments.done", { item_id: id, output_index: index, name: wireName, arguments: tc.argumentsJson });
+        const item = { ...base, status: "completed", arguments: tc.argumentsJson };
+        output[index] = item;
+        yield sse("response.output_item.done", { output_index: index, item });
+      }
+    };
 
     const closeOpen = function* (): Generator<string> {
       if (!open) return;
@@ -1111,81 +1241,66 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
               item_id: open!.id, output_index: open!.index, content_index: 0, delta: ev.text, logprobs: []
             });
           }
+        } else if (ev.type === "tool_call_start") {
+          if (disableParallel && allowedStreamToolIndices.size >= 1) {
+            step = await iter.next();
+            continue;
+          }
+          allowedStreamToolIndices.add(ev.index);
+          yield* closeOpen();
+          yield* closeOpenTool();
+          sawToolCalls = true;
+          const meta = toolMetaByName.get(ev.name);
+          const kind = meta?.toolKind ?? "function";
+          if (kind === "function") {
+            const outputIndex = output.length;
+            const id = newId("fc");
+            const wireName = meta?.wireName ?? ev.name;
+            const nsField: Record<string, string> = meta?.toolNamespace ? { namespace: meta.toolNamespace } : {};
+            output.push({});
+            openTool = {
+              streamIndex: ev.index,
+              outputIndex,
+              id,
+              callId: ev.id,
+              wireName,
+              nsField,
+              args: "",
+            };
+            yield sse("response.output_item.added", {
+              output_index: outputIndex,
+              item: { id, type: "function_call", call_id: ev.id, name: wireName, ...nsField, status: "in_progress", arguments: "" },
+            });
+          }
+        } else if (ev.type === "tool_call_delta") {
+          if (openTool && openTool.streamIndex === ev.index && ev.argumentsDelta) {
+            openTool.args += ev.argumentsDelta;
+            yield sse("response.function_call_arguments.delta", {
+              item_id: openTool.id,
+              output_index: openTool.outputIndex,
+              delta: ev.argumentsDelta,
+            });
+          }
+        } else if (ev.type === "tool_call_end") {
+          if (!allowedStreamToolIndices.has(ev.index)) {
+            step = await iter.next();
+            continue;
+          }
+          if (openTool && openTool.streamIndex === ev.index) {
+            yield* closeOpenTool(openTool.args || ev.call.argumentsJson);
+          } else {
+            yield* closeOpen();
+            yield* closeOpenTool();
+            sawToolCalls = true;
+            yield* emitSingleCompletedToolCall(ev.call);
+          }
         } else if (ev.type === "tool_calls") {
           yield* closeOpen();
+          yield* closeOpenTool();
           sawToolCalls = true;
-          const toolMetaByName = new Map<string, NormalizedTool>();
-          for (const t of turn.tools) {
-            toolMetaByName.set(t.name, t);
-            if (t.wireName && !toolMetaByName.has(t.wireName)) toolMetaByName.set(t.wireName, t);
-          }
           const calls = disableParallel ? ev.calls.slice(0, 1) : ev.calls;
           for (const tc of calls) {
-            const index = output.length;
-            const meta = toolMetaByName.get(tc.name);
-            const kind = meta?.toolKind ?? "function";
-            const wireName = meta?.wireName ?? tc.name;
-            const nsField = meta?.toolNamespace ? { namespace: meta.toolNamespace } : {};
-            output.push({});
-            if (kind === "custom") {
-              const id = newId("ctc");
-              const inputStr = typeof tc.argsObject.input === "string" ? tc.argsObject.input : tc.argumentsJson;
-              const base = { id, type: "custom_tool_call", call_id: tc.id, name: wireName, ...nsField };
-              yield sse("response.output_item.added", { output_index: index, item: { ...base, status: "in_progress", input: "" } });
-              yield sse("response.custom_tool_call_input.delta", { item_id: id, output_index: index, delta: inputStr });
-              yield sse("response.custom_tool_call_input.done", { item_id: id, output_index: index, input: inputStr });
-              const item = { ...base, status: "completed", input: inputStr };
-              output[index] = item;
-              yield sse("response.output_item.done", { output_index: index, item });
-            } else if (kind === "local_shell") {
-              const id = newId("lsh");
-              const rawCmd = tc.argsObject.command;
-              const cmd = Array.isArray(rawCmd)
-                ? rawCmd.map((x) => String(x))
-                : typeof rawCmd === "string"
-                  ? ["bash", "-lc", rawCmd]
-                  : [];
-              const action = {
-                type: "exec",
-                command: cmd,
-                ...(typeof tc.argsObject.working_directory === "string"
-                  ? { working_directory: tc.argsObject.working_directory }
-                  : {}),
-                ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
-              };
-              const item = { id, type: "local_shell_call", call_id: tc.id, status: "completed", action };
-              yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
-              output[index] = item;
-              yield sse("response.output_item.done", { output_index: index, item });
-            } else if (kind === "shell") {
-              const id = newId("sh");
-              const rawCmds = tc.argsObject.commands ?? tc.argsObject.command;
-              const commands = Array.isArray(rawCmds)
-                ? rawCmds.map((x) => String(x))
-                : typeof rawCmds === "string"
-                  ? [rawCmds]
-                  : [];
-              const action = {
-                commands,
-                ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
-                ...(typeof tc.argsObject.max_output_length === "number"
-                  ? { max_output_length: tc.argsObject.max_output_length }
-                  : {}),
-              };
-              const item = { id, type: "shell_call", call_id: tc.id, status: "completed", action };
-              yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
-              output[index] = item;
-              yield sse("response.output_item.done", { output_index: index, item });
-            } else {
-              const id = newId("fc");
-              const base = { id, type: "function_call", call_id: tc.id, name: wireName, ...nsField };
-              yield sse("response.output_item.added", { output_index: index, item: { ...base, status: "in_progress", arguments: "" } });
-              yield sse("response.function_call_arguments.delta", { item_id: id, output_index: index, delta: tc.argumentsJson });
-              yield sse("response.function_call_arguments.done", { item_id: id, output_index: index, name: wireName, arguments: tc.argumentsJson });
-              const item = { ...base, status: "completed", arguments: tc.argumentsJson };
-              output[index] = item;
-              yield sse("response.output_item.done", { output_index: index, item });
-            }
+            yield* emitSingleCompletedToolCall(tc);
           }
         } else if (ev.type === "usage") {
           metrics = ev.metrics;
@@ -1200,6 +1315,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
         ? streamErr
         : new GatewayError(streamErr instanceof Error ? streamErr.message : String(streamErr), 502, "upstream_error");
       yield* closeOpen();
+      yield* closeOpenTool();
       yield sse("response.failed", {
         response: baseResponse("failed", output, {
           error: { code: gwErr.code, message: gwErr.message },
@@ -1217,6 +1333,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
       await iter.return?.().catch(() => undefined);
     }
     yield* closeOpen();
+    yield* closeOpenTool();
 
     // A reply with no text and no tool call still carries one (empty) assistant message, as the official API does.
     if (!sawMessage && !sawToolCalls) {

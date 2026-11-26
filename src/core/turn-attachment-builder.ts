@@ -102,7 +102,7 @@ export async function buildPromptAndAttachmentsForTurn(
         ? AbortSignal.any([turn.signal, AbortSignal.timeout(90_000)])
         : AbortSignal.timeout(90_000);
       try {
-        const uploaded = await mapWithConcurrency(resolvedFiles, 3, async (f) => {
+        const uploaded = await mapWithConcurrency(resolvedFiles, 5, async (f) => {
           const doUpload = () =>
             isOAuthAccount && oauthCred
               ? uploadOAuthBinaryAttachment(
@@ -158,6 +158,7 @@ export async function buildPromptAndAttachmentsForTurn(
         resolveRawImagePayloads(items, turn.signal),
       )
       : await resolveRawImagePayloads(sourceImages, turn.signal);
+    if (resolvedImgs.length === 0) return imgResults;
     if ((isOAuthAccount && oauthCred) || (isWeb && webCred)) {
       const totalRawImgBytes = resolvedImgs.reduce((sum, im) => sum + im.buf.byteLength, 0);
       if (resolvedImgs.length >= 2 || totalRawImgBytes > 20_000) {
@@ -165,7 +166,7 @@ export async function buildPromptAndAttachmentsForTurn(
           ? AbortSignal.any([turn.signal, AbortSignal.timeout(90_000)])
           : AbortSignal.timeout(90_000);
         try {
-          const imgAtts = await mapWithConcurrency(resolvedImgs, 3, async (im, idx) => {
+          const imgAtts = await mapWithConcurrency(resolvedImgs, 5, async (im, idx) => {
             const prepared = await prepareHighResImageForOutOfBand(im.buf, im.mimeType);
             const ext = extForImageMime(prepared.mimeType);
             const imgTag = incremental ? `_${crypto.randomUUID().slice(0, 4)}` : "";

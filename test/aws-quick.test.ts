@@ -7497,4 +7497,623 @@ setInterval(() => {}, 10_000);
     const zeroHdr = buildOutOfBandContextPrompt("x".repeat(5000), "ctx.txt", 0);
     assert.ok(!zeroHdr.includes("excerpted below"), `zero-excerpt header should not say 'excerpted below': ${zeroHdr}`);
   });
+
+  it("transcodes webp/gif to jpeg for OAuth OOB upload, skips empty images, normalizes non-allowlisted MIME types, and surfaces 400 error details", async () => {
+    const { default: sharp } = await import("sharp");
+    const {
+      OAUTH_DIRECT_IMAGE_MIMES,
+      prepareHighResImageForOutOfBand,
+      resolveRawImagePayloads,
+      mapAttachmentUploadError,
+    } = await import("../src/core/media-utils.js");
+    const { normalizeOAuthUploadContentType, uploadOAuthBinaryAttachment } = await import(
+      "../src/aws-quick/oauth-client.js"
+    );
+
+    // 1. Direct OAuth image allowlist must ONLY allow image/png and image/jpeg
+    assert.equal(OAUTH_DIRECT_IMAGE_MIMES.has("image/png"), true);
+    assert.equal(OAUTH_DIRECT_IMAGE_MIMES.has("image/jpeg"), true);
+    assert.equal(OAUTH_DIRECT_IMAGE_MIMES.has("image/webp"), false);
+    assert.equal(OAUTH_DIRECT_IMAGE_MIMES.has("image/gif"), false);
+
+    // 2. Real webp and gif images are transcoded to image/jpeg; png/jpeg pass through untouched
+    const baseImg = sharp({
+      create: { width: 120, height: 120, channels: 4, background: { r: 60, g: 140, b: 220, alpha: 1 } },
+    });
+    const pngBuf = await baseImg.clone().png().toBuffer();
+    const jpgBuf = await baseImg.clone().jpeg().toBuffer();
+    const webpBuf = await baseImg.clone().webp().toBuffer();
+    const gifBuf = await baseImg.clone().gif().toBuffer();
+
+    const prepPng = await prepareHighResImageForOutOfBand(pngBuf, "image/png");
+    assert.equal(prepPng.mimeType, "image/png");
+    assert.equal(prepPng.buf, pngBuf);
+
+    const prepJpg = await prepareHighResImageForOutOfBand(jpgBuf, "image/jpg");
+    assert.equal(prepJpg.mimeType, "image/jpeg");
+    assert.equal(prepJpg.buf, jpgBuf);
+
+    const prepWebp = await prepareHighResImageForOutOfBand(webpBuf, "image/webp");
+    assert.equal(prepWebp.mimeType, "image/jpeg");
+    assert.equal((await sharp(prepWebp.buf).metadata()).format, "jpeg");
+
+    const prepGif = await prepareHighResImageForOutOfBand(gifBuf, "image/gif");
+    assert.equal(prepGif.mimeType, "image/jpeg");
+    assert.equal((await sharp(prepGif.buf).metadata()).format, "jpeg");
+
+    await assert.rejects(
+      () => prepareHighResImageForOutOfBand(Buffer.from("not-a-valid-webp"), "image/webp"),
+      (err: unknown) => err instanceof GatewayError && err.status === 400 && err.code === "invalid_image",
+    );
+
+    // 3. Empty 0-byte images are filtered out in resolveRawImagePayloads
+    const resolved = await resolveRawImagePayloads([
+      { data: "data:image/png;base64,==", mimeType: "image/png" },
+      { data: `data:image/webp;base64,${webpBuf.toString("base64")}`, mimeType: "image/webp; charset=binary" },
+    ]);
+    assert.equal(resolved.length, 1);
+    assert.equal(resolved[0]!.mimeType, "image/webp");
+
+    // 4. normalizeOAuthUploadContentType maps non-allowlisted text/* & aliases safely
+    assert.equal(normalizeOAuthUploadContentType("image/jpg", "a.jpg"), "image/jpeg");
+    assert.equal(normalizeOAuthUploadContentType("text/typescript", "app.ts"), "text/plain");
+    assert.equal(normalizeOAuthUploadContentType("text/css; charset=utf-8", "style.css"), "text/plain");
+    assert.equal(normalizeOAuthUploadContentType("application/xml", "pom.xml"), "text/xml");
+    assert.equal(normalizeOAuthUploadContentType("text/x-yaml", "cfg.yml"), "application/yaml");
+    assert.equal(normalizeOAuthUploadContentType("application/octet-stream", "notes.ts"), "text/plain");
+    assert.equal(normalizeOAuthUploadContentType("application/octet-stream", "report.pdf"), "application/pdf");
+    assert.equal(normalizeOAuthUploadContentType("application/pdf", "doc.pdf"), "application/pdf");
+
+    // 5. uploadOAuthBinaryAttachment rejects 0-byte buffers and surfaces upstream 400 detail
+    const cred = {
+      region: "us-east-1",
+      issuerUrl: "https://view.awsapps.com/start",
+      wsHost: "chat.quick.aws.com",
+      clientId: `test-upload-400-${Date.now()}`,
+      clientSecret: "sec",
+      refreshToken: "ref",
+      accessToken: "valid-tok",
+      expiresAt: Date.now() + 3600_000,
+    };
+    await assert.rejects(
+      () => uploadOAuthBinaryAttachment(cred, "th-empty", "empty.png", Buffer.alloc(0), "image/png"),
+      /empty file \(0 bytes\)/i,
+    );
+
+    const origFetch = globalThis.fetch;
+    try {
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ message: "Value at 'contentType' failed to satisfy constraint" }), {
+          status: 400,
+          headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+      let caught: unknown;
+      try {
+        await uploadOAuthBinaryAttachment(cred, "th-400", "bad.bin", Buffer.from("abc"), "application/x-custom-bin");
+      } catch (err) {
+        caught = err;
+      }
+      assert.ok(caught instanceof Error);
+      assert.match(caught.message, /upload-attachment failed \(400\): .*contentType/i);
+      const mapped = mapAttachmentUploadError(caught, "Failed to upload image attachment(s) to AWS Quick");
+      assert.equal(mapped.status, 400);
+      assert.match(mapped.message, /contentType/i);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  it("Wave 1: standby WS pool, OAuth rekey preservation, error classification, upload 5xx retry, post-usage close grace, and 1-account 502 self-healing", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { default: WsClass } = await import("ws");
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { classifyUpstreamError } = await import("../src/core/upstream-errors.js");
+    const { uploadOAuthBinaryAttachment } = await import("../src/aws-quick/oauth-client.js");
+    const { getProxyAgent } = await import("../src/utils/proxy-agent.js");
+    const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { collectTurnEvents } = await import("../src/protocols/common.js");
+
+    type StubWs = InstanceType<typeof EventEmitter> & {
+      readyState: number;
+      closed: boolean;
+      sent: unknown[];
+      ping: () => void;
+      close: () => void;
+      terminate: () => void;
+      send: (data: unknown) => void;
+    };
+    const makeStubWs = (initialState: number = WsClass.OPEN): StubWs => {
+      const ee = new EventEmitter() as StubWs;
+      ee.readyState = initialState;
+      ee.closed = false;
+      ee.sent = [];
+      ee.ping = () => {};
+      ee.send = (d: unknown) => {
+        ee.sent.push(d);
+      };
+      ee.close = () => {
+        ee.closed = true;
+        ee.readyState = WsClass.CLOSED;
+      };
+      ee.terminate = () => {
+        ee.closed = true;
+        ee.readyState = WsClass.CLOSED;
+      };
+      return ee;
+    };
+    const asWs = (stub: StubWs): import("ws").default => stub as unknown as import("ws").default;
+
+    // 1. Standby WS pool: store/take, incognito match, standby-first eviction, and OAuth rekey preservation
+    const pool = new WarmSessionPool({ maxWarmSessions: 16 });
+    const parkedWs = makeStubWs();
+    const standbyWs = makeStubWs();
+    const parkedOk = pool.park({
+      scope: "openai",
+      conversationKey: "conv-1",
+      slotId: "slot-old",
+      isIncognito: true,
+      prefixHashes: ["hash-1"],
+      threadId: "thr-1",
+      ws: asWs(parkedWs),
+      outpostId: "web0",
+      encodeFrame: encodeCloudInputFrame,
+    });
+    assert.equal(parkedOk, true);
+    const storedOk = pool.storeStandby({
+      slotId: "slot-old",
+      isIncognito: true,
+      handle: {
+        ws: asWs(standbyWs),
+        outpostId: "web0",
+        encodeFrame: encodeCloudInputFrame,
+        decodeFrame: decodeCloudOutputFrame,
+        surfaceType: "DESKTOP",
+        appVersion: "1.0.0",
+        surfaceName: "desktop",
+      },
+    });
+    assert.equal(storedOk, true);
+    assert.equal(pool.countStandbyWs(), 1);
+    assert.equal(pool.countIdleWsForSlot("slot-old"), 2);
+
+    // Rekey preserves BOTH parked and standby sockets without closing them
+    pool.rekeySlot("slot-old", "slot-new");
+    assert.equal(parkedWs.closed, false);
+    assert.equal(standbyWs.closed, false);
+    assert.equal(pool.hasOpenStandby("slot-new", true), true);
+    assert.equal(pool.countParkedWsForSlot("slot-new"), 1);
+
+    // Evicting 1 idle WS evicts standby FIRST, keeping conversation-bound parked WS alive!
+    const evicted = pool.evictParkedWsForSlot("slot-new", 1);
+    assert.equal(evicted, 1);
+    assert.equal(standbyWs.closed, true, "standby WS must be evicted before parked conversation WS");
+    assert.equal(parkedWs.closed, false, "conversation parked WS must remain alive");
+
+    // Store fresh standby and verify takeStandby returns it on matching incognito flag
+    const standbyWs2 = makeStubWs();
+    assert.equal(
+      pool.storeStandby({
+        slotId: "slot-new",
+        isIncognito: false,
+        handle: {
+          ws: asWs(standbyWs2),
+          outpostId: "web0",
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+        },
+      }),
+      true,
+    );
+    const taken = pool.takeStandby("slot-new", false);
+    assert.ok(taken && (taken.ws as unknown) === standbyWs2);
+    assert.equal(standbyWs2.closed, false);
+    assert.equal(pool.countStandbyWs(), 0);
+    pool.disposeAll();
+
+    // 2. Upstream error classification precision (WS 401/429 vs 502, payload size)
+    const c401 = classifyUpstreamError(new GatewayError("Unexpected server response: 401", 502, "upstream_error"));
+    assert.equal(c401.isAuthErr, true);
+    assert.equal(c401.isProxyOrConnErr, false);
+
+    const c429 = classifyUpstreamError(new GatewayError("Unexpected server response: 429", 502, "upstream_error"));
+    assert.equal(c429.isRateLimitErr, true);
+    assert.equal(c429.isProxyOrConnErr, false);
+
+    const c502 = classifyUpstreamError(new GatewayError("Unexpected server response: 502", 502, "upstream_error"));
+    assert.equal(c502.isProxyOrConnErr, true);
+    assert.equal(c502.isAuthErr, false);
+
+    const cSize = classifyUpstreamError(new GatewayError("Message size exceeds frame limit", 502, "upstream_error"));
+    assert.equal(cSize.isPayloadOrContextSizeErr, true);
+    assert.equal(cSize.isProxyOrConnErr, false);
+
+    // 3. OAuth upload-attachment transient 502 retry succeeds on attempt 2
+    const origFetch = globalThis.fetch;
+    try {
+      let step1Calls = 0;
+      globalThis.fetch = (async (input: string | URL) => {
+        const u = String(input);
+        if (u.includes("/upload-attachment")) {
+          step1Calls += 1;
+          if (step1Calls === 1) {
+            return new Response("Bad Gateway", { status: 502 });
+          }
+          return new Response(
+            JSON.stringify({ attachmentId: "att-retry-1" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (u.includes("/attachment-dlp-status")) {
+          return new Response(
+            JSON.stringify({ dlpJobStatus: "COMPLETED", policyAction: "ALLOW" }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            eventResponse: {
+              invokeAgentResponse: { statusCode: 200, body: JSON.stringify({ path: "/workspace/ctx.txt" }) },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      const uploaded = await uploadOAuthBinaryAttachment(
+        {
+          region: "us-east-1",
+          issuerUrl: "https://view.awsapps.com/start",
+          wsHost: "chat.quick.aws.com",
+          clientId: `test-upload-502-${Date.now()}`,
+          clientSecret: "sec",
+          refreshToken: "ref",
+          accessToken: "valid-tok",
+          expiresAt: Date.now() + 3600_000,
+        },
+        "th-retry",
+        "ctx.txt",
+        Buffer.from("hello world"),
+        "text/plain",
+      );
+      assert.equal(step1Calls, 2);
+      assert.equal(uploaded.attachmentId, "att-retry-1");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // 4. Proxy agent keep-alive enabled for HTTP CONNECT and SOCKS5
+    const httpProxyAgent = getProxyAgent("http://127.0.0.1:8888");
+    const socksProxyAgent = getProxyAgent("socks5://127.0.0.1:1080");
+    assert.equal((httpProxyAgent as unknown as { keepAlive?: boolean })?.keepAlive, true);
+    assert.equal((socksProxyAgent as unknown as { keepAlive?: boolean })?.keepAlive, true);
+
+    // 5. Post-turn_usage abrupt WS close finalizes gracefully (no spurious 502!)
+    const decodeCloudIn = (raw: unknown): Record<string, unknown> | null => {
+      try {
+        const s = typeof raw === "string" ? raw : Buffer.from(raw as Uint8Array).toString("utf8");
+        const outer = JSON.parse(s) as { payload?: { payload?: string } };
+        if (typeof outer?.payload?.payload === "string") {
+          return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as Record<string, unknown>;
+        }
+      } catch {}
+      return null;
+    };
+    const encodeCloudOut = (ev: Record<string, unknown>): Buffer => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+      return Buffer.from(encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, payload));
+    };
+
+    const gracePool = new WarmSessionPool({ maxWarmSessions: 8 });
+    const graceWs = makeStubWs(WsClass.OPEN);
+    graceWs.send = (raw: unknown) => {
+      const ev = decodeCloudIn(raw);
+      if (ev?.type === "user_message") {
+        setImmediate(() => {
+          graceWs.emit("message", encodeCloudOut({ type: "text_delta", payload: { delta: "Done cleanly" } }));
+          graceWs.emit("message", encodeCloudOut({ type: "turn_usage", payload: { input_tokens: 10, output_tokens: 3 } }));
+          graceWs.readyState = WsClass.CLOSED;
+          graceWs.emit("close", 1006, Buffer.from(""));
+        });
+      }
+    };
+    const graceRes = await collectTurnEvents(
+      runTurnStream({
+        ws: asWs(graceWs),
+        isReusedOpenWs: true,
+        encodeFrame: encodeCloudInputFrame,
+        decodeFrame: decodeCloudOutputFrame,
+        isWeb: false,
+        surfaceType: "DESKTOP",
+        appVersion: "1.0.0",
+        surfaceName: "desktop",
+        outpostId: "web0",
+        turn: {
+          requestedModel: "quick-balanced",
+          rawBody: { messages: [{ role: "user", content: "hi" }] },
+          fullTranscriptText: "hi",
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          stream: true,
+          estimatedInputTokens: 5,
+        },
+        apiKey: "oauth:test",
+        slotId: "slot-grace",
+        execMode: "incognito",
+        selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+        chunks: ["hi"],
+        effectiveCustomPrompt: null,
+        attachments: [],
+        rawPromptForRephrase: "hi",
+        toolFilter: null,
+        uiTagSanitizer: new StreamingUiTagSanitizer(),
+        threadId: "thr-grace",
+        effectiveRootThreadId: "thr-grace",
+        isIncognito: true,
+        isWarmIncremental: false,
+        isInternalHelperCall: false,
+        isRephraseRetry: false,
+        webSearchEnabled: false,
+        showRoutedModelInThinking: "false",
+        runIdleTimeoutMs: 10_000,
+        runMaxTimeoutMs: 10_000,
+        usageTracker: new UsageTracker(),
+        warmPool: gracePool,
+      }),
+    );
+    assert.equal(graceRes.text, "Done cleanly");
+    assert.equal(graceRes.stopReason, "stop");
+    gracePool.disposeAll();
+
+    // 6. Single-account transient 1006 self-heals via 1-shot same-slot retry without returning 502
+    const singleKey = `oauth:${Buffer.from(
+      JSON.stringify({
+        v: 1,
+        region: "us-east-1",
+        issuerUrl: "https://view.awsapps.com/start",
+        wsHost: "chat.quick.aws.com",
+        clientId: "cid-single-retry",
+        clientSecret: "csec",
+        refreshToken: "rt-single",
+        accessToken: "at-single",
+        expiresAt: Date.now() + 3600_000,
+      }),
+    ).toString("base64url")}`;
+    const singlePool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: singleKey,
+        SESSION_AFFINITY: "false",
+        AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      }),
+      dataDir: undefined,
+    });
+    let dialCount = 0;
+    const singleEngine = new QuickExecutionEngine({
+      config: loadConfigFromEnv({ QUICK_TOKENS: singleKey, AUTO_ENSURE_CODING_AGENT: "false" }),
+      usageTracker: new UsageTracker(),
+      webSocketFactory: () => {
+        dialCount += 1;
+        const attemptNo = dialCount;
+        const ws = makeStubWs(WsClass.OPEN);
+        ws.send = (raw: unknown) => {
+          const ev = decodeCloudIn(raw);
+          if (ev?.type === "user_message") {
+            setImmediate(() => {
+              if (attemptNo === 1) {
+                ws.readyState = WsClass.CLOSED;
+                ws.emit("close", 1006, Buffer.from("transient drop"));
+              } else {
+                ws.emit("message", encodeCloudOut({ type: "text_delta", payload: { delta: "RECOVERED" } }));
+                ws.emit("message", encodeCloudOut({ type: "message_complete", thread_id: "thr-ok", payload: {} }));
+              }
+            });
+          }
+        };
+        return asWs(ws);
+      },
+    });
+    const healed = await collectTurnEvents(
+      singleEngine.executeTurnWithPool(
+        {
+          requestedModel: "quick-balanced",
+          rawBody: { messages: [{ role: "user", content: "ping" }] },
+          fullTranscriptText: "ping",
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          stream: true,
+          estimatedInputTokens: 5,
+        },
+        singlePool,
+      ),
+    );
+    assert.equal(dialCount, 2, "single-account pool must retry transient 1006 once instead of returning 502");
+    assert.equal(healed.text, "RECOVERED");
+    await singleEngine.disposeAll();
+    singlePool.dispose();
+  });
+
+  it("Wave 2: incremental <tool_call> streaming across OpenAI Chat / Responses / Anthropic, literal newline & trailing comma repair, truncation safety, and parallel media ordering", async () => {
+    const { StreamingToolCallFilter } = await import("../src/core/tool-bridge.js");
+    const { openAiChatAdapter, openAiResponsesAdapter } = await import("../src/protocols/openai.js");
+    const { anthropicMessagesAdapter } = await import("../src/protocols/anthropic.js");
+    const { collectTurnEvents } = await import("../src/protocols/common.js");
+    const { compressResolvedImagesForQuickFrame } = await import("../src/core/media-utils.js");
+    const { default: sharp } = await import("sharp");
+
+    // 1. Incremental streaming lexer: streams multiple argument deltas live before </tool_call>,
+    //    repairs literal newlines inside JSON strings and trailing commas outside strings!
+    const allowed = new Set(["write_file", "read_file", "apply_patch"]);
+    const custom = new Set(["apply_patch"]);
+    const filter = new StreamingToolCallFilter(allowed, custom);
+    const chunks = [
+      "Let me write that.\n<tool_",
+      'call>{"name":"write_file","arguments":{',
+      '"path":"src/demo.ts",',
+      '"content":"line1\nline2',
+      '\nline3",',
+      '  }}</tool_call>',
+      '<tool_call>{"name":"read_file","arguments":{"path":"README.md"}}</tool_call>',
+    ];
+    let textAcc = "";
+    const allEvs: Array<import("../src/core/tool-bridge.js").StreamingToolCallEvent> = [];
+    let deltaCountBeforeClose = 0;
+    chunks.forEach((c, idx) => {
+      const { text, events } = filter.feedIncremental(c);
+      textAcc += text;
+      allEvs.push(...events);
+      if (idx <= 4) {
+        deltaCountBeforeClose += events.filter((e) => e.kind === "tool_call_delta").length;
+      }
+    });
+    const flushed = filter.flushIncremental();
+    textAcc += flushed.remainingText;
+    allEvs.push(...flushed.events);
+
+    assert.equal(textAcc, "Let me write that.\n");
+    assert.ok(deltaCountBeforeClose >= 4, `expected live argument deltas before </tool_call>, got ${deltaCountBeforeClose}`);
+    const ends = allEvs.filter((e) => e.kind === "tool_call_end");
+    assert.equal(ends.length, 2);
+    assert.equal(ends[0]!.call.name, "write_file");
+    assert.deepEqual(ends[0]!.call.argsObject, { path: "src/demo.ts", content: "line1\nline2\nline3" });
+    assert.equal(ends[1]!.call.name, "read_file");
+    assert.deepEqual(ends[1]!.call.argsObject, { path: "README.md" });
+
+    // 2. Disallowed tool name never emits tool_call_start and falls back to plain text;
+    //    custom tool string arguments & reversed keys still parse cleanly; truncated call closes cleanly.
+    const filter2 = new StreamingToolCallFilter(allowed, custom);
+    const rBad = filter2.feedIncremental('<tool_call>{"name":"not_allowed","arguments":{"a":1}}</tool_call>');
+    assert.equal(rBad.events.length, 0);
+    assert.ok(rBad.text.includes("not_allowed"));
+
+    const rCustom = filter2.feedIncremental('<tool_call>{"name":"apply_patch","arguments":"*** Begin Patch\\n*** End Patch"}</tool_call>');
+    const customEnd = rCustom.events.find((e) => e.kind === "tool_call_end");
+    assert.ok(customEnd && customEnd.kind === "tool_call_end");
+    assert.equal(customEnd.call.name, "apply_patch");
+    assert.equal(customEnd.call.argsObject.input, "*** Begin Patch\n*** End Patch");
+
+    const filterTrunc = new StreamingToolCallFilter(allowed);
+    const t1 = filterTrunc.feedIncremental('<tool_call>{"name":"write_file","arguments":{"path":"a.ts","content":"hello');
+    assert.ok(t1.events.some((e) => e.kind === "tool_call_start"));
+    const t2 = filterTrunc.flushIncremental();
+    const truncEnd = t2.events.find((e) => e.kind === "tool_call_end");
+    assert.ok(truncEnd && truncEnd.kind === "tool_call_end", "truncated streaming tool call must emit tool_call_end on flush");
+    assert.equal(truncEnd.call.argsObject.path, "a.ts");
+
+    // 3. All 3 protocol adapters stream incremental tool argument chunks AND enforce single-tool mode!
+    const makeStreamEvents = async function* (): AsyncGenerator<import("../src/core/types.js").GatewayStreamEvent> {
+      const f = new StreamingToolCallFilter(allowed);
+      const parts = [
+        '<tool_call>{"name":"write_file","arguments":{',
+        '"path":"src/a.ts",',
+        '"content":"const x = 1;\\n"',
+        '}}</tool_call>',
+        '<tool_call>{"name":"read_file","arguments":{"path":"b.ts"}}</tool_call>',
+      ];
+      for (const p of parts) {
+        const { events } = f.feedIncremental(p);
+        for (const e of events) {
+          if (e.kind === "tool_call_start") yield { type: "tool_call_start", index: e.index, id: e.id, name: e.name };
+          else if (e.kind === "tool_call_delta") yield { type: "tool_call_delta", index: e.index, id: e.id, argumentsDelta: e.argumentsDelta };
+          else if (e.kind === "tool_call_end") yield { type: "tool_call_end", index: e.index, call: e.call };
+        }
+      }
+      yield { type: "done", stopReason: "tool_calls" };
+    };
+
+    const dummyTools: import("../src/core/types.js").NormalizedTool[] = [
+      { name: "write_file", inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } } } },
+      { name: "read_file", inputSchema: { type: "object", properties: { path: { type: "string" } } } },
+    ];
+    const baseTurn: import("../src/core/types.js").ParsedProtocolTurn = {
+      requestedModel: "quick-balanced",
+      rawBody: { model: "quick-balanced", stream: true },
+      fullTranscriptText: "write",
+      images: [],
+      tools: dummyTools,
+      toolChoice: "auto",
+      trailingToolResults: [],
+      stream: true,
+      estimatedInputTokens: 10,
+    };
+
+    // 3a) OpenAI Chat Completions SSE
+    let chatSse = "";
+    for await (const c of openAiChatAdapter.streamSse(makeStreamEvents(), baseTurn)) chatSse += c;
+    const chatToolFrames = chatSse
+      .split("\n\n")
+      .map((b) => b.replace(/^data:\s*/, "").trim())
+      .filter((s) => s && s !== "[DONE]")
+      .map((s) => JSON.parse(s))
+      .filter((j) => Array.isArray(j.choices?.[0]?.delta?.tool_calls));
+    assert.ok(chatToolFrames.length >= 5, `OpenAI Chat must emit multiple incremental tool_calls frames, got ${chatToolFrames.length}`);
+    const chatArgs0 = chatToolFrames
+      .flatMap((j) => j.choices[0].delta.tool_calls)
+      .filter((tc: { index: number }) => tc.index === 0)
+      .map((tc: { function?: { arguments?: string } }) => tc.function?.arguments || "")
+      .join("");
+    assert.deepEqual(JSON.parse(chatArgs0), { path: "src/a.ts", content: "const x = 1;\n" });
+
+    // 3b) OpenAI Responses SSE
+    let respSse = "";
+    for await (const c of openAiResponsesAdapter.streamSse(makeStreamEvents(), baseTurn)) respSse += c;
+    const respArgDeltas = respSse
+      .split("\n\n")
+      .map((b) => b.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim())
+      .filter(Boolean)
+      .map((s) => JSON.parse(s!))
+      .filter((j) => j.type === "response.function_call_arguments.delta");
+    assert.ok(respArgDeltas.length >= 4, `OpenAI Responses must emit incremental function_call_arguments.delta chunks, got ${respArgDeltas.length}`);
+
+    // 3c) Anthropic Messages SSE + disable_parallel_tool_use: true
+    let anthSse = "";
+    for await (const c of anthropicMessagesAdapter.streamSse(makeStreamEvents(), {
+      ...baseTurn,
+      rawBody: { ...baseTurn.rawBody, tool_choice: { type: "auto", disable_parallel_tool_use: true } },
+    })) {
+      anthSse += c;
+    }
+    const anthEvents = anthSse
+      .split("\n\n")
+      .map((b) => b.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim())
+      .filter(Boolean)
+      .map((s) => JSON.parse(s!));
+    const anthToolStarts = anthEvents.filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+    const anthJsonDeltas = anthEvents.filter((e) => e.type === "content_block_delta" && e.delta?.type === "input_json_delta");
+    assert.equal(anthToolStarts.length, 1, "disable_parallel_tool_use must strictly emit only 1 tool_use block");
+    assert.ok(anthJsonDeltas.length >= 4, `Anthropic must emit multiple input_json_delta chunks, got ${anthJsonDeltas.length}`);
+    assert.deepEqual(
+      JSON.parse(anthJsonDeltas.map((d) => d.delta.partial_json).join("")),
+      { path: "src/a.ts", content: "const x = 1;\n" },
+    );
+
+    // 3d) Non-streaming collectTurnEvents collects streamed tool_call_end cleanly
+    const collected = await collectTurnEvents(makeStreamEvents());
+    assert.equal(collected.toolCalls.length, 2);
+    assert.equal(collected.toolCalls[0]!.name, "write_file");
+    assert.equal(collected.toolCalls[1]!.name, "read_file");
+
+    // 4. Parallel compressResolvedImagesForQuickFrame preserves exact 001..004 ordering
+    const rawImgs = await Promise.all(
+      [1, 2, 3, 4].map(async (i) => ({
+        buf: await sharp({
+          create: { width: 80, height: 80, channels: 4, background: { r: i * 50, g: 100, b: 150, alpha: 1 } },
+        }).png().toBuffer(),
+        mimeType: "image/png",
+      })),
+    );
+    const compressed = await compressResolvedImagesForQuickFrame(rawImgs);
+    assert.deepEqual(
+      compressed.map((im) => im.name),
+      ["user_image_001.png", "user_image_002.png", "user_image_003.png", "user_image_004.png"],
+    );
+  });
 });

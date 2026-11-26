@@ -133,6 +133,8 @@ export class QuickExecutionEngine {
   private readonly warmPool: WarmSessionPool;
   private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
   private readonly autoEnsureFailedSlots = new Map<string, { failedAt: number; count: number }>();
+  private readonly standbyWarmupTimers = new Set<NodeJS.Timeout>();
+  private disposed = false;
 
   constructor(options: {
     config: GatewayConfig;
@@ -183,11 +185,12 @@ export class QuickExecutionEngine {
   }
 
   runtimeStats() {
-    const { warmIncrementalSessions, warmIdleSessions } = this.warmPool.stats();
+    const { warmIncrementalSessions, warmIdleSessions, standbyWs } = this.warmPool.stats();
     return {
       parkedToolSessions: 0,
       warmIncrementalSessions,
       warmIdleSessions,
+      standbyWs,
       memoryStore: { blobs: 0, totalBytes: 0 },
     };
   }
@@ -197,6 +200,11 @@ export class QuickExecutionEngine {
   }
 
   async disposeAll(): Promise<void> {
+    this.disposed = true;
+    for (const t of this.standbyWarmupTimers) {
+      clearTimeout(t);
+    }
+    this.standbyWarmupTimers.clear();
     this.warmPool.disposeAll();
     stopSharedOutpost();
   }
@@ -210,11 +218,244 @@ export class QuickExecutionEngine {
   }
 
   /**
+   * Preserves live parked & standby WebSockets when an OAuth slot's single-use refresh token
+   * rotates (same account, new `slotId`).
+   */
+  rekeyWarmSessionsForSlot(oldSlotId: string, newSlotId: string): void {
+    this.warmPool.rekeySlot(oldSlotId, newSlotId);
+    const oldWsId = this.workingSessionIds.get(oldSlotId);
+    if (oldWsId) {
+      this.workingSessionIds.delete(oldSlotId);
+      if (!this.workingSessionIds.has(newSlotId)) {
+        this.workingSessionIds.set(newSlotId, oldWsId);
+      }
+    }
+  }
+
+  /**
    * Immediately invalidates parked WebSockets & warm sessions across all slots
    * (e.g. when global `chatAgentId` or `incognitoMode` changes).
    */
   invalidateWarmSessionsAll(): number {
     return this.warmPool.invalidateAll();
+  }
+
+  private isStandbyPrewarmEnabled(): boolean {
+    if (this.disposed) return false;
+    if (this.webSocketFactory) return false;
+    if (process.env.STANDBY_WS_PREWARM === "false") return false;
+    return true;
+  }
+
+  /**
+   * Schedules a non-blocking background pre-warm of 1 standby `session_established` WebSocket
+   * for `slotId` (and caches its OAuth access token). Safe under AWS's 5-WS/account cap because
+   * it skips whenever `active + parked > 3` and standby sockets are evicted first under load.
+   */
+  scheduleStandbyWarmup(keyPool: UpstreamKeyPool | undefined, slotId: string, delayMs = 300): void {
+    if (!keyPool || !slotId || !this.isStandbyPrewarmEnabled()) return;
+    const isIncognito = keyPool.getSettings().incognitoMode;
+    if (this.warmPool.hasOpenStandby(slotId, isIncognito)) return;
+    if (!this.warmPool.tryClaimStandbyDial(slotId)) return;
+
+    const timer = setTimeout(() => {
+      this.standbyWarmupTimers.delete(timer);
+      void this.warmStandbyForSlot(keyPool, slotId).finally(() => {
+        this.warmPool.releaseStandbyDial(slotId);
+      });
+    }, Math.max(0, delayMs));
+    timer.unref?.();
+    this.standbyWarmupTimers.add(timer);
+  }
+
+  /**
+   * Staggered startup pre-warm for enabled healthy OAuth slots (capped at 16 sockets globally).
+   */
+  warmStandbyPool(keyPool: UpstreamKeyPool): void {
+    if (!this.isStandbyPrewarmEnabled()) return;
+    const snapshots = keyPool.statusSnapshot();
+    let idx = 0;
+    for (const snap of snapshots) {
+      if (idx >= 16) break;
+      if (!snap.enabled || snap.authType !== "oauth") continue;
+      if (snap.cooldownRemainingMs > 0 || snap.apiPoolExhausted || snap.autoPoolExhausted) continue;
+      this.scheduleStandbyWarmup(keyPool, snap.slotId, 250 * idx);
+      idx += 1;
+    }
+  }
+
+  private async warmStandbyForSlot(keyPool: UpstreamKeyPool, slotId: string): Promise<void> {
+    if (!this.isStandbyPrewarmEnabled()) return;
+    const snap = keyPool.statusSnapshot().find((s) => s.slotId === slotId);
+    if (!snap || !snap.enabled || snap.authType !== "oauth") return;
+    if (snap.cooldownRemainingMs > 0 || snap.apiPoolExhausted || snap.autoPoolExhausted) return;
+    const managed = keyPool.allManagedKeys().find((k) => k.slotId === slotId && k.enabled);
+    if (!managed) return;
+    const parsed = parseQuickCredential(managed.rawKey);
+    if (parsed.mode !== "oauth" || !parsed.oauth) return;
+
+    const isIncognito = keyPool.getSettings().incognitoMode;
+    if (this.warmPool.hasOpenStandby(slotId, isIncognito)) return;
+    const activeForSlot = Math.max(
+      this.warmPool.getActiveWsCount(slotId),
+      keyPool.activeInflightForSlot(slotId),
+    );
+    if (activeForSlot + this.warmPool.countParkedWsForSlot(slotId) > 3) return;
+
+    const expectedGeneration = this.warmPool.getSlotGeneration(slotId);
+    let workingSessionId = this.workingSessionIds.get(slotId);
+    if (!workingSessionId) {
+      workingSessionId = crypto.randomUUID();
+      this.workingSessionIds.set(slotId, workingSessionId);
+    }
+
+    let dialed: DialedQuickWs | undefined;
+    try {
+      dialed = await dialQuickWebSocket({
+        apiKey: managed.rawKey,
+        workingSessionId,
+        proxyUrl: managed.proxyUrl,
+        webSocketFactory: this.webSocketFactory,
+      });
+      if (this.disposed) {
+        dialed.ws.on("error", () => { });
+        try { dialed.ws.close(); } catch { }
+        return;
+      }
+
+      const established = await new Promise<boolean>((resolve) => {
+        let settled = false;
+        let recvBuf = Buffer.alloc(0);
+        const ws = dialed!.ws;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(handshakeTimeout);
+          ws.off("open", onOpen);
+          ws.off("message", onMessage);
+          ws.off("error", onDead);
+          ws.off("close", onDead);
+          resolve(ok);
+        };
+        const onDead = () => finish(false);
+        const onOpen = () => {
+          if (settled || this.disposed || ws.readyState !== WebSocket.OPEN) {
+            finish(false);
+            return;
+          }
+          try {
+            ws.send(
+              dialed!.encodeFrame({
+                type: "session_connect",
+                payload: {
+                  ...(dialed!.actorArn ? { actor_id: dialed!.actorArn } : {}),
+                  surfaceType: dialed!.surfaceType,
+                  outpostId: dialed!.outpostId,
+                  appVersion: dialed!.appVersion,
+                  ...DESKTOP_CAPABILITIES,
+                  ...(isIncognito ? { incognito: true } : {}),
+                },
+              }),
+            );
+            if (!dialed!.isWeb) {
+              ws.send(dialed!.encodeFrame({ type: "federate_status", payload: {} }));
+            }
+          } catch {
+            finish(false);
+          }
+        };
+        const onMessage = (data: Buffer) => {
+          if (settled) return;
+          const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+          try {
+            recvBuf = Buffer.concat([recvBuf, chunk]);
+            const drained = drainEventStream(recvBuf, 0);
+            if (drained.consumed > 0) recvBuf = recvBuf.subarray(drained.consumed);
+            for (const esMsg of drained.messages) {
+              const dec = dialed!.decodeFrame(esMsg);
+              if (dec?.type === "error") {
+                finish(false);
+                return;
+              }
+              if (dec?.type === "event" && dec.data && typeof dec.data === "object") {
+                const evObj = dec.data as { type?: unknown; payload?: Record<string, unknown> };
+                const evT = String(evObj.type || "");
+                if (evT === "connected" && parsed.oauth?.clientId) {
+                  const u = evObj.payload?.user as Record<string, unknown> | undefined;
+                  if (u && typeof u === "object") {
+                    cacheOAuthUserIdentity(parsed.oauth.clientId, {
+                      ...(typeof u.email === "string" ? { email: u.email } : {}),
+                      ...(typeof u.name === "string" ? { name: u.name } : {}),
+                      ...(typeof u.aws_account_id === "string" ? { accountId: u.aws_account_id } : {}),
+                    });
+                  }
+                }
+                if (evT === "session_established" || evT === "connected") {
+                  finish(true);
+                  return;
+                }
+              }
+            }
+          } catch {
+            finish(false);
+          }
+        };
+        const handshakeTimeout = setTimeout(() => finish(false), 8_000);
+        handshakeTimeout.unref?.();
+        ws.on("error", onDead);
+        ws.on("close", onDead);
+        ws.on("message", onMessage);
+        if (ws.readyState === WebSocket.OPEN) onOpen();
+        else ws.once("open", onOpen);
+      });
+
+      if (!established || this.disposed || dialed.ws.readyState !== WebSocket.OPEN) {
+        dialed.ws.on("error", () => { });
+        try { dialed.ws.close(); } catch { }
+        return;
+      }
+
+      // Resolve live slotId/rawKey in case OAuth refresh token rotated during `dialQuickWebSocket`.
+      const liveSlot =
+        keyPool.allManagedKeys().find((k) => k.slotId === slotId && k.enabled) ||
+        keyPool.allManagedKeys().find((k) => {
+          if (!k.enabled) return false;
+          const p = parseQuickCredential(k.rawKey);
+          return p.mode === "oauth" && p.oauth?.clientId === parsed.oauth?.clientId;
+        });
+      if (!liveSlot) {
+        dialed.ws.on("error", () => { });
+        try { dialed.ws.close(); } catch { }
+        return;
+      }
+
+      const stored = this.warmPool.storeStandby({
+        slotId: liveSlot.slotId,
+        isIncognito,
+        expectedGeneration,
+        handle: {
+          ws: dialed.ws,
+          outpostId: dialed.outpostId,
+          encodeFrame: dialed.encodeFrame,
+          decodeFrame: dialed.decodeFrame,
+          surfaceType: dialed.surfaceType,
+          appVersion: dialed.appVersion,
+          surfaceName: dialed.surfaceName,
+          actorArn: dialed.actorArn,
+        },
+        apiKey: liveSlot.rawKey,
+        proxyUrl: liveSlot.proxyUrl,
+      });
+      if (!stored) {
+        dialed.ws.on("error", () => { });
+        try { dialed.ws.close(); } catch { }
+      }
+    } catch {
+      if (dialed) {
+        dialed.ws.on("error", () => { });
+        try { dialed.ws.close(); } catch { }
+      }
+    }
   }
 
   async resolveModel(apiKey: string, requestedModel: string, body: Record<string, unknown>) {
@@ -502,16 +743,17 @@ export class QuickExecutionEngine {
     }
     const checkedRemoteUrls = new Set<string>();
     for (const img of currentTurnImages) {
-      if ("url" in img && img.url && !img.url.startsWith("data:") && !checkedRemoteUrls.has(img.url)) {
+      if ("url" in img && img.url && !img.url.startsWith("data:")) {
         checkedRemoteUrls.add(img.url);
-        await assertSafeRemoteImageUrl(img.url);
       }
     }
     for (const f of currentTurnFiles) {
-      if (f.url && !f.url.startsWith("data:") && !checkedRemoteUrls.has(f.url)) {
+      if (f.url && !f.url.startsWith("data:")) {
         checkedRemoteUrls.add(f.url);
-        await assertSafeRemoteImageUrl(f.url);
       }
+    }
+    if (checkedRemoteUrls.size > 0) {
+      await Promise.all([...checkedRemoteUrls].map((u) => assertSafeRemoteImageUrl(u)));
     }
 
     const excluded = new Set<string>();
@@ -526,6 +768,7 @@ export class QuickExecutionEngine {
     const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount(requiredAccountGroup)), 10);
     let remainingWaitBudgetMs = 18_000;
     let retriedSameSlotConnLimit = false;
+    let retriedTransientSameSlot = false;
 
     try {
       for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
@@ -649,7 +892,13 @@ export class QuickExecutionEngine {
             keyPool,
             initialLeaseOpts,
           )) {
-            if (ev.type === "text" || ev.type === "tool_calls") {
+            if (
+              ev.type === "text" ||
+              ev.type === "tool_calls" ||
+              ev.type === "tool_call_start" ||
+              ev.type === "tool_call_delta" ||
+              ev.type === "tool_call_end"
+            ) {
               yieldedOutput = true;
               hasEmittedClientText = true;
             } else if (ev.type === "thinking") {
@@ -660,6 +909,9 @@ export class QuickExecutionEngine {
           }
           closeCapturedFilterWs();
           lease.markSuccess();
+          if (!isInternalCall) {
+            this.scheduleStandbyWarmup(keyPool, lease.slotId, 300);
+          }
           return;
         } catch (err) {
           // Immediately disarm any armed 15s `flushEarly` timer before rephrase/warm-fallback/failover
@@ -761,6 +1013,9 @@ export class QuickExecutionEngine {
                   yield ev;
                 }
                 lease.markSuccess();
+                if (!isInternalCall) {
+                  this.scheduleStandbyWarmup(keyPool, lease.slotId, 300);
+                }
                 return;
               } catch (rephraseRetryErr) {
                 err = rephraseRetryErr;
@@ -798,12 +1053,22 @@ export class QuickExecutionEngine {
                 keyPool,
                 { attachmentCache, expectedWarmGeneration, warmFallbackToCold: true },
               )) {
-                if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
+                if (
+                  ev.type === "text" ||
+                  ev.type === "thinking" ||
+                  ev.type === "tool_calls" ||
+                  ev.type === "tool_call_start" ||
+                  ev.type === "tool_call_delta" ||
+                  ev.type === "tool_call_end"
+                ) {
                   yieldedOutput = true;
                 }
                 yield ev;
               }
               lease.markSuccess();
+              if (!isInternalCall) {
+                this.scheduleStandbyWarmup(keyPool, lease.slotId, 300);
+              }
               return;
             } catch (fallbackErr) {
               err = fallbackErr;
@@ -811,8 +1076,20 @@ export class QuickExecutionEngine {
           }
           let finalErr = mapSdkError(err);
           let msg = finalErr.message || "";
-          let { isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
-            classifyUpstreamError(finalErr);
+          let {
+            isConnLimitErr,
+            isPayloadOrContextSizeErr,
+            isSessionLifecycleErr,
+            isQuotaErr,
+            isRateLimitErr,
+            isAuthErr,
+            isProxyOrConnErr,
+          } = classifyUpstreamError(finalErr);
+
+          // Oversized payloads/contexts are client-side 400s: fail fast without burning the account pool.
+          if (isPayloadOrContextSizeErr && !yieldedOutput) {
+            throw new GatewayError(finalErr.message, 400, "invalid_request_error");
+          }
 
           // On 401/403 auth errors for OAuth accounts, force-refresh once before marking auth-failed.
           if (
@@ -831,8 +1108,15 @@ export class QuickExecutionEngine {
               } catch (refreshErr) {
                 finalErr = mapSdkError(refreshErr);
                 msg = finalErr.message || "";
-                ({ isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
-                  classifyUpstreamError(finalErr));
+                ({
+                  isConnLimitErr,
+                  isPayloadOrContextSizeErr,
+                  isSessionLifecycleErr,
+                  isQuotaErr,
+                  isRateLimitErr,
+                  isAuthErr,
+                  isProxyOrConnErr,
+                } = classifyUpstreamError(finalErr));
               }
             }
           }
@@ -841,15 +1125,28 @@ export class QuickExecutionEngine {
             ? this.warmPool.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
             : 0;
 
+          // Retry once on the same slot after evicting idle/standby WS (or waiting ~450ms for AWS's
+          // backend to finish reaping a recently closed WS even when no local parked WS existed).
           if (
             isConnLimitErr &&
-            evictedParked > 0 &&
             !retriedSameSlotConnLimit &&
             !yieldedOutput &&
             !turn.signal?.aborted
           ) {
             retriedSameSlotConnLimit = true;
-            await new Promise<void>((r) => setTimeout(r, 200));
+            const waitMs = evictedParked > 0 ? 250 : 450 + Math.floor(Math.random() * 200);
+            await new Promise<void>((resolve) => {
+              const onAbort = () => {
+                clearTimeout(t);
+                resolve();
+              };
+              const t = setTimeout(() => {
+                turn.signal?.removeEventListener("abort", onAbort);
+                resolve();
+              }, waitMs);
+              t.unref?.();
+              turn.signal?.addEventListener("abort", onAbort, { once: true });
+            });
             attempt -= 1;
             continue;
           }
@@ -877,7 +1174,14 @@ export class QuickExecutionEngine {
           const canFailover =
             (!yieldedOutput || !turn.stream) &&
             !turn.signal?.aborted &&
-            (isQuotaErr || isConnLimitErr || isRateLimitErr || isAuthErr || isProxyOrConnErr || isModelNotAvailable) &&
+            finalErr.status !== 504 &&
+            (isQuotaErr ||
+              isConnLimitErr ||
+              isRateLimitErr ||
+              isAuthErr ||
+              isProxyOrConnErr ||
+              isSessionLifecycleErr ||
+              isModelNotAvailable) &&
             attempt + 1 < maxAttempts;
 
           if (canFailover) {
@@ -897,10 +1201,54 @@ export class QuickExecutionEngine {
               continue;
             }
           }
-          // Never leak internal HTTP 402 (unretriable by Anthropic/OpenAI SDKs) or upstream 401/403
-          // (which tricks clients into thinking their own gateway API key is invalid) to callers.
+
+          // Single-account / exhausted-pool self-healing: retry transient socket/proxy/session hiccups
+          // once on the same slot with a short jittered backoff before surfacing 502 to the caller.
+          if (
+            !retriedTransientSameSlot &&
+            (!yieldedOutput || !turn.stream) &&
+            !turn.signal?.aborted &&
+            finalErr.status !== 504 &&
+            (isProxyOrConnErr || isSessionLifecycleErr)
+          ) {
+            retriedTransientSameSlot = true;
+            excluded.delete(lease.apiKey);
+            const waitMs = 400 + Math.floor(Math.random() * 250);
+            await new Promise<void>((resolve) => {
+              const onAbort = () => {
+                clearTimeout(t);
+                resolve();
+              };
+              const t = setTimeout(() => {
+                turn.signal?.removeEventListener("abort", onAbort);
+                resolve();
+              }, waitMs);
+              t.unref?.();
+              turn.signal?.addEventListener("abort", onAbort, { once: true });
+            });
+            if (!turn.signal?.aborted) {
+              if (yieldedOutput && !turn.stream) {
+                yield { type: "reset" };
+              }
+              attempt -= 1;
+              continue;
+            }
+          }
+
+          // Never leak internal HTTP 402 (unretriable by Anthropic/OpenAI SDKs), upstream 401/403
+          // (which tricks clients into thinking their own gateway API key is invalid), or raw 502
+          // for rate-limit/connection-limit/quota rejections to callers.
           if (finalErr.status === 402 && finalErr.code === "quota_exhausted") {
             throw new GatewayError(finalErr.message, 429, "rate_limit_exceeded", undefined, 30);
+          }
+          if ((isConnLimitErr || isRateLimitErr || isQuotaErr) && finalErr.status !== 429) {
+            throw new GatewayError(
+              finalErr.message,
+              429,
+              "rate_limit_exceeded",
+              undefined,
+              isQuotaErr ? 30 : 5,
+            );
           }
           if ((finalErr.status === 401 || finalErr.status === 403) && finalErr.code === "upstream_auth_error") {
             throw new GatewayError(finalErr.message, 502, "upstream_auth_error");
@@ -1080,8 +1428,8 @@ export class QuickExecutionEngine {
         this.warmPool.getActiveWsCount(lease.slotId),
         keyPool ? keyPool.activeInflightForSlot(lease.slotId) : 0,
       );
-      const parkedForSlot = this.warmPool.countParkedWsForSlot(lease.slotId);
-      const overflow = activeForSlot + parkedForSlot - 4;
+      const idleForSlot = this.warmPool.countIdleWsForSlot(lease.slotId);
+      const overflow = activeForSlot + idleForSlot - 4;
       if (overflow > 0) {
         this.warmPool.evictParkedWsForSlot(lease.slotId, overflow);
       }
@@ -1106,6 +1454,31 @@ export class QuickExecutionEngine {
       }
     };
 
+    // Instant cold-turn acceleration: pop a pre-warmed `session_established` standby WS if available
+    // (saves ~1.9s on direct connections and ~7.1s on residential SOCKS5 proxies!).
+    let standbyHit = !reusedWs && !turn.signal?.aborted
+      ? this.warmPool.takeStandby(lease.slotId, isIncognito)
+      : undefined;
+    let tempStandbyDead = false;
+    const onTempStandbyDead = () => {
+      tempStandbyDead = true;
+    };
+    if (standbyHit) {
+      standbyHit.ws.on("error", onTempStandbyDead);
+      standbyHit.ws.on("close", onTempStandbyDead);
+    }
+    const safeCloseStandbyWs = () => {
+      if (!standbyHit) return;
+      const stale = standbyHit.ws;
+      standbyHit = undefined;
+      stale.off("error", onTempStandbyDead);
+      stale.off("close", onTempStandbyDead);
+      stale.on("error", () => { });
+      try {
+        stale.close();
+      } catch { }
+    };
+
     // Speculative parallel WS dial + `session_connect` handshake during OOB attachment/text uploads.
     // Overlaps the ~900-1000ms WS connect+handshake RTT behind OOB upload without risking leaks on abort/error.
     interface SpeculativeDialState {
@@ -1113,6 +1486,7 @@ export class QuickExecutionEngine {
       handshakeEstablished: boolean;
       sessionConnectSent: boolean;
       dead: boolean;
+      trackedActive: boolean;
       bufferedFrames: Buffer[];
       detach: () => void;
     }
@@ -1124,6 +1498,10 @@ export class QuickExecutionEngine {
         void specPromise.then((st) => {
           if (!st) return;
           st.detach();
+          if (st.trackedActive) {
+            st.trackedActive = false;
+            this.warmPool.trackActiveWsEnd(lease.slotId);
+          }
           st.dialed.ws.on("error", () => { });
           try {
             st.dialed.ws.close();
@@ -1143,6 +1521,7 @@ export class QuickExecutionEngine {
           : turn.fullTranscriptText;
     const willLikelyUseOob =
       !reusedWs &&
+      !standbyHit &&
       !turn.signal?.aborted &&
       ((isOAuthAccount && Boolean(cred.oauth)) || (isWeb && Boolean(cred.web))) &&
       (rawSourceFiles.length > 0 ||
@@ -1167,11 +1546,13 @@ export class QuickExecutionEngine {
             } catch { }
             return null;
           }
+          this.warmPool.trackActiveWsStart(lease.slotId);
           const state: SpeculativeDialState = {
             dialed,
             handshakeEstablished: false,
             sessionConnectSent: false,
             dead: false,
+            trackedActive: true,
             bufferedFrames: [],
             detach: () => { },
           };
@@ -1242,6 +1623,10 @@ export class QuickExecutionEngine {
             dialed.ws.off("message", onSpecMessage);
             dialed.ws.off("error", onSpecDead);
             dialed.ws.off("close", onSpecDead);
+            if (specRecvBuf.length > 0) {
+              state.bufferedFrames.unshift(specRecvBuf);
+              specRecvBuf = Buffer.alloc(0);
+            }
           };
           dialed.ws.on("error", onSpecDead);
           dialed.ws.on("close", onSpecDead);
@@ -1306,6 +1691,7 @@ export class QuickExecutionEngine {
       }
     } catch (prepErr) {
       safeCloseReusedWs();
+      safeCloseStandbyWs();
       cancelSpeculativeDial();
       throw prepErr;
     }
@@ -1338,6 +1724,7 @@ export class QuickExecutionEngine {
 
     if (turn.signal?.aborted) {
       safeCloseReusedWs();
+      safeCloseStandbyWs();
       cancelSpeculativeDial();
       throw new GatewayError("Request aborted by client.", 499, "client_aborted");
     }
@@ -1420,6 +1807,7 @@ export class QuickExecutionEngine {
       }
     } catch (chunkErr) {
       safeCloseReusedWs();
+      safeCloseStandbyWs();
       cancelSpeculativeDial();
       throw chunkErr;
     }
@@ -1470,6 +1858,7 @@ export class QuickExecutionEngine {
     let actorArn: string | undefined;
     let outpostId = activeEditBranch?.outpostId || warmHit?.reusedOutpostId || "web0";
     let isReusedOpenWs = false;
+    let isStandbyWs = false;
     let preSessionConnectSent = false;
     let preBufferedFrames: Buffer[] | undefined;
 
@@ -1478,15 +1867,38 @@ export class QuickExecutionEngine {
       reusedWs.off("close", onTempReusedDead);
       ws = reusedWs;
       isReusedOpenWs = true;
+      safeCloseStandbyWs();
       cancelSpeculativeDial();
+    } else if (standbyHit && !tempStandbyDead && standbyHit.ws.readyState === WebSocket.OPEN) {
+      safeCloseReusedWs();
+      cancelSpeculativeDial();
+      const adoptedStandby = standbyHit;
+      standbyHit = undefined;
+      adoptedStandby.ws.off("error", onTempStandbyDead);
+      adoptedStandby.ws.off("close", onTempStandbyDead);
+      ws = adoptedStandby.ws;
+      encodeFrame = adoptedStandby.encodeFrame;
+      decodeFrame = adoptedStandby.decodeFrame;
+      surfaceType = adoptedStandby.surfaceType;
+      appVersion = adoptedStandby.appVersion;
+      surfaceName = adoptedStandby.surfaceName;
+      outpostId = adoptedStandby.outpostId;
+      actorArn = adoptedStandby.actorArn;
+      isReusedOpenWs = true;
+      isStandbyWs = true;
     } else {
       safeCloseReusedWs();
+      safeCloseStandbyWs();
       let adoptedSpec: SpeculativeDialState | null = null;
       if (specPromise) {
         const candidate = await specPromise;
         specPromise = null;
         if (candidate) {
           candidate.detach();
+          if (candidate.trackedActive) {
+            candidate.trackedActive = false;
+            this.warmPool.trackActiveWsEnd(lease.slotId);
+          }
           if (
             !candidate.dead &&
             (candidate.dialed.ws.readyState === WebSocket.OPEN ||
@@ -1543,6 +1955,7 @@ export class QuickExecutionEngine {
     yield* runTurnStream({
       ws,
       isReusedOpenWs,
+      isStandbyWs,
       preSessionConnectSent,
       preBufferedFrames,
       encodeFrame,

@@ -95,7 +95,8 @@ class HttpConnectTunnelAgent extends https.Agent {
   private readonly proxyUrl: URL;
 
   constructor(proxyUrl: string) {
-    super({ keepAlive: false });
+    // 20s idle free-socket timeout prevents reusing NAT-dropped sockets on residential proxies.
+    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 16, maxFreeSockets: 4 });
     this.proxyUrl = new URL(proxyUrl);
   }
 
@@ -133,8 +134,8 @@ class HttpConnectTunnelAgent extends https.Agent {
       callback?.(err, stream as Duplex);
     };
 
-    req.setTimeout(15_000, () => {
-      req.destroy(new Error("Proxy CONNECT handshake timed out after 15s"));
+    req.setTimeout(10_000, () => {
+      req.destroy(new Error("Proxy CONNECT handshake timed out after 10s"));
     });
 
     req.once("connect", (res, socket) => {
@@ -143,6 +144,7 @@ class HttpConnectTunnelAgent extends https.Agent {
         done(new Error(`Proxy CONNECT failed (${res.statusCode} ${res.statusMessage || ""})`), socket);
         return;
       }
+      socket.setNoDelay?.(true);
       if (options.protocol === "http:") {
         done(null, socket);
         return;
@@ -151,6 +153,7 @@ class HttpConnectTunnelAgent extends https.Agent {
         socket,
         servername: options.servername || targetHost,
       });
+      tlsSocket.setNoDelay?.(true);
       done(null, tlsSocket);
     });
 
@@ -171,7 +174,7 @@ export function establishSocks5Tunnel(
   proxyUrl: URL,
   targetHost: string,
   targetPort: number,
-  timeoutMs = 15_000,
+  timeoutMs = 10_000,
 ): Promise<net.Socket> {
   const proxyHost = proxyUrl.hostname;
   const proxyPort = Number(proxyUrl.port || 1080);
@@ -181,6 +184,7 @@ export function establishSocks5Tunnel(
 
   return new Promise<net.Socket>((resolve, reject) => {
     const socket = net.connect({ host: proxyHost, port: proxyPort });
+    socket.setNoDelay(true);
     let settled = false;
     let stage: "greeting" | "auth" | "connect" = "greeting";
     let buf: Buffer = Buffer.alloc(0);
@@ -324,7 +328,8 @@ class Socks5TunnelAgent extends https.Agent {
   private readonly proxyUrl: URL;
 
   constructor(proxyUrl: string) {
-    super({ keepAlive: false });
+    // 20s idle free-socket timeout prevents reusing NAT-dropped sockets on residential proxies.
+    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 16, maxFreeSockets: 4 });
     this.proxyUrl = new URL(proxyUrl);
   }
 
@@ -336,6 +341,7 @@ class Socks5TunnelAgent extends https.Agent {
     const targetPort = Number(options.port || (options.protocol === "http:" ? 80 : 443));
     establishSocks5Tunnel(this.proxyUrl, targetHost, targetPort)
       .then((socket) => {
+        socket.setNoDelay?.(true);
         if (options.protocol === "http:") {
           callback?.(null, socket);
           return;
@@ -344,6 +350,7 @@ class Socks5TunnelAgent extends https.Agent {
           socket,
           servername: options.servername || targetHost,
         });
+        tlsSocket.setNoDelay?.(true);
         callback?.(null, tlsSocket);
       })
       .catch((err) => {
@@ -384,17 +391,36 @@ export function getProxyAgent(proxyUrl: string | undefined): https.Agent | undef
 }
 
 function isTransientProxyNetworkError(err: unknown): boolean {
-  const code = String((err as { code?: unknown } | null)?.code || "").toUpperCase();
-  if (code === "ECONNRESET" || code === "ECONNABORTED" || code === "EPIPE") {
+  const rec = err as { code?: unknown; cause?: { code?: unknown; message?: unknown } } | null;
+  const code = String(rec?.code || rec?.cause?.code || "").toUpperCase();
+  if (
+    code === "ECONNRESET" ||
+    code === "ECONNABORTED" ||
+    code === "EPIPE" ||
+    code === "ETIMEDOUT" ||
+    code === "ECONNREFUSED" ||
+    code === "UND_ERR_SOCKET" ||
+    code === "UND_ERR_CONNECT_TIMEOUT"
+  ) {
     return true;
   }
-  const msg = (err instanceof Error ? err.message : String(err || "")).toLowerCase();
+  const msg = `${err instanceof Error ? err.message : String(err || "")} ${String(rec?.cause?.message || "")}`.toLowerCase();
   return (
     msg.includes("econnreset") ||
     msg.includes("econnaborted") ||
     msg.includes("epipe") ||
+    msg.includes("etimedout") ||
+    msg.includes("econnrefused") ||
     msg.includes("socket hang up") ||
+    msg.includes("other side closed") ||
+    msg.includes("und_err_socket") ||
+    msg.includes("fetch failed") ||
     msg.includes("socks5 proxy closed connection during handshake") ||
+    msg.includes("socks5 proxy handshake timed out") ||
+    msg.includes("socks5 connect failed") ||
+    msg.includes("proxy connect handshake timed out") ||
+    msg.includes("proxy http request timed out") ||
+    /proxy connect failed \((?:429|5\d\d)\b/.test(msg) ||
     msg.includes("before secure tls connection was established")
   );
 }
@@ -460,8 +486,8 @@ function doProxiedHttpsRequest(
         });
       },
     );
-    req.setTimeout(30_000, () => {
-      req.destroy(new Error("Proxy HTTP request timed out after 30s"));
+    req.setTimeout(20_000, () => {
+      req.destroy(new Error("Proxy HTTP request timed out after 20s"));
     });
     req.on("error", fail);
     if (init.body) req.write(init.body);
@@ -589,6 +615,9 @@ export async function fetchViaOptionalProxy(
   const directProxy = (proxyUrl || "").trim();
   const effectiveProxy =
     directProxy || (globalThis.fetch === NATIVE_FETCH ? resolveEffectiveProxyUrl(undefined, url) || "" : "");
+  const maxRetries = Math.max(0, options?.maxRetries ?? 1);
+  const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 300);
+
   if (!effectiveProxy) {
     const fetchInit: RequestInit = {
       ...(init.method ? { method: init.method } : {}),
@@ -598,12 +627,23 @@ export async function fetchViaOptionalProxy(
         : {}),
       ...(init.signal ? { signal: init.signal } : {}),
     };
-    return fetch(url, fetchInit);
+    let lastDirectErr: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fetch(url, fetchInit);
+      } catch (err) {
+        lastDirectErr = err;
+        if (attempt >= maxRetries || init.signal?.aborted || !isTransientProxyNetworkError(err)) {
+          throw err;
+        }
+        const delay = retryDelayMs * (attempt + 1);
+        if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw lastDirectErr;
   }
   const u = new URL(url);
   const agent = getProxyAgent(effectiveProxy);
-  const maxRetries = Math.max(0, options?.maxRetries ?? 1);
-  const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 300);
 
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {

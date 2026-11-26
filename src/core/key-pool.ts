@@ -284,6 +284,7 @@ export class UpstreamKeyPool {
   private readonly rrIndexByGroup = new Map<string, number>();
   private readonly unsubscribeOAuthRotation: () => void;
   private onSlotInvalidatedCallback?: (slotId: string) => void;
+  private onSlotRekeyedCallback?: (oldSlotId: string, newSlotId: string) => void;
   private readonly groupRenameListeners = new Set<(oldName: string, newName: string) => void>();
 
   constructor(config: Pick<
@@ -550,6 +551,10 @@ export class UpstreamKeyPool {
     this.onSlotInvalidatedCallback = cb;
   }
 
+  setOnSlotRekeyed(cb: ((oldSlotId: string, newSlotId: string) => void) | undefined): void {
+    this.onSlotRekeyedCallback = cb;
+  }
+
   private emitSlotInvalidated(slotId: string): void {
     if (!slotId || !this.onSlotInvalidatedCallback) return;
     try {
@@ -559,7 +564,20 @@ export class UpstreamKeyPool {
     }
   }
 
-  private rekeySlotCredential(slot: InternalKeySlot, newRawKey: string): void {
+  private emitSlotRekeyed(oldSlotId: string, newSlotId: string): void {
+    if (!oldSlotId || !newSlotId || oldSlotId === newSlotId) return;
+    if (this.onSlotRekeyedCallback) {
+      try {
+        this.onSlotRekeyedCallback(oldSlotId, newSlotId);
+      } catch {
+        // non-fatal
+      }
+      return;
+    }
+    this.emitSlotInvalidated(oldSlotId);
+  }
+
+  private rekeySlotCredential(slot: InternalKeySlot, newRawKey: string, preserveWarmSessions = false): void {
     const oldRawKey = slot.rawKey;
     const oldSlotId = slot.slotId;
     if (oldRawKey === newRawKey) return;
@@ -580,7 +598,11 @@ export class UpstreamKeyPool {
         this.quotaProbeCooldownBySlot.delete(oldSlotId);
         this.quotaProbeCooldownBySlot.set(newSlotId, prevProbeAt);
       }
-      this.emitSlotInvalidated(oldSlotId);
+      if (preserveWarmSessions) {
+        this.emitSlotRekeyed(oldSlotId, newSlotId);
+      } else {
+        this.emitSlotInvalidated(oldSlotId);
+      }
     }
     this.affinityTable.rekeyEntries(oldRawKey, newRawKey, newSlotId, newMaskedKey);
     evictQuotaCachesForKey(oldRawKey);
@@ -608,7 +630,7 @@ export class UpstreamKeyPool {
         ...(accessToken ? { accessToken } : {}),
         ...(typeof expiresAt === "number" && Number.isFinite(expiresAt) ? { expiresAt } : {}),
       });
-      this.rekeySlotCredential(slot, updatedRawKey);
+      this.rekeySlotCredential(slot, updatedRawKey, true);
       this.persist();
       return true;
     }

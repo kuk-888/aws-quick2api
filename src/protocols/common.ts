@@ -61,6 +61,7 @@ export async function collectTurnEvents(events: AsyncIterable<GatewayStreamEvent
         thinking += ev.text;
       }
     } else if (ev.type === "text") text += ev.text;
+    else if (ev.type === "tool_call_end") toolCalls.push(ev.call);
     else if (ev.type === "tool_calls") toolCalls = ev.calls;
     else if (ev.type === "usage") {
       metrics = ev.metrics;

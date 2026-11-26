@@ -132,6 +132,9 @@ export type GatewayStreamEvent =
   | { type: "reset" }
   | { type: "thinking"; text: string; lateRoutingCorrection?: boolean; actualRoutedModel?: string }
   | { type: "text"; text: string }
+  | { type: "tool_call_start"; index: number; id: string; name: string }
+  | { type: "tool_call_delta"; index: number; id: string; argumentsDelta: string }
+  | { type: "tool_call_end"; index: number; call: NormalizedToolCall }
   | { type: "tool_calls"; calls: NormalizedToolCall[] }
   | { type: "usage"; metrics: TurnTokenMetrics }
   | { type: "done"; stopReason: "stop" | "tool_calls" | "length" };

@@ -252,6 +252,21 @@ export class RequestTraceLogger {
     rec.emittedToolCallsCount = calls.length;
   }
 
+  recordToolCallStart(traceId: string | null): void {
+    if (!traceId) return;
+    const rec = this.records.get(traceId);
+    if (!rec) return;
+    if (rec.ttftMs === null) rec.ttftMs = Date.now() - rec.startedAtMs;
+  }
+
+  recordToolCallCompleted(traceId: string | null): void {
+    if (!traceId) return;
+    const rec = this.records.get(traceId);
+    if (!rec) return;
+    if (rec.ttftMs === null) rec.ttftMs = Date.now() - rec.startedAtMs;
+    rec.emittedToolCallsCount += 1;
+  }
+
   recordUsage(traceId: string | null, metrics: TurnTokenMetrics): void {
     if (!traceId) return;
     const rec = this.records.get(traceId);

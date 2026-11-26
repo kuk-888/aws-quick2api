@@ -353,17 +353,41 @@ export async function deleteCloudSessionsForKey(
  * Lists all AWS Quick chat agents (default SYSTEM + user custom agents) on the given account
  * using the native `get_chat_agents` -> `chat_agents_updated` WebSocket protocol.
  */
+function scheduleControlSessionConnect(dialed: DialedQuickWs): void {
+  const sendConnect = () => {
+    if (dialed.ws.readyState !== WebSocket.OPEN) return;
+    try {
+      dialed.ws.send(
+        dialed.encodeFrame({
+          type: "session_connect",
+          payload: {
+            ...(dialed.actorArn ? { actor_id: dialed.actorArn } : {}),
+            surfaceType: dialed.surfaceType,
+            outpostId: dialed.outpostId,
+            appVersion: dialed.appVersion,
+            ...DESKTOP_CAPABILITIES,
+          },
+        }),
+      );
+    } catch { }
+  };
+  if (dialed.ws.readyState === WebSocket.OPEN) sendConnect();
+  else dialed.ws.once("open", sendConnect);
+}
+
 export async function listChatAgentsForKey(
   apiKey: string,
   proxyUrl?: string,
   webSocketFactory?: QuickWebSocketFactory,
 ): Promise<QuickChatAgentInfo[]> {
-  const { ws, encodeFrame, decodeFrame } = await dialQuickWebSocket({
+  const dialed = await dialQuickWebSocket({
     apiKey,
     workingSessionId: crypto.randomUUID(),
     proxyUrl,
     webSocketFactory,
   });
+  const { ws, encodeFrame, decodeFrame } = dialed;
+  scheduleControlSessionConnect(dialed);
 
   return new Promise<QuickChatAgentInfo[]>((resolve, reject) => {
     let settled = false;
@@ -439,12 +463,14 @@ export async function createAndPublishCodingAgentForKey(
   const name = opts?.name?.trim() || DEFAULT_CODING_AGENT_NAME;
   const description = opts?.description?.trim() || DEFAULT_CODING_AGENT_DESCRIPTION;
   const instructions = opts?.instructions?.trim() || DEFAULT_CODING_AGENT_INSTRUCTIONS;
-  const { ws, encodeFrame, decodeFrame } = await dialQuickWebSocket({
+  const dialed = await dialQuickWebSocket({
     apiKey,
     workingSessionId: crypto.randomUUID(),
     proxyUrl,
     webSocketFactory,
   });
+  const { ws, encodeFrame, decodeFrame } = dialed;
+  scheduleControlSessionConnect(dialed);
 
   return new Promise<{ agentId: string; name: string }>((resolve, reject) => {
     let settled = false;
@@ -563,12 +589,14 @@ export async function updateAndPublishAgentForKey(
   const cleanId = normalizeChatAgentShortId(agentId);
   if (!cleanId) throw new GatewayError("`agentId` is required.", 400, "invalid_request_error");
   const instructions = opts.instructions.trim();
-  const { ws, encodeFrame, decodeFrame } = await dialQuickWebSocket({
+  const dialed = await dialQuickWebSocket({
     apiKey,
     workingSessionId: crypto.randomUUID(),
     proxyUrl,
     webSocketFactory,
   });
+  const { ws, encodeFrame, decodeFrame } = dialed;
+  scheduleControlSessionConnect(dialed);
 
   return new Promise<{ agentId: string }>((resolve, reject) => {
     let settled = false;

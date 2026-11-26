@@ -26,8 +26,9 @@ export function classifyUpstreamError(finalErr: GatewayError): {
     /thread.?expired|session.?expired|conversation.?expired/i.test(lower);
   // Check proxy/transport errors BEFORE auth so `Proxy CONNECT failed (407 Proxy Authentication Required)`
   // and `SOCKS5 username/password authentication failed` never permanently disable a healthy AWS account.
+  // Never match `Unexpected server response: 401/403/429` here so WS 401 triggers OAuth refresh & WS 429 triggers rate-limit backoff.
   const isExplicitProxyOrNetErr =
-    /proxy connect failed|socks5.*(?:authentication|handshake|connect)|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower);
+    /proxy connect failed|socks5.*(?:authentication|handshake|connect)|econnrefused|econnreset|etimedout|socket hang up|unexpected server response:\s*(?:5\d\d|407|408)|websocket closed \(1006\)|opening handshake has timed out/i.test(lower);
   const isExplicitOverloadErr =
     finalErr.status === 529 ||
     finalErr.code === "overloaded" ||
@@ -48,7 +49,7 @@ export function classifyUpstreamError(finalErr: GatewayError): {
     !isQuotaErr &&
     (isConnLimitErr ||
       finalErr.status === 429 ||
-      /rate.?limit|too many requests|toomanyrequestsexception|throttl/i.test(lower));
+      /unexpected server response:\s*429|rate.?limit|too many requests|toomanyrequestsexception|throttl/i.test(lower));
   const isAuthErr =
     !isExplicitProxyOrNetErr &&
     !isExplicitOverloadErr &&
@@ -58,14 +59,15 @@ export function classifyUpstreamError(finalErr: GatewayError): {
     !isSessionLifecycleErr &&
     (finalErr.status === 401 ||
       finalErr.status === 403 ||
-      /unauthorized|invalid.?grant|invalid.?client|unauthorized.?client|expired.?token|invalid refresh token|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
+      /unexpected server response:\s*(?:401|403)|oidc refresh_token failed \((?:401|403)\)|unauthorized|invalid.?grant|invalid.?client|unauthorized.?client|expired.?token|invalid refresh token|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
   const isProxyOrConnErr =
-    isExplicitProxyOrNetErr ||
-    isExplicitOverloadErr ||
-    (!isQuotaErr &&
-      !isRateLimitErr &&
-      !isAuthErr &&
-      (finalErr.status === 502 || finalErr.status === 503 || finalErr.status === 504));
+    !isPayloadOrContextSizeErr &&
+    (isExplicitProxyOrNetErr ||
+      isExplicitOverloadErr ||
+      (!isQuotaErr &&
+        !isRateLimitErr &&
+        !isAuthErr &&
+        (finalErr.status === 502 || finalErr.status === 503 || finalErr.status === 504)));
 
   return {
     isConnLimitErr,

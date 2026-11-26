@@ -15,6 +15,7 @@ import { extendHashWithAssistantTurn } from "../utils/hash.js";
 import { appendWsRecvBuf, type QuickAttachment } from "./media-utils.js";
 import type { StreamingToolCallFilter } from "./tool-bridge.js";
 import { buildOutboundChatFrame, type OutboundEditBranch } from "./turn-frame-builder.js";
+import type { StreamingToolCallEvent } from "./tool-bridge.js";
 import { TurnProtocolTracker } from "./turn-protocol-state.js";
 import {
   GatewayError,
@@ -51,6 +52,8 @@ export { parseRoutedModelThinkingMode, type RoutedModelThinkingMode };
 export interface RunTurnStreamParams {
   ws: WebSocket;
   isReusedOpenWs: boolean;
+  /** True when `ws` was adopted from the pre-warmed standby pool (enables fast 10s first-response liveness guard). */
+  isStandbyWs?: boolean;
   /** True when `session_connect` was already sent during speculative parallel dial (awaiting `session_established`). */
   preSessionConnectSent?: boolean;
   /** Any raw WS chunks received during speculative parallel dial before `runTurnStream` attached listeners. */
@@ -114,6 +117,7 @@ export async function* runTurnStream(
   const {
     ws,
     isReusedOpenWs,
+    isStandbyWs,
     preSessionConnectSent,
     preBufferedFrames,
     encodeFrame,
@@ -204,6 +208,7 @@ export async function* runTurnStream(
   let handshakeTimer: NodeJS.Timeout | null = null;
   let chunkAdvanceTimer: NodeJS.Timeout | null = null;
   let idleTimer: NodeJS.Timeout | null = null;
+  let standbyLivenessTimer: NodeJS.Timeout | null = null;
   const idleTimeoutMs = runIdleTimeoutMs > 0 ? runIdleTimeoutMs : 0;
 
   const clearPing = () => {
@@ -234,11 +239,18 @@ export async function* runTurnStream(
       idleTimer = null;
     }
   };
+  const clearStandbyLivenessTimer = () => {
+    if (standbyLivenessTimer) {
+      clearTimeout(standbyLivenessTimer);
+      standbyLivenessTimer = null;
+    }
+  };
   const clearAllStreamTimers = () => {
     clearPing();
     clearPostUsageTimer();
     clearAuxTimers();
     clearIdleTimer();
+    clearStandbyLivenessTimer();
   };
   const touchIdleTimer = () => {
     if (!idleTimeoutMs || ended) return;
@@ -389,11 +401,72 @@ export async function* runTurnStream(
     push({ type: "text", text: chunk });
   };
 
+  const rawToolChoiceObjForStream =
+    turn.rawBody?.tool_choice && typeof turn.rawBody.tool_choice === "object"
+      ? (turn.rawBody.tool_choice as { disable_parallel_tool_use?: unknown })
+      : undefined;
+  const singleToolOnly =
+    turn.rawBody?.parallel_tool_calls === false ||
+    rawToolChoiceObjForStream?.disable_parallel_tool_use === true;
+  const allowedStreamToolIndices = new Set<number>();
+  const completedStreamToolCalls: import("./types.js").NormalizedToolCall[] = [];
+  let trimmedParallelToolCalls = false;
+  let hasEmittedToolCall = false;
+
+  const flushBufferedTextBeforeToolCall = () => {
+    if (usageLimitPrefixBuf) {
+      usageLimitChecked = true;
+      flushPendingRoutedThinking();
+      const flushed = usageLimitPrefixBuf;
+      usageLimitPrefixBuf = "";
+      if (flushed) {
+        hasEmittedText = true;
+        assistantOutputText += flushed;
+        push({ type: "text", text: flushed });
+      }
+    } else {
+      usageLimitChecked = true;
+      flushPendingRoutedThinking();
+    }
+    const pendingUi = uiTagSanitizer.flush();
+    if (pendingUi) {
+      hasEmittedText = true;
+      assistantOutputText += pendingUi;
+      push({ type: "text", text: pendingUi });
+    }
+  };
+
+  const emitStreamingToolEvents = (
+    toolEvents: readonly StreamingToolCallEvent[],
+    onBeforeToolStart?: () => void,
+  ) => {
+    for (const te of toolEvents) {
+      if (te.kind === "tool_call_start") {
+        if (singleToolOnly && allowedStreamToolIndices.size >= 1) {
+          trimmedParallelToolCalls = true;
+          continue;
+        }
+        allowedStreamToolIndices.add(te.index);
+        onBeforeToolStart?.();
+        flushBufferedTextBeforeToolCall();
+        hasEmittedToolCall = true;
+        push({ type: "tool_call_start", index: te.index, id: te.id, name: te.name });
+      } else if (te.kind === "tool_call_delta") {
+        if (!allowedStreamToolIndices.has(te.index)) continue;
+        push({ type: "tool_call_delta", index: te.index, id: te.id, argumentsDelta: te.argumentsDelta });
+      } else if (te.kind === "tool_call_end") {
+        if (!allowedStreamToolIndices.has(te.index)) continue;
+        completedStreamToolCalls.push(te.call);
+        push({ type: "tool_call_end", index: te.index, call: te.call });
+      }
+    }
+  };
+
   const finalizeTurn = (realThreadId: string, allowParkWs = true) => {
     if (ended) return;
     clearAllStreamTimers();
     if (usageLimitPrefixBuf) {
-      if (!sawRealThinking && isPseudo200UsageLimitText(usageLimitPrefixBuf)) {
+      if (!sawRealThinking && !hasEmittedToolCall && isPseudo200UsageLimitText(usageLimitPrefixBuf)) {
         usageLimitPrefixBuf = "";
         pendingRoutedThinking = null;
         abortPseudo200QuotaLimit();
@@ -412,34 +485,16 @@ export async function* runTurnStream(
     }
     let stopReason: "stop" | "tool_calls" = "stop";
     let emittedToolCalls: Array<{ id: string; name: string }> = [];
-    let pendingToolCalls: import("./types.js").NormalizedToolCall[] = [];
-    let trimmedParallelToolCalls = false;
     if (toolFilter) {
-      const { remainingText, toolCalls } = toolFilter.flush();
+      const { remainingText, events: finalToolEvents } = toolFilter.flushIncremental();
       const cleanRem = remainingText ? uiTagSanitizer.feed(remainingText) : remainingText;
       if (cleanRem) {
         hasEmittedText = true;
         assistantOutputText += cleanRem;
         push({ type: "text", text: cleanRem });
       }
-      if (toolCalls.length > 0) {
-        const rawToolChoiceObj =
-          turn.rawBody?.tool_choice && typeof turn.rawBody.tool_choice === "object"
-            ? (turn.rawBody.tool_choice as { disable_parallel_tool_use?: unknown })
-            : undefined;
-        const singleToolOnly =
-          turn.rawBody?.parallel_tool_calls === false ||
-          rawToolChoiceObj?.disable_parallel_tool_use === true;
-        if (singleToolOnly && toolCalls.length > 1) {
-          trimmedParallelToolCalls = true;
-        }
-        const effectiveCalls = trimmedParallelToolCalls ? toolCalls.slice(0, 1) : toolCalls;
-        pendingToolCalls = effectiveCalls;
-        emittedToolCalls = effectiveCalls.map((tc) => {
-          const matchedTool = turn.tools.find((t) => t.name === tc.name || t.wireName === tc.name);
-          return { id: tc.id, name: matchedTool?.name || tc.name };
-        });
-        stopReason = "tool_calls";
+      if (finalToolEvents.length > 0) {
+        emitStreamingToolEvents(finalToolEvents);
       }
     }
     const tailText = uiTagSanitizer.flush();
@@ -458,8 +513,12 @@ export async function* runTurnStream(
         actualRoutedModel: corrected,
       });
     }
-    if (pendingToolCalls.length > 0) {
-      push({ type: "tool_calls", calls: pendingToolCalls });
+    if (completedStreamToolCalls.length > 0) {
+      emittedToolCalls = completedStreamToolCalls.map((tc) => {
+        const matchedTool = turn.tools.find((t) => t.name === tc.name || t.wireName === tc.name);
+        return { id: tc.id, name: matchedTool?.name || tc.name };
+      });
+      stopReason = "tool_calls";
     }
     flushAggregatedTurnUsage();
     let parkedForReuse = false;
@@ -581,6 +640,7 @@ export async function* runTurnStream(
   const maxThinkingOnlyMs = runIdleTimeoutMs > 0 ? runIdleTimeoutMs : 600_000;
   const onWsPong = () => {
     missedPongs = 0;
+    clearStandbyLivenessTimer();
   };
   ws.on("pong", onWsPong);
 
@@ -626,6 +686,7 @@ export async function* runTurnStream(
   const onWsMessage = (data: Buffer) => {
     if (ended) return;
     missedPongs = 0;
+    clearStandbyLivenessTimer();
     let drainedMessages;
     try {
       recvBuf = appendWsRecvBuf(recvBuf, data);
@@ -871,7 +932,13 @@ export async function* runTurnStream(
         const delta = String(payload.delta || "");
         if (delta) {
           touchIdleTimer();
-          const afterTools = toolFilter ? toolFilter.feed(delta) : delta;
+          let afterTools = delta;
+          let toolEvents: StreamingToolCallEvent[] = [];
+          if (toolFilter) {
+            const inc = toolFilter.feedIncremental(delta);
+            afterTools = inc.text;
+            toolEvents = inc.events;
+          }
           const emitText = afterTools ? uiTagSanitizer.feed(afterTools) : afterTools;
           if (emitText) {
             if (canEmitRoutedThinking()) {
@@ -880,6 +947,15 @@ export async function* runTurnStream(
               else emitOrDeferRoutedThinking(undefined, false);
             }
             emitGuardedText(emitText);
+          }
+          if (toolEvents.length > 0) {
+            emitStreamingToolEvents(toolEvents, () => {
+              if (canEmitRoutedThinking()) {
+                if (resolvedModelId) emitOrDeferRoutedThinking(resolvedModelId, true);
+                else if (observedModelHint) emitOrDeferRoutedThinking(observedModelHint, false);
+                else emitOrDeferRoutedThinking(undefined, false);
+              }
+            });
           }
         }
         rearmPostUsageIfNeeded();
@@ -1065,6 +1141,12 @@ export async function* runTurnStream(
   const onWsClose = (code: number, reason: Buffer) => {
     clearAllStreamTimers();
     if (!ended) {
+      // If upstream already delivered usage & text/tool call (with no pending cloud tools) and dropped the
+      // socket right before `turn_complete`, finalize cleanly instead of failing the turn with 502.
+      if (proto.hasUsage() && !proto.hasActiveCloudTools() && (hasEmittedText || hasEmittedToolCall || usageLimitPrefixBuf.length > 0)) {
+        finalizeTurn(activeKernelThreadId || threadId, false);
+        return;
+      }
       ended = true;
       push({ type: "__error", error: new GatewayError(`WebSocket closed (${code}): ${reason.toString("utf8")}`, 502, "upstream_error") });
     }
@@ -1076,6 +1158,11 @@ export async function* runTurnStream(
   ws.once("close", onWsClose);
 
   try {
+    if (!ended && (ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED)) {
+      clearAllStreamTimers();
+      ended = true;
+      push({ type: "__error", error: new GatewayError("WebSocket closed before turn dispatch", 502, "upstream_error") });
+    }
     if (!ended && preBufferedFrames && preBufferedFrames.length > 0) {
       for (const frameBuf of preBufferedFrames) {
         if (!ended) onWsMessage(frameBuf);
@@ -1084,18 +1171,43 @@ export async function* runTurnStream(
     if (!ended) {
       if (isReusedOpenWs && ws.readyState === WebSocket.OPEN) {
         startTurnPing();
+        if (isStandbyWs) {
+          // Fast half-open proxy detection: probe immediately with a WS ping and fail over in <=10s
+          // if neither a pong nor any upstream frame arrives (prevents 90s+ dead NAT socket stalls).
+          try {
+            ws.ping();
+          } catch { }
+          standbyLivenessTimer = setTimeout(() => {
+            if (!ended) {
+              clearAllStreamTimers();
+              ended = true;
+              push({
+                type: "__error",
+                error: new GatewayError("Adopted standby WebSocket unresponsive (half-open proxy socket).", 502, "upstream_error"),
+              });
+              try {
+                ws.terminate();
+              } catch { }
+            }
+          }, 10_000);
+          standbyLivenessTimer.unref?.();
+        }
         if (!initialChunkSent) triggerInitialSend();
       } else if (preSessionConnectSent && ws.readyState === WebSocket.OPEN) {
         startTurnPing();
         if (!initialChunkSent) {
-          handshakeTimer = setTimeout(() => {
-            try {
-              triggerInitialSend();
-            } catch (sendErr) {
-              onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
-            }
-          }, 200);
-          handshakeTimer.unref?.();
+          if (!isWeb) {
+            triggerInitialSend();
+          } else {
+            handshakeTimer = setTimeout(() => {
+              try {
+                triggerInitialSend();
+              } catch (sendErr) {
+                onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+              }
+            }, 200);
+            handshakeTimer.unref?.();
+          }
         }
       } else {
         const sendConnectAndSchedule = () => {
@@ -1119,14 +1231,20 @@ export async function* runTurnStream(
               ws.send(encodeFrame({ type: "federate_status", payload: {} }));
             }
             startTurnPing();
-            handshakeTimer = setTimeout(() => {
-              try {
-                triggerInitialSend();
-              } catch (sendErr) {
-                onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
-              }
-            }, 200);
-            handshakeTimer.unref?.();
+            if (!isWeb) {
+              // Live-verified on AWS Quick desktop WS: pipelining `user_message` immediately after
+              // `session_connect` + `federate_status` eliminates a full handshake RTT (~350-512ms).
+              triggerInitialSend();
+            } else {
+              handshakeTimer = setTimeout(() => {
+                try {
+                  triggerInitialSend();
+                } catch (sendErr) {
+                  onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+                }
+              }, 200);
+              handshakeTimer.unref?.();
+            }
           } catch (openSendErr) {
             onWsError(openSendErr instanceof Error ? openSendErr : new Error(String(openSendErr)));
           }

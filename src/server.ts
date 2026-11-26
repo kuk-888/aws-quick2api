@@ -463,6 +463,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
   keyPool.setOnSlotInvalidated((slotId) => {
     engine.invalidateWarmSessionsForSlot(slotId);
   });
+  keyPool.setOnSlotRekeyed((oldSlotId, newSlotId) => {
+    engine.rekeyWarmSessionsForSlot(oldSlotId, newSlotId);
+  });
 
   /** Reject unknown base model ids with 404 before any account-pool / spend-guard logic runs. Does not touch pool scheduling state. */
   async function assertModelExists(requestedModel: string): Promise<void> {
@@ -498,6 +501,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       for await (const ev of events) {
         if (ev.type === "thinking") traceLogger.recordThinkingDelta(traceId, ev.text);
         else if (ev.type === "text") traceLogger.recordTextDelta(traceId, ev.text);
+        else if (ev.type === "tool_call_start") traceLogger.recordToolCallStart(traceId);
+        else if (ev.type === "tool_call_end") traceLogger.recordToolCallCompleted(traceId);
         else if (ev.type === "tool_calls") traceLogger.recordToolCalls(traceId, ev.calls);
         else if (ev.type === "usage") {
           traceLogger.recordUsage(traceId, ev.metrics);
@@ -1193,6 +1198,11 @@ if (isMain) {
         lbStrategy: config.lbStrategy
       })
     );
+    // Non-blocking staggered standby WS + OAuth token pre-warm after listen.
+    const standbyStartTimer = setTimeout(() => {
+      instance.engine.warmStandbyPool(instance.keyPool);
+    }, 1_500);
+    standbyStartTimer.unref?.();
   });
 
   process.on("unhandledRejection", (reason) => {

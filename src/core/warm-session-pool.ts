@@ -1,16 +1,36 @@
 import WebSocket from "ws";
 import { resolveOAuthAccessToken } from "../aws-quick/oauth-client.js";
 import { parseQuickCredential } from "../aws-quick/outpost-singleton.js";
-import type { QuickFrameEncoder } from "../aws-quick/ws-transport.js";
+import type { QuickFrameDecoder, QuickFrameEncoder } from "../aws-quick/ws-transport.js";
 
 const WARM_THREAD_TTL_MS = 30 * 60 * 1000;
 const PARKED_WS_IDLE_TTL_MS = 15 * 60 * 1000;
+const STANDBY_WS_IDLE_TTL_MS = 10 * 60 * 1000;
 const PARKED_WS_TOKEN_REFRESH_MS = 12 * 60 * 1000;
 const MAX_WARM_THREADS = 256;
 const MIN_PARKED_WS = 64;
+const MAX_STANDBY_WS_GLOBAL = 16;
 // AWS Quick enforces a hard limit of 5 active WebSockets per account (`LimitExceededException`).
-// Keep at most 2 idle parked sockets per slot so burst concurrency + retries always have headroom.
+// Keep at most 2 idle parked conversation sockets + 1 replaceable standby pre-warmed socket per slot
+// (strictly enforcing active + parked + standby <= 4, and evicting standby FIRST under load).
 export const MAX_PARKED_WS_PER_SLOT = 2;
+
+export interface StandbyWsHandle {
+  ws: WebSocket;
+  outpostId: string;
+  encodeFrame: QuickFrameEncoder;
+  decodeFrame: QuickFrameDecoder;
+  surfaceType: string;
+  appVersion: string;
+  surfaceName: "web" | "desktop";
+  actorArn?: string;
+}
+
+interface InternalStandbyEntry extends StandbyWsHandle {
+  slotId: string;
+  isIncognito: boolean;
+  parked: ParkedWsHandle;
+}
 
 interface ParkedWsHandle {
   ws: WebSocket;
@@ -50,6 +70,8 @@ export class WarmSessionPool {
   private readonly maxParkedWs: number;
   private readonly warmSessionTtlMs: number;
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
+  private readonly standbyBySlot = new Map<string, InternalStandbyEntry>();
+  private readonly standbyPendingSlots = new Set<string>();
   private readonly activeWsBySlot = new Map<string, number>();
   private readonly evictSettlingUntilBySlot = new Map<string, number>();
   private readonly slotGeneration = new Map<string, number>();
@@ -84,6 +106,10 @@ export class WarmSessionPool {
       this.removeEntry(entry, true);
       invalidated += 1;
     }
+    if (this.evictStandbyWsForSlot(slotId) > 0) {
+      closedParked += 1;
+      invalidated += 1;
+    }
     if (closedParked > 0) {
       this.evictSettlingUntilBySlot.set(
         slotId,
@@ -106,11 +132,64 @@ export class WarmSessionPool {
       this.removeEntry(entry, true);
       invalidated += 1;
     }
+    for (const [sid, st] of this.standbyBySlot.entries()) {
+      this.standbyBySlot.delete(sid);
+      this.detachParkedWs(st.parked, true);
+      closedSlots.add(sid);
+      invalidated += 1;
+    }
     const settleUntil = Date.now() + 150;
     for (const sid of closedSlots) {
       this.evictSettlingUntilBySlot.set(sid, Math.max(this.evictSettlingUntilBySlot.get(sid) || 0, settleUntil));
     }
     return invalidated;
+  }
+
+  /**
+   * Migrates warm threads, parked sockets, standby sockets, and active WS accounting when an
+   * OAuth account's single-use refresh token rotates (same account, new `slotId`).
+   */
+  rekeySlot(oldSlotId: string, newSlotId: string): void {
+    if (!oldSlotId || !newSlotId || oldSlotId === newSlotId) return;
+    const oldMarker = `|${oldSlotId}|`;
+    const newMarker = `|${newSlotId}|`;
+    for (const entry of new Set(this.warmThreads.values())) {
+      if (entry.slotId !== oldSlotId) continue;
+      for (const k of entry.siblingKeys) {
+        if (this.warmThreads.get(k) === entry) this.warmThreads.delete(k);
+      }
+      entry.slotId = newSlotId;
+      entry.siblingKeys = entry.siblingKeys.map((k) => k.replace(oldMarker, newMarker));
+      for (const k of entry.siblingKeys) {
+        this.warmThreads.set(k, entry);
+      }
+    }
+    const standby = this.standbyBySlot.get(oldSlotId);
+    if (standby) {
+      this.standbyBySlot.delete(oldSlotId);
+      const prevNew = this.standbyBySlot.get(newSlotId);
+      if (prevNew) this.detachParkedWs(prevNew.parked, true);
+      standby.slotId = newSlotId;
+      this.standbyBySlot.set(newSlotId, standby);
+    }
+    if (this.standbyPendingSlots.delete(oldSlotId)) {
+      this.standbyPendingSlots.add(newSlotId);
+    }
+    const active = this.activeWsBySlot.get(oldSlotId);
+    if (active) {
+      this.activeWsBySlot.delete(oldSlotId);
+      this.activeWsBySlot.set(newSlotId, (this.activeWsBySlot.get(newSlotId) || 0) + active);
+    }
+    const settle = this.evictSettlingUntilBySlot.get(oldSlotId);
+    if (settle) {
+      this.evictSettlingUntilBySlot.delete(oldSlotId);
+      this.evictSettlingUntilBySlot.set(newSlotId, Math.max(this.evictSettlingUntilBySlot.get(newSlotId) || 0, settle));
+    }
+    const gen = this.slotGeneration.get(oldSlotId);
+    if (gen !== undefined) {
+      this.slotGeneration.delete(oldSlotId);
+      this.slotGeneration.set(newSlotId, Math.max(this.slotGeneration.get(newSlotId) || 0, gen));
+    }
   }
 
   private warmKey(
@@ -194,8 +273,201 @@ export class WarmSessionPool {
     return n;
   }
 
+  countStandbyWs(): number {
+    let n = 0;
+    for (const entry of this.standbyBySlot.values()) {
+      if (entry.ws.readyState === WebSocket.OPEN) n += 1;
+    }
+    return n;
+  }
+
+  hasOpenStandby(slotId: string, isIncognito?: boolean): boolean {
+    const entry = this.standbyBySlot.get(slotId);
+    if (!entry) return false;
+    if (entry.ws.readyState !== WebSocket.OPEN) return false;
+    if (isIncognito !== undefined && entry.isIncognito !== isIncognito) return false;
+    return true;
+  }
+
+  countIdleWsForSlot(slotId: string): number {
+    return this.countParkedWsForSlot(slotId) + (this.hasOpenStandby(slotId) ? 1 : 0);
+  }
+
+  tryClaimStandbyDial(slotId: string): boolean {
+    if (this.standbyPendingSlots.has(slotId)) return false;
+    this.standbyPendingSlots.add(slotId);
+    return true;
+  }
+
+  releaseStandbyDial(slotId: string): void {
+    this.standbyPendingSlots.delete(slotId);
+  }
+
+  evictStandbyWsForSlot(slotId: string): number {
+    const entry = this.standbyBySlot.get(slotId);
+    if (!entry) return 0;
+    this.standbyBySlot.delete(slotId);
+    this.detachParkedWs(entry.parked, true);
+    this.evictSettlingUntilBySlot.set(
+      slotId,
+      Math.max(this.evictSettlingUntilBySlot.get(slotId) || 0, Date.now() + 150),
+    );
+    return 1;
+  }
+
+  /**
+   * Stores a pre-warmed, `session_established` WebSocket ready for instant cold-turn adoption.
+   * Returns `true` if stored; returns `false` if rejected (caller should close `ws`).
+   */
+  storeStandby(params: {
+    slotId: string;
+    isIncognito: boolean;
+    expectedGeneration?: number;
+    handle: StandbyWsHandle;
+    apiKey?: string;
+    proxyUrl?: string;
+  }): boolean {
+    const { slotId, isIncognito, expectedGeneration, handle, apiKey, proxyUrl } = params;
+    const { ws, outpostId, encodeFrame } = handle;
+    if (ws.readyState !== WebSocket.OPEN) return false;
+    if (expectedGeneration !== undefined && expectedGeneration !== this.getSlotGeneration(slotId)) {
+      return false;
+    }
+    // Strictly respect AWS's 5-WS/account cap: keep at least 1 headroom slot free for concurrent traffic.
+    if (this.getActiveWsCount(slotId) + this.countParkedWsForSlot(slotId) > 3) {
+      return false;
+    }
+    const existing = this.standbyBySlot.get(slotId);
+    if (existing) {
+      this.standbyBySlot.delete(slotId);
+      this.detachParkedWs(existing.parked, true);
+    }
+    while (this.countStandbyWs() >= MAX_STANDBY_WS_GLOBAL) {
+      const oldestSid = this.standbyBySlot.keys().next().value;
+      if (!oldestSid) break;
+      this.evictStandbyWsForSlot(oldestSid);
+    }
+
+    let entryRef: InternalStandbyEntry | undefined;
+    const handleDeadStandby = () => {
+      if (!entryRef) return;
+      if (this.standbyBySlot.get(entryRef.slotId) === entryRef) {
+        this.standbyBySlot.delete(entryRef.slotId);
+      }
+      this.detachParkedWs(entryRef.parked, true);
+    };
+    const onIdleClose = () => handleDeadStandby();
+    const onIdleError = () => handleDeadStandby();
+    let missedPongs = 0;
+    const onIdleMessage = () => {
+      missedPongs = 0;
+    };
+    const onIdlePong = () => {
+      missedPongs = 0;
+    };
+
+    const pingTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        handleDeadStandby();
+        return;
+      }
+      if (missedPongs >= 2) {
+        try {
+          ws.terminate();
+        } catch { }
+        handleDeadStandby();
+        return;
+      }
+      missedPongs += 1;
+      try {
+        ws.ping();
+        ws.send(encodeFrame({ type: "ping", payload: { timestamp: Date.now() } }));
+      } catch {
+        handleDeadStandby();
+      }
+    }, 15_000);
+    pingTimer.unref?.();
+
+    let tokenRefreshTimer: NodeJS.Timeout | undefined;
+    const parsedForRefresh = apiKey ? parseQuickCredential(apiKey) : undefined;
+    if (parsedForRefresh?.mode === "oauth" && parsedForRefresh.oauth) {
+      const oauthCred = parsedForRefresh.oauth;
+      tokenRefreshTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN || !entryRef || this.standbyBySlot.get(entryRef.slotId) !== entryRef) {
+          handleDeadStandby();
+          return;
+        }
+        void resolveOAuthAccessToken(oauthCred, false, proxyUrl)
+          .then(({ accessToken }) => {
+            if (ws.readyState === WebSocket.OPEN && entryRef && this.standbyBySlot.get(entryRef.slotId) === entryRef) {
+              ws.send(encodeFrame({ type: "token_refresh", token: accessToken }));
+            }
+          })
+          .catch(() => {
+            handleDeadStandby();
+          });
+      }, PARKED_WS_TOKEN_REFRESH_MS);
+      tokenRefreshTimer.unref?.();
+    }
+
+    const idleTimer = setTimeout(() => handleDeadStandby(), STANDBY_WS_IDLE_TTL_MS);
+    idleTimer.unref?.();
+
+    ws.on("close", onIdleClose);
+    ws.on("error", onIdleError);
+    ws.on("message", onIdleMessage);
+    ws.on("pong", onIdlePong);
+
+    entryRef = {
+      ...handle,
+      slotId,
+      isIncognito,
+      parked: {
+        ws,
+        outpostId: outpostId || "web0",
+        pingTimer,
+        idleTimer,
+        tokenRefreshTimer,
+        onIdleClose,
+        onIdleError,
+        onIdleMessage,
+        onIdlePong,
+      },
+    };
+    this.standbyBySlot.set(slotId, entryRef);
+    return true;
+  }
+
+  /**
+   * Atomically pops a pre-warmed standby WS for `slotId` matching `isIncognito`.
+   */
+  takeStandby(slotId: string, isIncognito: boolean): StandbyWsHandle | undefined {
+    const entry = this.standbyBySlot.get(slotId);
+    if (!entry) return undefined;
+    this.standbyBySlot.delete(slotId);
+    if (entry.isIncognito !== isIncognito || entry.ws.readyState !== WebSocket.OPEN) {
+      this.detachParkedWs(entry.parked, true);
+      return undefined;
+    }
+    this.detachParkedWs(entry.parked, false);
+    return {
+      ws: entry.ws,
+      outpostId: entry.outpostId,
+      encodeFrame: entry.encodeFrame,
+      decodeFrame: entry.decodeFrame,
+      surfaceType: entry.surfaceType,
+      appVersion: entry.appVersion,
+      surfaceName: entry.surfaceName,
+      actorArn: entry.actorArn,
+    };
+  }
+
   evictParkedWsForSlot(slotId: string, maxEvict = 1): number {
     let evicted = 0;
+    // Always evict replaceable standby sockets FIRST before touching conversation-bound parked sockets.
+    if (evicted < maxEvict && this.standbyBySlot.has(slotId)) {
+      evicted += this.evictStandbyWsForSlot(slotId);
+    }
     for (const existing of new Set(this.warmThreads.values())) {
       if (evicted >= maxEvict) break;
       if (existing.slotId !== slotId || !existing.parkedWs) continue;
@@ -347,7 +619,10 @@ export class WarmSessionPool {
     // Only park the live WS for reuse when the account has headroom below AWS's 5-WS hard limit.
     // Note: `activeWsBySlot` still includes the current finishing WS until `finally` decrements it.
     const activeOnSlot = this.activeWsBySlot.get(slotId) || 0;
-    const allowParkUnderLoad = activeOnSlot + this.countParkedWsForSlot(slotId) <= 4;
+    if (ws && ws.readyState === WebSocket.OPEN && encodeFrame && activeOnSlot + this.countIdleWsForSlot(slotId) > 4) {
+      this.evictStandbyWsForSlot(slotId);
+    }
+    const allowParkUnderLoad = activeOnSlot + this.countIdleWsForSlot(slotId) <= 4;
     if (ws && ws.readyState === WebSocket.OPEN && encodeFrame && allowParkUnderLoad) {
       while (this.countParkedWsForSlot(slotId) >= MAX_PARKED_WS_PER_SLOT) {
         if (this.evictParkedWsForSlot(slotId, 1) === 0) break;
@@ -475,18 +750,30 @@ export class WarmSessionPool {
     for (const entry of new Set(this.warmThreads.values())) {
       if (entry.expiresAt <= now) this.removeEntry(entry, true);
     }
+    for (const [sid, st] of this.standbyBySlot.entries()) {
+      if (st.ws.readyState !== WebSocket.OPEN) {
+        this.standbyBySlot.delete(sid);
+        this.detachParkedWs(st.parked, true);
+      }
+    }
   }
 
   disposeAll(): void {
     for (const entry of new Set(this.warmThreads.values())) {
       this.removeEntry(entry, true);
     }
+    for (const [sid, st] of this.standbyBySlot.entries()) {
+      this.standbyBySlot.delete(sid);
+      this.detachParkedWs(st.parked, true);
+    }
+    this.standbyPendingSlots.clear();
   }
 
-  stats(): { warmIncrementalSessions: number; warmIdleSessions: number } {
+  stats(): { warmIncrementalSessions: number; warmIdleSessions: number; standbyWs: number } {
     return {
       warmIncrementalSessions: new Set(this.warmThreads.values()).size,
       warmIdleSessions: this.countParkedWs(),
+      standbyWs: this.countStandbyWs(),
     };
   }
 }

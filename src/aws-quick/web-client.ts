@@ -169,23 +169,41 @@ async function callWebQbsProxy(
     `?_method=${method}&surfaceType=WEB_EXPERIENCE&appVersion=qbiz-web-bridge` +
     `&mbtc=${mbtcEnc}&outpostId=web0&workingSessionId=${workingSessionId}`;
 
-  const resp = await fetchViaOptionalProxy(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Origin: "https://quick.aws.com",
-        Referer: "https://quick.aws.com/",
-        Cookie: cred.cookie,
-        "User-Agent": WEB_UA,
-        "x-amzn-csrf-token": mbtcEnc,
+  const bodyStr = JSON.stringify(bodyObj);
+  let resp!: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    resp = await fetchViaOptionalProxy(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Origin: "https://quick.aws.com",
+          Referer: "https://quick.aws.com/",
+          Cookie: cred.cookie,
+          "User-Agent": WEB_UA,
+          "x-amzn-csrf-token": mbtcEnc,
+        },
+        body: bodyStr,
+        ...(signal ? { signal } : {}),
       },
-      body: JSON.stringify(bodyObj),
-      ...(signal ? { signal } : {}),
-    },
-    proxyUrl,
-  );
+      proxyUrl,
+    );
+    if (
+      attempt === 0 &&
+      !signal?.aborted &&
+      (resp.status === 429 || (resp.status >= 500 && resp.status <= 599))
+    ) {
+      await resp.text().catch(() => "");
+      const backoffMs = 350 + Math.floor(Math.random() * 200);
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, backoffMs);
+        t.unref?.();
+      });
+      continue;
+    }
+    break;
+  }
 
   if (!resp.ok) {
     let summary = "";
@@ -307,23 +325,40 @@ export async function uploadWebBinaryAttachment(
     `/attachments/presigned-url?Operation=ConversationSendMessage` +
     `&filename=${encodeURIComponent(filename)}&mbtc=${mbtcEnc}`;
 
-  const upResp = await fetchViaOptionalProxy(
-    uploadUrl,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": normalizedMime,
-        Origin: "https://quick.aws.com",
-        Cookie: cred.cookie,
-        "User-Agent": WEB_UA,
-        "x-amzn-csrf-token": mbtcEnc,
-        "X-Quick-File-Name": encodeURIComponent(filename),
+  let upResp!: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    upResp = await fetchViaOptionalProxy(
+      uploadUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": normalizedMime,
+          Origin: "https://quick.aws.com",
+          Cookie: cred.cookie,
+          "User-Agent": WEB_UA,
+          "x-amzn-csrf-token": mbtcEnc,
+          "X-Quick-File-Name": encodeURIComponent(filename),
+        },
+        body: buf,
+        ...(signal ? { signal } : {}),
       },
-      body: buf,
-      ...(signal ? { signal } : {}),
-    },
-    proxyUrl,
-  );
+      proxyUrl,
+    );
+    if (
+      attempt === 0 &&
+      !signal?.aborted &&
+      (upResp.status === 429 || (upResp.status >= 500 && upResp.status <= 599))
+    ) {
+      await upResp.text().catch(() => "");
+      const backoffMs = 350 + Math.floor(Math.random() * 200);
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, backoffMs);
+        t.unref?.();
+      });
+      continue;
+    }
+    break;
+  }
   if (!upResp.ok) {
     const errText = await upResp.text().catch(() => "");
     throw new Error(`AWS Quick Web attachment upload failed (${upResp.status}): ${errText.slice(0, 200)}`);

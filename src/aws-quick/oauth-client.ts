@@ -722,76 +722,95 @@ export async function resolveOAuthAccessToken(
   const currentRefresh = cached?.refreshToken || cred.refreshToken;
   const currentExpiry = cached?.expiresAt || cred.expiresAt || 0;
 
+  const startRefresh = (): Promise<{ accessToken: string; expiresAt: number; rotatedRefreshToken?: string }> => {
+    const existing = inFlightRefresh.get(cred.clientId);
+    if (existing) return existing;
+
+    const refreshPromise = (async () => {
+      let resp!: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
+      let text = "";
+      for (let attempt = 0; attempt < 2; attempt++) {
+        resp = await fetchViaOptionalProxy(
+          `${oidcBaseUrl(cred.region)}/token`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              clientId: cred.clientId,
+              clientSecret: cred.clientSecret,
+              grantType: "refresh_token",
+              refreshToken: currentRefresh,
+            }),
+          },
+          proxyUrl,
+          { maxRetries: attempt === 0 ? 1 : 0 },
+        );
+        text = await resp.text();
+        if ((resp.status === 429 || resp.status >= 500) && attempt < 1) {
+          await sleepWithAbort(350 + Math.floor(Math.random() * 200));
+          continue;
+        }
+        break;
+      }
+      if (!resp.ok) {
+        throw new Error(`OIDC refresh_token failed (${resp.status}): ${text.slice(0, 240)}`);
+      }
+      const data = JSON.parse(text) as {
+        accessToken?: string;
+        refreshToken?: string;
+        expiresIn?: number;
+      };
+      if (!data.accessToken) {
+        throw new Error("OIDC refresh response missing accessToken.");
+      }
+      const nextRefresh = data.refreshToken || currentRefresh;
+      const nextExpiry = Date.now() + Math.max(300, Number(data.expiresIn || 3600)) * 1000;
+      tokenCache.set(cred.clientId, {
+        accessToken: data.accessToken,
+        refreshToken: nextRefresh,
+        expiresAt: nextExpiry,
+      });
+      const rotated = Boolean(data.refreshToken && data.refreshToken !== currentRefresh);
+      if (rotated && data.refreshToken) {
+        const ev: OAuthRefreshRotationEvent = {
+          clientId: cred.clientId,
+          rotatedRefreshToken: data.refreshToken,
+          accessToken: data.accessToken,
+          expiresAt: nextExpiry,
+        };
+        for (const listener of refreshRotationListeners) {
+          try {
+            listener(ev);
+          } catch {
+            // Never fail token resolution if persistence listener errors
+          }
+        }
+      }
+      return {
+        accessToken: data.accessToken,
+        expiresAt: nextExpiry,
+        ...(data.refreshToken && data.refreshToken !== cred.refreshToken
+          ? { rotatedRefreshToken: data.refreshToken }
+          : {}),
+      };
+    })().finally(() => {
+      inFlightRefresh.delete(cred.clientId);
+    });
+
+    inFlightRefresh.set(cred.clientId, refreshPromise);
+    return refreshPromise;
+  };
+
   if (!forceRefresh && currentAccess && currentExpiry > now + 300_000) {
+    // Proactive non-blocking background refresh when within 15 minutes of expiry so live turns
+    // never stall 0.7s-2.7s waiting for an inline OIDC token round-trip.
+    if (currentExpiry < now + 900_000 && !inFlightRefresh.has(cred.clientId)) {
+      void startRefresh().catch(() => { });
+    }
     return { accessToken: currentAccess, expiresAt: currentExpiry };
   }
 
-  const inflight = inFlightRefresh.get(cred.clientId);
-  if (inflight) return inflight;
-
-  const refreshPromise = (async () => {
-    const resp = await fetchViaOptionalProxy(
-      `${oidcBaseUrl(cred.region)}/token`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          clientId: cred.clientId,
-          clientSecret: cred.clientSecret,
-          grantType: "refresh_token",
-          refreshToken: currentRefresh,
-        }),
-      },
-      proxyUrl,
-    );
-    const text = await resp.text();
-    if (!resp.ok) {
-      throw new Error(`OIDC refresh_token failed (${resp.status}): ${text.slice(0, 240)}`);
-    }
-    const data = JSON.parse(text) as {
-      accessToken?: string;
-      refreshToken?: string;
-      expiresIn?: number;
-    };
-    if (!data.accessToken) {
-      throw new Error("OIDC refresh response missing accessToken.");
-    }
-    const nextRefresh = data.refreshToken || currentRefresh;
-    const nextExpiry = Date.now() + Math.max(300, Number(data.expiresIn || 3600)) * 1000;
-    tokenCache.set(cred.clientId, {
-      accessToken: data.accessToken,
-      refreshToken: nextRefresh,
-      expiresAt: nextExpiry,
-    });
-    const rotated = Boolean(data.refreshToken && data.refreshToken !== currentRefresh);
-    if (rotated && data.refreshToken) {
-      const ev: OAuthRefreshRotationEvent = {
-        clientId: cred.clientId,
-        rotatedRefreshToken: data.refreshToken,
-        accessToken: data.accessToken,
-        expiresAt: nextExpiry,
-      };
-      for (const listener of refreshRotationListeners) {
-        try {
-          listener(ev);
-        } catch {
-          // Never fail token resolution if persistence listener errors
-        }
-      }
-    }
-    return {
-      accessToken: data.accessToken,
-      expiresAt: nextExpiry,
-      ...(data.refreshToken && data.refreshToken !== cred.refreshToken
-        ? { rotatedRefreshToken: data.refreshToken }
-        : {}),
-    };
-  })().finally(() => {
-    inFlightRefresh.delete(cred.clientId);
-  });
-
-  inFlightRefresh.set(cred.clientId, refreshPromise);
-  return refreshPromise;
+  return startRefresh();
 }
 
 async function sleepWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1044,6 +1063,141 @@ function dlpPollDelayForAttempt(pollIndex: number): number {
  * AWS Quick's official 3-step AIDP attachment pipeline (`upload-attachment` -> `attachment-dlp-status`
  * -> `files/upload/{threadId}`), bypassing the 50KB WebSocket single-frame limit completely.
  */
+// Official AWS Quick AIDP `upload-attachment` contentType allowlist (verified live against upstream enum).
+const AWS_QUICK_UPLOAD_ALLOWED_MIMES = new Set([
+  "application/zip",
+  "video/x-ms-wmv",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "text/rtf",
+  "text/csv",
+  "text/x-python-script",
+  "video/x-m4v",
+  "video/quicktime",
+  "application/yaml",
+  "application/vnd.ms-outlook",
+  "application/json",
+  "text/plain",
+  "audio/x-m4a",
+  "video/x-msvideo",
+  "application/x-twbx",
+  "video/webm",
+  "text/html",
+  "text/x-java-source",
+  "text/javascript",
+  "application/msword",
+  "application/x-pbit",
+  "text/xslt+xml",
+  "application/vnd.ms-excel",
+  "application/vnd.ms-powerpoint",
+  "text/markdown",
+  "application/pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/vtt",
+  "application/x-pbix",
+  "video/x-matroska",
+  "image/png",
+  "text/xml",
+  "application/vnd.openxmlformats-officedocument.presentationml.template",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+  "audio/mp4",
+  "video/mpeg",
+  "application/x-yaml",
+  "image/jpeg",
+  "video/mp4",
+  "audio/mpeg",
+]);
+
+const AWS_QUICK_UPLOAD_MIME_ALIASES: Record<string, string> = {
+  "image/jpg": "image/jpeg",
+  "application/javascript": "text/javascript",
+  "application/x-javascript": "text/javascript",
+  "application/xml": "text/xml",
+  "text/yaml": "application/yaml",
+  "text/x-yaml": "application/yaml",
+  "text/x-python": "text/x-python-script",
+  "text/x-java": "text/x-java-source",
+  "application/rtf": "text/rtf",
+  "application/typescript": "text/plain",
+  "application/x-typescript": "text/plain",
+  "application/x-sh": "text/plain",
+  "application/x-httpd-php": "text/plain",
+  "application/toml": "text/plain",
+  "application/sql": "text/plain",
+  "application/graphql": "text/plain",
+};
+
+const AWS_QUICK_EXT_TO_MIME: Record<string, string> = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  json: "application/json",
+  md: "text/markdown",
+  markdown: "text/markdown",
+  csv: "text/csv",
+  xml: "text/xml",
+  html: "text/html",
+  htm: "text/html",
+  yaml: "application/yaml",
+  yml: "application/yaml",
+  py: "text/x-python-script",
+  java: "text/x-java-source",
+  js: "text/javascript",
+  mjs: "text/javascript",
+  cjs: "text/javascript",
+  rtf: "text/rtf",
+  vtt: "text/vtt",
+  zip: "application/zip",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  txt: "text/plain",
+  ts: "text/plain",
+  tsx: "text/plain",
+  jsx: "text/plain",
+  css: "text/plain",
+  scss: "text/plain",
+  less: "text/plain",
+  go: "text/plain",
+  rs: "text/plain",
+  c: "text/plain",
+  cpp: "text/plain",
+  h: "text/plain",
+  hpp: "text/plain",
+  sh: "text/plain",
+  bash: "text/plain",
+  zsh: "text/plain",
+  sql: "text/plain",
+  toml: "text/plain",
+  ini: "text/plain",
+  cfg: "text/plain",
+  conf: "text/plain",
+  log: "text/plain",
+  env: "text/plain",
+};
+
+/**
+ * Normalizes a client-supplied MIME type into AWS Quick's strict `upload-attachment` enum:
+ * - Maps known aliases (`image/jpg`, `application/xml`, `text/yaml`, etc.)
+ * - Maps any non-allowlisted `text/*` subtype (e.g. `text/typescript`, `text/css`) to `text/plain`
+ * - Resolves generic `application/octet-stream` using known file extensions
+ */
+export function normalizeOAuthUploadContentType(mimeType: string, filename?: string): string {
+  const base = (mimeType || "").split(";")[0]?.trim().toLowerCase() || "";
+  const aliased = AWS_QUICK_UPLOAD_MIME_ALIASES[base] || base;
+  if (aliased && AWS_QUICK_UPLOAD_ALLOWED_MIMES.has(aliased)) return aliased;
+  if (aliased.startsWith("text/")) return "text/plain";
+  if (!aliased || aliased === "application/octet-stream") {
+    const ext = (filename || "").split(".").pop()?.trim().toLowerCase() || "";
+    if (ext && AWS_QUICK_EXT_TO_MIME[ext]) return AWS_QUICK_EXT_TO_MIME[ext]!;
+  }
+  return aliased || "text/plain";
+}
+
 export async function uploadOAuthBinaryAttachment(
   cred: OAuthCredential,
   threadId: string,
@@ -1056,32 +1210,22 @@ export async function uploadOAuthBinaryAttachment(
   if (signal?.aborted) throw new Error("Attachment upload aborted by client.");
   let { accessToken } = await resolveOAuthAccessToken(cred, false, proxyUrl);
   const buf = Buffer.isBuffer(content) ? content : Buffer.from(content);
+  if (buf.byteLength === 0) {
+    throw new Error("upload-attachment failed (400): empty file (0 bytes) is not supported.");
+  }
   const contentSha256 = crypto.createHash("sha256").update(buf).digest("hex");
-  const normalizedMime = mimeType.trim().toLowerCase() || "application/octet-stream";
+  const normalizedMime = normalizeOAuthUploadContentType(mimeType, filename);
 
-  // Step 1: Upload raw bytes (with 1 forced-refresh retry on 401)
+  // Step 1: Upload raw bytes (with 1 forced-refresh retry on 401 + up to 2 jittered retries on transient 429/5xx)
   const upUrl =
     `https://${cred.wsHost}/integration/quick-work/upload-attachment` +
     `?name=${encodeURIComponent(filename)}` +
     `&contentType=${encodeURIComponent(normalizedMime)}` +
     `&contentLength=${buf.byteLength}`;
-  let upRes = await fetchViaOptionalProxy(
-    upUrl,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "User-Agent": QUICK_DESKTOP_USER_AGENT,
-        "Content-Type": "application/octet-stream",
-        "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
-      },
-      body: buf,
-      ...(signal ? { signal } : {}),
-    },
-    proxyUrl,
-  );
-  if (upRes.status === 401) {
-    ({ accessToken } = await resolveOAuthAccessToken(cred, true, proxyUrl));
+  let upRes!: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
+  let refreshedOnUpload401 = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (signal?.aborted) throw new Error("Attachment upload aborted by client.");
     upRes = await fetchViaOptionalProxy(
       upUrl,
       {
@@ -1097,9 +1241,23 @@ export async function uploadOAuthBinaryAttachment(
       },
       proxyUrl,
     );
+    if (upRes.status === 401 && !refreshedOnUpload401) {
+      refreshedOnUpload401 = true;
+      ({ accessToken } = await resolveOAuthAccessToken(cred, true, proxyUrl));
+      attempt -= 1;
+      continue;
+    }
+    if ((upRes.status === 429 || upRes.status >= 500) && attempt < 2) {
+      await upRes.text().catch(() => "");
+      await sleepWithAbort(400 * (attempt + 1) + Math.floor(Math.random() * 250), signal);
+      continue;
+    }
+    break;
   }
   if (!upRes.ok) {
-    throw new Error(`upload-attachment failed (${upRes.status})`);
+    const errBody = await upRes.text().catch(() => "");
+    const detail = errBody.replace(/\s+/g, " ").trim().slice(0, 260);
+    throw new Error(`upload-attachment failed (${upRes.status})${detail ? `: ${detail}` : ""}`);
   }
   const upJson = (await upRes.json()) as { attachmentId?: string; id?: string };
   const attachmentId = (upJson.attachmentId || upJson.id || "").trim();
