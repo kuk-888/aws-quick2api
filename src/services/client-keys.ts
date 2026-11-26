@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { normalizeAccountGroup } from "../core/key-pool.js";
 import { GatewayError, type GatewayConfig } from "../core/types.js";
 import { safeStringEquals } from "../utils/hash.js";
 import { normalizeBaseModelId } from "./model-access.js";
@@ -26,6 +27,8 @@ export interface ClientGatewayKeyView {
   enabled: boolean;
   allowAllModels: boolean;
   allowedModels: string[];
+  /** Optional bound account group for strict pool isolation (`null` = unrestricted global pool). */
+  accountGroup: string | null;
   /** Maximum total requests allowed; `null` = unlimited. */
   maxRequests: number | null;
   /** Max simultaneous in-flight requests for this key; `null` = use the gateway default (unlimited unless configured). */
@@ -46,6 +49,7 @@ interface InternalClientKey {
   enabled: boolean;
   allowAllModels: boolean;
   allowedModels: Set<string>;
+  accountGroup: string | null;
   maxRequests: number | null;
   maxConcurrent: number | null;
   expiresAt: string | null;
@@ -56,12 +60,13 @@ interface InternalClientKey {
 
 export type AuthenticatedClientIdentity =
   | {
-      kind: "gateway_key";
-      keyId: string;
-      keyName: string;
-      allowAllModels: boolean;
-      allowedModels: ReadonlySet<string>;
-    };
+    kind: "gateway_key";
+    keyId: string;
+    keyName: string;
+    allowAllModels: boolean;
+    allowedModels: ReadonlySet<string>;
+    accountGroup: string | null;
+  };
 
 function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex");
@@ -167,6 +172,14 @@ export class ClientGatewayKeyManager {
             } catch {
               expiresAt = null;
             }
+            let loadedGroup: string | null = null;
+            if (typeof rec.accountGroup === "string" && rec.accountGroup.trim()) {
+              try {
+                loadedGroup = normalizeAccountGroup(rec.accountGroup) ?? null;
+              } catch {
+                loadedGroup = null;
+              }
+            }
             this.keys.push({
               id: typeof rec.id === "string" && rec.id ? rec.id : `gk_${crypto.randomBytes(4).toString("hex")}`,
               name: typeof rec.name === "string" && rec.name.trim() ? rec.name.trim() : "Gateway Key",
@@ -174,6 +187,7 @@ export class ClientGatewayKeyManager {
               enabled: rec.enabled !== false,
               allowAllModels: rec.allowAllModels !== false,
               allowedModels: new Set(allowedList),
+              accountGroup: loadedGroup,
               maxRequests: normalizeMaxRequests(rec.maxRequests),
               maxConcurrent: normalizeMaxRequests(rec.maxConcurrent),
               expiresAt,
@@ -231,6 +245,7 @@ export class ClientGatewayKeyManager {
         enabled: true,
         allowAllModels: true,
         allowedModels: new Set(),
+        accountGroup: null,
         maxRequests: null,
         maxConcurrent: null,
         expiresAt: null,
@@ -254,6 +269,7 @@ export class ClientGatewayKeyManager {
       enabled: k.enabled,
       allowAllModels: k.allowAllModels,
       allowedModels: [...k.allowedModels].sort(),
+      accountGroup: k.accountGroup,
       maxRequests: k.maxRequests,
       maxConcurrent: k.maxConcurrent,
       expiresAt: k.expiresAt,
@@ -332,7 +348,8 @@ export class ClientGatewayKeyManager {
         keyId: matchedManaged.id,
         keyName: matchedManaged.name,
         allowAllModels: matchedManaged.allowAllModels,
-        allowedModels: matchedManaged.allowedModels
+        allowedModels: matchedManaged.allowedModels,
+        accountGroup: matchedManaged.accountGroup,
       };
     }
 
@@ -422,6 +439,7 @@ export class ClientGatewayKeyManager {
     enabled?: boolean;
     allowAllModels?: boolean;
     allowedModels?: readonly string[];
+    accountGroup?: string | null;
     maxRequests?: unknown;
     maxConcurrent?: unknown;
     expiresAt?: unknown;
@@ -442,6 +460,7 @@ export class ClientGatewayKeyManager {
     if (!allowAllModels && allowedSet.size === 0) {
       throw new GatewayError("Select at least one allowed model under custom allowlist mode.", 400, "empty_model_allowlist");
     }
+    const accountGroup = normalizeAccountGroup(params.accountGroup) ?? null;
 
     const entry: InternalClientKey = {
       id: `gk_${crypto.randomBytes(8).toString("hex")}`,
@@ -450,6 +469,7 @@ export class ClientGatewayKeyManager {
       enabled: params.enabled !== false,
       allowAllModels,
       allowedModels: allowedSet,
+      accountGroup,
       maxRequests: normalizeMaxRequests(params.maxRequests),
       maxConcurrent: normalizeMaxRequests(params.maxConcurrent),
       expiresAt: normalizeExpiresAt(params.expiresAt),
@@ -474,6 +494,7 @@ export class ClientGatewayKeyManager {
       enabled?: boolean;
       allowAllModels?: boolean;
       allowedModels?: readonly string[];
+      accountGroup?: string | null;
       maxRequests?: unknown;
       maxConcurrent?: unknown;
       expiresAt?: unknown;
@@ -491,29 +512,63 @@ export class ClientGatewayKeyManager {
       throw new GatewayError("Select at least one allowed model under custom allowlist mode.", 400, "empty_model_allowlist");
     }
 
-    if (typeof patch.name === "string" && patch.name.trim()) {
-      entry.name = patch.name.trim();
-    }
-    if (typeof patch.enabled === "boolean") {
-      entry.enabled = patch.enabled;
-    }
+    const nextName = typeof patch.name === "string" && patch.name.trim() ? patch.name.trim() : entry.name;
+    const nextEnabled = typeof patch.enabled === "boolean" ? patch.enabled : entry.enabled;
+    const nextAccountGroup =
+      patch.accountGroup !== undefined ? (normalizeAccountGroup(patch.accountGroup) ?? null) : entry.accountGroup;
+    const nextMaxRequests =
+      patch.maxRequests !== undefined ? normalizeMaxRequests(patch.maxRequests) : entry.maxRequests;
+    const nextMaxConcurrent =
+      patch.maxConcurrent !== undefined ? normalizeMaxRequests(patch.maxConcurrent) : entry.maxConcurrent;
+    const nextExpiresAt =
+      patch.expiresAt !== undefined ? normalizeExpiresAt(patch.expiresAt) : entry.expiresAt;
+
+    entry.name = nextName;
+    entry.enabled = nextEnabled;
     entry.allowAllModels = nextAllowAll;
     entry.allowedModels = nextAllowed;
-    if (patch.maxRequests !== undefined) {
-      entry.maxRequests = normalizeMaxRequests(patch.maxRequests);
-    }
-    if (patch.maxConcurrent !== undefined) {
-      entry.maxConcurrent = normalizeMaxRequests(patch.maxConcurrent);
-    }
-    if (patch.expiresAt !== undefined) {
-      entry.expiresAt = normalizeExpiresAt(patch.expiresAt);
-    }
+    entry.accountGroup = nextAccountGroup;
+    entry.maxRequests = nextMaxRequests;
+    entry.maxConcurrent = nextMaxConcurrent;
+    entry.expiresAt = nextExpiresAt;
     if (patch.resetRequests === true) {
       entry.stats.requests = 0;
     }
 
     this.persist();
     return this.toView(entry);
+  }
+
+  countByAccountGroup(): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const k of this.keys) {
+      if (k.accountGroup) {
+        counts.set(k.accountGroup, (counts.get(k.accountGroup) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }
+
+  renameAccountGroup(oldName: string, newName: string): number {
+    const normOld = normalizeAccountGroup(oldName);
+    const normNew = normalizeAccountGroup(newName);
+    if (!normOld || !normNew || normOld === normNew) return 0;
+    const touched: Array<(typeof this.keys)[number]> = [];
+    for (const k of this.keys) {
+      if (k.accountGroup === normOld) {
+        k.accountGroup = normNew;
+        touched.push(k);
+      }
+    }
+    if (touched.length > 0) {
+      try {
+        this.persist();
+      } catch (err) {
+        for (const k of touched) k.accountGroup = normOld;
+        throw err;
+      }
+    }
+    return touched.length;
   }
 
   /**
@@ -552,6 +607,7 @@ export class ClientGatewayKeyManager {
       enabled: k.enabled,
       allowAllModels: k.allowAllModels,
       allowedModels: [...k.allowedModels].sort(),
+      accountGroup: k.accountGroup,
       maxRequests: k.maxRequests,
       maxConcurrent: k.maxConcurrent,
       expiresAt: k.expiresAt,

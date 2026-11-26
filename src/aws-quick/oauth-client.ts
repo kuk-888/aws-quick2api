@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import WebSocket from "ws";
-import { fetchViaOptionalProxy, getProxyAgent } from "../utils/proxy-agent.js";
+import { fetchViaOptionalProxy, getProxyAgent, resolveEffectiveProxyUrl } from "../utils/proxy-agent.js";
 import { decodeCloudOutputFrame, drainEventStream, encodeCloudInputFrame } from "./event-stream-cbor.js";
 import type { CloudSessionMeta, QuickQuotaUsage } from "./types.js";
 
@@ -127,7 +127,7 @@ export async function fetchOAuthUserIdentity(
       channel: "prod",
     });
     const wsUrl = `wss://${cred.wsHost}/streaming/quickwork-chat-bidirectional-stream?${qs.toString()}`;
-    const effectiveProxy = proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, `https://${cred.wsHost}/`);
     const agent = getProxyAgent(effectiveProxy);
 
     const user = await new Promise<OAuthUserIdentity | null>((resolve) => {
@@ -819,6 +819,7 @@ async function callOAuthQbsEvent(
   signal?: AbortSignal,
 ): Promise<unknown> {
   let forceRefresh = false;
+  let refreshedOn401 = false;
   let lastErr: Error | undefined;
   const maxAttempts = 3;
 
@@ -829,6 +830,7 @@ async function callOAuthQbsEvent(
     const surfaceType =
       process.platform === "win32" ? "QUICK_WORK_DESKTOP_WINDOWS" : "QUICK_WORK_DESKTOP_MAC";
     const outpostId = deriveStableOutpostId(cred.clientId);
+    const workingSessionId = crypto.randomUUID();
     const resp = await fetchViaOptionalProxy(
       `https://${cred.wsHost}/integration/quick-work/qbs-event`,
       {
@@ -851,6 +853,7 @@ async function callOAuthQbsEvent(
               },
               body: bodyObj ?? {},
               outpostId,
+              workingSessionId,
             },
           },
         }),
@@ -858,23 +861,108 @@ async function callOAuthQbsEvent(
       },
       proxyUrl,
     );
-    if (resp.status === 401 && attempt === 0) {
+    if (resp.status === 401 && !refreshedOn401) {
+      refreshedOn401 = true;
       forceRefresh = true;
+      attempt -= 1;
       continue;
     }
+    const formatField = (val: unknown): string => {
+      if (typeof val === "string") return val.replace(/\s+/g, " ").trim();
+      if (val && typeof val === "object") {
+        if (Array.isArray(val) ? val.length === 0 : Object.keys(val).length === 0) return "";
+        try {
+          return JSON.stringify(val).replace(/\s+/g, " ").trim();
+        } catch {
+          return "";
+        }
+      }
+      return "";
+    };
+    const readShortBodySummary = async (): Promise<string> => {
+      try {
+        const raw = (await resp.text()).replace(/\s+/g, " ").trim();
+        return raw ? raw.slice(0, 220) : "";
+      } catch {
+        return "";
+      }
+    };
     if ((resp.status === 429 || resp.status >= 500) && attempt + 1 < maxAttempts) {
-      lastErr = new Error(`qbs-event ${path} failed (${resp.status})`);
+      const summary = await readShortBodySummary();
+      lastErr = new Error(`qbs-event ${path} failed (${resp.status})${summary ? `: ${summary}` : ""}`);
       const jitterMs = 750 + Math.floor(Math.random() * 750);
       await sleepWithAbort(jitterMs * (attempt + 1), signal);
       continue;
     }
     if (!resp.ok) {
-      throw new Error(`qbs-event ${path} failed (${resp.status})`);
+      const summary = await readShortBodySummary();
+      throw new Error(`qbs-event ${path} failed (${resp.status})${summary ? `: ${summary}` : ""}`);
     }
-    const envelope = (await resp.json()) as { eventResponse?: { invokeAgentResponse?: string | { body?: string } } };
+    let envelope: {
+      errorMessage?: unknown;
+      error?: unknown;
+      eventResponse?: {
+        invokeAgentResponse?:
+          | string
+          | { status?: number; statusCode?: number; body?: unknown; errorMessage?: unknown; error?: unknown };
+      };
+    };
+    try {
+      const envText = await resp.text();
+      envelope = (envText.trim() ? JSON.parse(envText) : {}) as typeof envelope;
+    } catch {
+      throw new Error(`qbs-event ${path} returned malformed JSON envelope`);
+    }
+    const envErr = formatField(envelope?.errorMessage) || formatField(envelope?.error);
+    if (envErr) {
+      throw new Error(`qbs-event ${path} error: ${envErr.slice(0, 220)}`);
+    }
     const rawInv = envelope?.eventResponse?.invokeAgentResponse;
-    const apiResp = typeof rawInv === "string" ? (JSON.parse(rawInv) as { body?: string }) : rawInv;
-    return typeof apiResp?.body === "string" ? JSON.parse(apiResp.body) : {};
+    let apiResp:
+      | { status?: number; statusCode?: number; body?: unknown; errorMessage?: unknown; error?: unknown }
+      | undefined;
+    if (typeof rawInv === "string") {
+      try {
+        apiResp = rawInv.trim() ? (JSON.parse(rawInv) as typeof apiResp) : undefined;
+      } catch {
+        throw new Error(`qbs-event ${path} returned malformed invokeAgentResponse payload`);
+      }
+    } else if (rawInv && typeof rawInv === "object") {
+      apiResp = rawInv;
+    }
+    const innerStatus = typeof apiResp?.status === "number" ? apiResp.status : apiResp?.statusCode;
+    const innerErr = formatField(apiResp?.errorMessage) || formatField(apiResp?.error);
+    if (innerErr) {
+      throw new Error(`qbs-event ${path} inner error: ${innerErr.slice(0, 220)}`);
+    }
+    if (typeof innerStatus === "number" && innerStatus >= 400) {
+      const bodySnippet = formatField(apiResp?.body).slice(0, 220);
+      if (innerStatus === 401 && !refreshedOn401) {
+        refreshedOn401 = true;
+        forceRefresh = true;
+        attempt -= 1;
+        continue;
+      }
+      if ((innerStatus === 429 || innerStatus >= 500) && attempt + 1 < maxAttempts) {
+        lastErr = new Error(`qbs-event ${path} failed (inner ${innerStatus})${bodySnippet ? `: ${bodySnippet}` : ""}`);
+        const jitterMs = 750 + Math.floor(Math.random() * 750);
+        await sleepWithAbort(jitterMs * (attempt + 1), signal);
+        continue;
+      }
+      throw new Error(`qbs-event ${path} failed (inner ${innerStatus})${bodySnippet ? `: ${bodySnippet}` : ""}`);
+    }
+    if (typeof apiResp?.body === "string") {
+      if (!apiResp.body.trim()) return {};
+      try {
+        return JSON.parse(apiResp.body);
+      } catch {
+        throw new Error(`qbs-event ${path} returned malformed body payload`);
+      }
+    }
+    if (apiResp?.body && typeof apiResp.body === "object") {
+      return apiResp.body;
+    }
+    return {};
   }
   throw lastErr ?? new Error(`qbs-event ${path} failed after retries`);
 }

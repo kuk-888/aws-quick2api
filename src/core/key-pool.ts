@@ -21,7 +21,14 @@ import {
   type PersistedPoolState,
 } from "./pool-state-store.js";
 import { SessionAffinityTable, type AffinityBindingView } from "./session-affinity.js";
-import { GatewayError, type AutoDisabledState, type GatewayConfig, type LbStrategy } from "./types.js";
+import {
+  GatewayError,
+  parseRoutedModelThinkingMode,
+  type AutoDisabledState,
+  type GatewayConfig,
+  type LbStrategy,
+  type RoutedModelThinkingMode,
+} from "./types.js";
 
 export interface KeyIdentitySummary {
   apiKeyName: string;
@@ -43,6 +50,7 @@ export function detectKeyAuthType(rawKey: string): KeyAuthType {
 export interface KeySlotStatus {
   slotId: string;
   label?: string;
+  group?: string;
   authType: KeyAuthType;
   addedAt: number;
   maskedKey: string;
@@ -76,6 +84,7 @@ export interface KeySlotStatus {
 interface InternalKeySlot {
   slotId: string;
   label?: string;
+  group?: string;
   authType: KeyAuthType;
   addedAt: number;
   rawKey: string;
@@ -112,11 +121,39 @@ export interface KeyLease {
   slotId: string;
   maskedKey: string;
   label?: string;
+  group?: string;
   proxyUrl?: string;
   chatAgentId?: string;
   viaAffinity: boolean;
   markSuccess: () => void;
   release: () => void;
+}
+
+export interface AccountGroupSummary {
+  name: string;
+  /** False when the group itself was deleted (no accounts & not registered) but still has bound sub-keys referencing it. */
+  defined: boolean;
+  totalAccounts: number;
+  enabledAccounts: number;
+  healthyAccounts: number;
+  boundKeys: number;
+}
+
+const INVALID_GROUP_CHARS_RE = /[\r\n\t,/\\\x00-\x1f\x7f]/;
+const FORBIDDEN_GROUP_NAMES = new Set(["__proto__", "constructor", "prototype", ".", ".."]);
+
+export function normalizeAccountGroup(raw: string | undefined | null): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const normalized = String(raw).trim().replace(/\s+/g, " ");
+  if (!normalized) return undefined;
+  if (normalized.length > 48 || INVALID_GROUP_CHARS_RE.test(normalized) || FORBIDDEN_GROUP_NAMES.has(normalized.toLowerCase())) {
+    throw new GatewayError(
+      "Invalid account group name (1-48 chars; cannot be '.', '..', or contain commas, slashes, or control characters).",
+      400,
+      "invalid_account_group",
+    );
+  }
+  return normalized;
 }
 
 export interface PoolRoutingSettings {
@@ -128,6 +165,7 @@ export interface PoolRoutingSettings {
   autoEnsureCodingAgent: boolean;
   customAgentPrompt?: string;
   sanitizeClientSystemPrompt: boolean;
+  showRoutedModelInThinking: RoutedModelThinkingMode;
   autoRephraseOnContentFilter: boolean;
   contentFilterRephrasePrompt?: string;
   contentFilterRephraseModel: string;
@@ -210,7 +248,14 @@ export const DEFAULT_CONCURRENCY_WAIT_MS = 4_000;
 
 export class UpstreamKeyPool {
   private readonly slots: InternalKeySlot[] = [];
-  private readonly slotWaiters: Array<{ wake: () => void; canUse: (slot?: InternalKeySlot) => boolean }> = [];
+  private readonly accountGroups = new Set<string>();
+  private readonly slotWaiters: Array<{
+    wake: () => void;
+    canUse: (slot?: InternalKeySlot) => boolean;
+    hasRemainingCandidate: () => boolean;
+    getRequiredGroup: () => string | undefined;
+    onGroupRenamed: (oldName: string, newName: string) => void;
+  }> = [];
   private onQuotaExhaustedCallback?: (slotId: string) => void;
   private readonly quotaProbeCooldownBySlot = new Map<string, number>();
   private readonly baseCooldownMs: number;
@@ -231,13 +276,15 @@ export class UpstreamKeyPool {
   private autoEnsureCodingAgent: boolean;
   private customAgentPrompt?: string;
   private sanitizeClientSystemPrompt: boolean;
+  private showRoutedModelInThinking: RoutedModelThinkingMode;
   private autoRephraseOnContentFilter: boolean;
   private contentFilterRephrasePrompt?: string;
   private contentFilterRephraseModel: string;
   private chatAgentId?: string;
-  private rrIndex = 0;
+  private readonly rrIndexByGroup = new Map<string, number>();
   private readonly unsubscribeOAuthRotation: () => void;
   private onSlotInvalidatedCallback?: (slotId: string) => void;
+  private readonly groupRenameListeners = new Set<(oldName: string, newName: string) => void>();
 
   constructor(config: Pick<
     GatewayConfig,
@@ -262,6 +309,7 @@ export class UpstreamKeyPool {
     | "autoEnsureCodingAgent"
     | "customAgentPrompt"
     | "sanitizeClientSystemPrompt"
+    | "showRoutedModelInThinking"
     | "autoRephraseOnContentFilter"
     | "contentFilterRephrasePrompt"
     | "contentFilterRephraseModel"
@@ -278,6 +326,7 @@ export class UpstreamKeyPool {
     this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
     this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
     this.sanitizeClientSystemPrompt = config.sanitizeClientSystemPrompt === true;
+    this.showRoutedModelInThinking = parseRoutedModelThinkingMode(config.showRoutedModelInThinking);
     this.autoRephraseOnContentFilter = config.autoRephraseOnContentFilter === true;
     this.contentFilterRephrasePrompt = config.contentFilterRephrasePrompt?.trim() || undefined;
     this.contentFilterRephraseModel =
@@ -310,6 +359,9 @@ export class UpstreamKeyPool {
       this.autoEnsureCodingAgent = persistedState.autoEnsureCodingAgent;
       this.customAgentPrompt = persistedState.customAgentPrompt.trim() || undefined;
       this.sanitizeClientSystemPrompt = persistedState.sanitizeClientSystemPrompt === true;
+      if (persistedState.showRoutedModelInThinking !== undefined) {
+        this.showRoutedModelInThinking = parseRoutedModelThinkingMode(persistedState.showRoutedModelInThinking);
+      }
       this.autoRephraseOnContentFilter = persistedState.autoRephraseOnContentFilter;
       this.contentFilterRephrasePrompt = persistedState.contentFilterRephrasePrompt.trim() || undefined;
       this.contentFilterRephraseModel =
@@ -333,12 +385,30 @@ export class UpstreamKeyPool {
         }
       };
 
+      const normalizeLoadedGroup = (raw?: string): string | undefined => {
+        if (!raw) return undefined;
+        try {
+          return normalizeAccountGroup(raw);
+        } catch {
+          return undefined;
+        }
+      };
+      for (const g of persistedState.accountGroups ?? []) {
+        const ng = normalizeLoadedGroup(g);
+        if (ng) this.accountGroups.add(ng);
+      }
+
       const totalPersistedKeys = persistedState.activeKeys.length + persistedState.disabledKeys.length;
       let bootIdx = 0;
       for (const k of persistedState.activeKeys) {
         const s = this.upsertInternal(k, true);
         if (persistedState.keyLabels[s.slotId]) s.label = persistedState.keyLabels[s.slotId];
         if (persistedState.keyProxies[s.slotId]) s.proxyUrl = persistedState.keyProxies[s.slotId];
+        const grp = normalizeLoadedGroup(persistedState.keyGroups?.[s.slotId]);
+        if (grp) {
+          s.group = grp;
+          this.accountGroups.add(grp);
+        }
         if (persistedState.keyChatAgentIds[s.slotId]) {
           s.chatAgentId = normalizeLoadedAgent(persistedState.keyChatAgentIds[s.slotId]);
         }
@@ -350,6 +420,11 @@ export class UpstreamKeyPool {
           const s = this.upsertInternal(k, false);
           if (persistedState.keyLabels[s.slotId]) s.label = persistedState.keyLabels[s.slotId];
           if (persistedState.keyProxies[s.slotId]) s.proxyUrl = persistedState.keyProxies[s.slotId];
+          const grp = normalizeLoadedGroup(persistedState.keyGroups?.[s.slotId]);
+          if (grp) {
+            s.group = grp;
+            this.accountGroups.add(grp);
+          }
           if (persistedState.keyChatAgentIds[s.slotId]) {
             s.chatAgentId = normalizeLoadedAgent(persistedState.keyChatAgentIds[s.slotId]);
           }
@@ -637,11 +712,17 @@ export class UpstreamKeyPool {
   private buildPersistedState(): PersistedPoolState {
     const keyLabels: Record<string, string> = {};
     const keyProxies: Record<string, string> = {};
+    const keyGroups: Record<string, string> = {};
     const keyChatAgentIds: Record<string, string> = {};
     const keyAddedAt: Record<string, number> = {};
+    const groupSet = new Set<string>(this.accountGroups);
     for (const s of this.slots) {
       if (s.label) keyLabels[s.slotId] = s.label;
       if (s.proxyUrl) keyProxies[s.slotId] = s.proxyUrl;
+      if (s.group) {
+        keyGroups[s.slotId] = s.group;
+        groupSet.add(s.group);
+      }
       if (s.chatAgentId) keyChatAgentIds[s.slotId] = s.chatAgentId;
       if (s.addedAt) keyAddedAt[s.slotId] = s.addedAt;
     }
@@ -664,6 +745,8 @@ export class UpstreamKeyPool {
       disabledKeys: this.slots.filter((s) => !s.enabled).map((s) => s.rawKey),
       keyLabels,
       keyProxies,
+      accountGroups: Array.from(groupSet).sort((a, b) => a.localeCompare(b)),
+      keyGroups,
       chatAgentId: this.chatAgentId ?? "",
       keyChatAgentIds,
       keyAddedAt,
@@ -676,6 +759,7 @@ export class UpstreamKeyPool {
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
       customAgentPrompt: this.customAgentPrompt ?? "",
       sanitizeClientSystemPrompt: this.sanitizeClientSystemPrompt,
+      showRoutedModelInThinking: this.showRoutedModelInThinking,
       autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
       contentFilterRephrasePrompt: this.contentFilterRephrasePrompt ?? "",
       contentFilterRephraseModel: this.contentFilterRephraseModel,
@@ -701,6 +785,7 @@ export class UpstreamKeyPool {
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
       ...(this.customAgentPrompt ? { customAgentPrompt: this.customAgentPrompt } : {}),
       sanitizeClientSystemPrompt: this.sanitizeClientSystemPrompt,
+      showRoutedModelInThinking: this.showRoutedModelInThinking,
       autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
       ...(this.contentFilterRephrasePrompt ? { contentFilterRephrasePrompt: this.contentFilterRephrasePrompt } : {}),
       contentFilterRephraseModel: this.contentFilterRephraseModel,
@@ -732,6 +817,9 @@ export class UpstreamKeyPool {
     if (typeof patch.sanitizeClientSystemPrompt === "boolean") {
       this.sanitizeClientSystemPrompt = patch.sanitizeClientSystemPrompt;
     }
+    if (patch.showRoutedModelInThinking !== undefined) {
+      this.showRoutedModelInThinking = parseRoutedModelThinkingMode(patch.showRoutedModelInThinking);
+    }
     if (typeof patch.autoRephraseOnContentFilter === "boolean") {
       this.autoRephraseOnContentFilter = patch.autoRephraseOnContentFilter;
     }
@@ -747,13 +835,14 @@ export class UpstreamKeyPool {
     this.persist();
   }
 
-  allManagedKeys(): Array<{ slotId: string; rawKey: string; enabled: boolean; label?: string; proxyUrl?: string; chatAgentId?: string }> {
+  allManagedKeys(): Array<{ slotId: string; rawKey: string; enabled: boolean; label?: string; group?: string; proxyUrl?: string; chatAgentId?: string }> {
     this.reviveCycleResetAccounts();
     return this.slots.map((s) => ({
       slotId: s.slotId,
       rawKey: s.rawKey,
       enabled: s.enabled,
       ...(s.label ? { label: s.label } : {}),
+      ...(s.group ? { group: s.group } : {}),
       ...(s.proxyUrl ? { proxyUrl: s.proxyUrl } : {}),
       ...(s.chatAgentId ? { chatAgentId: s.chatAgentId } : {}),
     }));
@@ -763,9 +852,138 @@ export class UpstreamKeyPool {
     return this.slots.find((s) => s.rawKey === rawKey)?.proxyUrl;
   }
 
-  enabledKeyCount(): number {
+  enabledKeyCount(accountGroup?: string | null): number {
     this.reviveCycleResetAccounts();
-    return this.slots.filter((s) => s.enabled).length;
+    const requiredGroup = accountGroup ? accountGroup.trim() || undefined : undefined;
+    return this.slots.filter((s) => s.enabled && (!requiredGroup || s.group === requiredGroup)).length;
+  }
+
+  listGroupNames(): string[] {
+    const names = new Set<string>(this.accountGroups);
+    for (const s of this.slots) {
+      if (s.group) names.add(s.group);
+    }
+    return Array.from(names).sort((a, b) => a.localeCompare(b));
+  }
+
+  listGroupSummaries(boundKeyCounts?: ReadonlyMap<string, number>): AccountGroupSummary[] {
+    this.reviveCycleResetAccounts();
+    const now = Date.now();
+    const names = new Set<string>(this.listGroupNames());
+    if (boundKeyCounts) {
+      for (const k of boundKeyCounts.keys()) {
+        if (k) names.add(k);
+      }
+    }
+    return Array.from(names)
+      .sort((a, b) => a.localeCompare(b))
+      .map((name) => {
+        const members = this.slots.filter((s) => s.group === name);
+        const enabled = members.filter((s) => s.enabled);
+        const healthy = enabled.filter(
+          (s) => s.cooldownUntil <= now && !s.autoPoolExhausted && !s.apiPoolExhausted,
+        );
+        return {
+          name,
+          defined: this.accountGroups.has(name) || members.length > 0,
+          totalAccounts: members.length,
+          enabledAccounts: enabled.length,
+          healthyAccounts: healthy.length,
+          boundKeys: boundKeyCounts?.get(name) ?? 0,
+        };
+      });
+  }
+
+  createGroup(rawName: string): string {
+    const name = normalizeAccountGroup(rawName);
+    if (!name) {
+      throw new GatewayError("Account group name is required.", 400, "invalid_account_group");
+    }
+    if (!this.accountGroups.has(name)) {
+      this.accountGroups.add(name);
+      this.persist({ mirrorToEnv: false });
+    }
+    return name;
+  }
+
+  subscribeGroupRename(listener: (oldName: string, newName: string) => void): () => void {
+    this.groupRenameListeners.add(listener);
+    return () => {
+      this.groupRenameListeners.delete(listener);
+    };
+  }
+
+  renameGroup(
+    oldRaw: string,
+    newRaw: string,
+    extraReservedNames?: ReadonlySet<string>,
+  ): { oldName: string; newName: string; movedSlots: number } {
+    const oldName = normalizeAccountGroup(oldRaw);
+    const newName = normalizeAccountGroup(newRaw);
+    if (!oldName || !newName) {
+      throw new GatewayError("Both current and new group names are required.", 400, "invalid_account_group");
+    }
+    if (!this.accountGroups.has(oldName) && !this.slots.some((s) => s.group === oldName)) {
+      throw new GatewayError(`Account group '${oldName}' not found.`, 404, "not_found");
+    }
+    if (oldName === newName) return { oldName, newName, movedSlots: 0 };
+    if (
+      this.accountGroups.has(newName) ||
+      this.slots.some((s) => s.group === newName) ||
+      extraReservedNames?.has(newName)
+    ) {
+      throw new GatewayError(`Account group '${newName}' already exists.`, 409, "duplicate_account_group");
+    }
+    this.accountGroups.delete(oldName);
+    this.accountGroups.add(newName);
+    const oldRr = this.rrIndexByGroup.get(oldName);
+    if (oldRr !== undefined) {
+      this.rrIndexByGroup.delete(oldName);
+      this.rrIndexByGroup.set(newName, oldRr);
+    }
+    let movedSlots = 0;
+    for (const s of this.slots) {
+      if (s.group === oldName) {
+        s.group = newName;
+        movedSlots += 1;
+      }
+    }
+    for (const w of this.slotWaiters) {
+      w.onGroupRenamed(oldName, newName);
+    }
+    for (const listener of this.groupRenameListeners) {
+      try {
+        listener(oldName, newName);
+      } catch {
+        // ignore listener failure
+      }
+    }
+    this.persist({ mirrorToEnv: false });
+    return { oldName, newName, movedSlots };
+  }
+
+  deleteGroup(rawName: string): { name: string; ungroupedSlots: number } {
+    const name = normalizeAccountGroup(rawName);
+    if (!name) {
+      throw new GatewayError("Account group name is required.", 400, "invalid_account_group");
+    }
+    const existed = this.accountGroups.delete(name);
+    this.rrIndexByGroup.delete(name);
+    let ungroupedSlots = 0;
+    for (const s of this.slots) {
+      if (s.group === name) {
+        s.group = undefined;
+        ungroupedSlots += 1;
+        this.affinityTable.evictAllForKey(s.rawKey);
+        this.emitSlotInvalidated(s.slotId);
+      }
+    }
+    if (!existed && ungroupedSlots === 0) {
+      throw new GatewayError(`Account group '${name}' not found.`, 404, "not_found");
+    }
+    this.persist({ mirrorToEnv: false });
+    this.wakeWaitersIfPoolDepleted();
+    return { name, ungroupedSlots };
   }
 
   activeInflightForSlot(slotId: string): number {
@@ -850,6 +1068,7 @@ export class UpstreamKeyPool {
       slotId: slot?.slotId ?? "direct",
       maskedKey: slot?.maskedKey ?? maskSecretKey(rawKey),
       ...(slot?.label ? { label: slot.label } : {}),
+      ...(slot?.group ? { group: slot.group } : {}),
       ...(slot?.proxyUrl ? { proxyUrl: slot.proxyUrl } : {}),
       ...(slot?.chatAgentId ? { chatAgentId: slot.chatAgentId } : {}),
       viaAffinity,
@@ -880,17 +1099,19 @@ export class UpstreamKeyPool {
   }
 
   /**
-   * Immediately wakes all queued waiters when no enabled/non-exhausted slots remain,
-   * preventing waiters from hanging uselessly for the full 15s wait budget.
+   * Immediately wakes queued waiters whose scoped pool (global or bound account group) has no
+   * enabled/non-exhausted slots left, preventing waiters from hanging for the full 15s wait budget.
    */
   private wakeWaitersIfPoolDepleted(): void {
     if (this.slotWaiters.length === 0) return;
-    const anyUsable = this.slots.some(
-      (s) => s.enabled && (!this.isSlotPoolExhausted(s, "auto") || !this.isSlotPoolExhausted(s, "api")),
-    );
-    if (!anyUsable) {
-      const toWake = this.slotWaiters.splice(0, this.slotWaiters.length);
-      for (const w of toWake) w.wake();
+    for (let i = 0; i < this.slotWaiters.length;) {
+      const w = this.slotWaiters[i]!;
+      if (!w.hasRemainingCandidate()) {
+        this.slotWaiters.splice(i, 1);
+        w.wake();
+      } else {
+        i += 1;
+      }
     }
   }
 
@@ -915,15 +1136,23 @@ export class UpstreamKeyPool {
   leaseKey(
     requestedModel = "auto",
     excludeKeys?: ReadonlySet<string>,
-    conversationKey?: string
+    conversationKey?: string,
+    accountGroup?: string | null,
   ): KeyLease {
     this.reviveCycleResetAccounts();
 
     // Never use caller tokens upstream; always pick from the managed credential pool.
     if (this.slots.length === 0) {
-      throw new GatewayError("All upstream AWS Quick accounts are currently disabled or unconfigured.", 503, "no_enabled_keys");
+      const grp = accountGroup?.trim();
+      throw new GatewayError(
+        grp
+          ? `No enabled upstream AWS Quick credentials available in group '${grp}'.`
+          : "All upstream AWS Quick accounts are currently disabled or unconfigured.",
+        503,
+        grp ? "group_no_enabled_keys" : "no_enabled_keys",
+      );
     }
-    return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
+    return this.pickFromPool(requestedModel, excludeKeys, conversationKey, accountGroup);
   }
 
   /**
@@ -931,16 +1160,25 @@ export class UpstreamKeyPool {
    * headroom below AWS Quick's 5-connection hard limit). If every usable account is currently full,
    * performs a bounded soft-wait (default 4s, bounded queue) for a slot to free up instead of firing
    * a doomed 5th/6th WebSocket that triggers LimitExceededException / ThrottlingException.
+   * When `opts.accountGroup` is set, strictly confines scheduling to that group (never crosses groups
+   * and never falls back to the global pool).
    */
   async leaseKeyWithWait(
     requestedModel = "auto",
     excludeKeys?: ReadonlySet<string>,
     conversationKey?: string,
-    opts?: { maxWaitMs?: number; signal?: AbortSignal },
+    opts?: { maxWaitMs?: number; signal?: AbortSignal; accountGroup?: string | null },
   ): Promise<KeyLease> {
     this.reviveCycleResetAccounts();
+    let activeGroup = opts?.accountGroup ? opts.accountGroup.trim() || undefined : undefined;
     if (this.slots.length === 0) {
-      throw new GatewayError("All upstream AWS Quick accounts are currently disabled or unconfigured.", 503, "no_enabled_keys");
+      throw new GatewayError(
+        activeGroup
+          ? `No enabled upstream AWS Quick credentials available in group '${activeGroup}'.`
+          : "All upstream AWS Quick accounts are currently disabled or unconfigured.",
+        503,
+        activeGroup ? "group_no_enabled_keys" : "no_enabled_keys",
+      );
     }
 
     const maxWaitMs = Math.max(0, opts?.maxWaitMs ?? DEFAULT_CONCURRENCY_WAIT_MS);
@@ -957,13 +1195,16 @@ export class UpstreamKeyPool {
         if (s.cooldownUntil > 0 && s.cooldownUntil <= now) s.cooldownUntil = 0;
         if (s.connLimitCooldownUntil > 0 && s.connLimitCooldownUntil <= now) s.connLimitCooldownUntil = 0;
       }
-      const enabledSlots = this.slots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
+      const scopedSlots = activeGroup ? this.slots.filter((s) => s.group === activeGroup) : this.slots;
+      const enabledSlots = scopedSlots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
       if (enabledSlots.length === 0) {
-        const soonestResetSec = this.computeSoonestAutoResetSec(now);
+        const soonestResetSec = this.computeSoonestAutoResetSec(now, scopedSlots);
         throw new GatewayError(
-          "No enabled upstream AWS Quick credentials available.",
+          activeGroup
+            ? `No enabled upstream AWS Quick credentials available in group '${activeGroup}'.`
+            : "No enabled upstream AWS Quick credentials available.",
           503,
-          "no_enabled_keys",
+          activeGroup ? "group_no_enabled_keys" : "no_enabled_keys",
           undefined,
           soonestResetSec,
         );
@@ -972,7 +1213,9 @@ export class UpstreamKeyPool {
       if (usableSlots.length === 0) {
         const soonestResetSec = this.computeSoonestAutoResetSec(now, enabledSlots);
         throw new GatewayError(
-          `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
+          activeGroup
+            ? `All enabled AWS Quick accounts in group '${activeGroup}' have exhausted their '${targetPool}' quota.`
+            : `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
           429,
           "quota_exhausted",
           undefined,
@@ -984,12 +1227,15 @@ export class UpstreamKeyPool {
         (s) => s.cooldownUntil === 0 && s.activeInflight < this.maxInflightPerSlot,
       );
       if (hasCapacity) {
-        return this.pickFromPool(requestedModel, excludeKeys, conversationKey);
+        return this.pickFromPool(requestedModel, excludeKeys, conversationKey, activeGroup);
       }
 
       // If no account has inflight capacity (or all are briefly cooling down), check wait budget.
       const remainingMs = deadline - Date.now();
       const maxQueue = Math.max(4, usableSlots.length * this.maxInflightPerSlot);
+      const scopedWaitersCount = activeGroup
+        ? this.slotWaiters.filter((w) => w.getRequiredGroup() === activeGroup).length
+        : this.slotWaiters.filter((w) => !w.getRequiredGroup()).length;
       // Use minimum cooldown across ALL usable slots (including currently full ones) when deciding
       // whether to fast-fail 429: a full slot with a brief 2.5s connLimit can release before deadline.
       const soonestAnyCooldownMs = usableSlots.reduce((min, s) => {
@@ -1007,13 +1253,15 @@ export class UpstreamKeyPool {
       const allCoolingBeyondBudget =
         usableSlots.every((s) => s.cooldownUntil > now) && soonestAnyCooldownMs > Math.max(0, remainingMs);
 
-      if (remainingMs <= 0 || allCoolingBeyondBudget || (!hasWaited && this.slotWaiters.length >= maxQueue)) {
+      if (remainingMs <= 0 || allCoolingBeyondBudget || (!hasWaited && scopedWaitersCount >= maxQueue)) {
         const retryAfterSec =
           Number.isFinite(soonestAnyCooldownMs) && soonestAnyCooldownMs > 0
             ? Math.min(3600, Math.max(1, Math.ceil(soonestAnyCooldownMs / 1000)))
             : 5;
         throw new GatewayError(
-          "All upstream AWS Quick accounts are currently rate-limited or at capacity. Please retry in a few seconds.",
+          activeGroup
+            ? `All upstream AWS Quick accounts in group '${activeGroup}' are currently rate-limited or at capacity. Please retry in a few seconds.`
+            : "All upstream AWS Quick accounts are currently rate-limited or at capacity. Please retry in a few seconds.",
           429,
           "rate_limit_exceeded",
           undefined,
@@ -1027,10 +1275,23 @@ export class UpstreamKeyPool {
       await new Promise<void>((resolve) => {
         let settled = false;
         const entry = {
+          getRequiredGroup: () => activeGroup,
+          onGroupRenamed: (oldName: string, newName: string) => {
+            if (activeGroup === oldName) activeGroup = newName;
+          },
           wake: () => finish(),
+          hasRemainingCandidate: () =>
+            this.slots.some(
+              (s) =>
+                s.enabled &&
+                (!activeGroup || s.group === activeGroup) &&
+                !excludeKeys?.has(s.rawKey) &&
+                !this.isSlotPoolExhausted(s, targetPool),
+            ),
           canUse: (releasedSlot?: InternalKeySlot) => {
             if (!releasedSlot) return true;
             if (!releasedSlot.enabled || excludeKeys?.has(releasedSlot.rawKey)) return false;
+            if (activeGroup && releasedSlot.group !== activeGroup) return false;
             return !this.isSlotPoolExhausted(releasedSlot, targetPool);
           },
         };
@@ -1063,26 +1324,27 @@ export class UpstreamKeyPool {
   private pickFromPool(
     requestedModel: string,
     excludeKeys?: ReadonlySet<string>,
-    conversationKey?: string
+    conversationKey?: string,
+    accountGroup?: string | null,
   ): KeyLease {
     const now = Date.now();
     const targetPool = classifyModelQuotaPool(requestedModel);
+    const requiredGroup = accountGroup ? accountGroup.trim() || undefined : undefined;
+    const scopedSlots = requiredGroup ? this.slots.filter((s) => s.group === requiredGroup) : this.slots;
 
     // Clear expired cooldowns
-    for (const s of this.slots) {
+    for (const s of scopedSlots) {
       if (s.cooldownUntil > 0 && s.cooldownUntil <= now) s.cooldownUntil = 0;
       if (s.connLimitCooldownUntil > 0 && s.connLimitCooldownUntil <= now) s.connLimitCooldownUntil = 0;
     }
 
     // Step 1: Check Sticky Session Affinity first!
-    // Elastic concurrency & brief conn-limit guard: if the sticky account is at maxInflightPerSlot
-    // or in a brief 2.5s conn-limit backoff, migrate cleanly to an idle account via `bindAndLease`
-    // so Turn N parks its fresh warm thread on the new account and Turn N+1 immediately hits
-    // warm_incremental there (avoiding a double cold-replay bounce back to the saturated slot).
+    // Strictly enforce group membership: if the sticky slot no longer belongs to `requiredGroup`,
+    // evict affinity immediately so cross-group fallback is impossible.
     if (this.sessionAffinityEnabled && conversationKey) {
       const stickyRawKey = this.affinityTable.lookup(conversationKey, this.sessionAffinityTtlMs);
       if (stickyRawKey && !excludeKeys?.has(stickyRawKey)) {
-        const stickySlot = this.slots.find((s) => s.rawKey === stickyRawKey);
+        const stickySlot = scopedSlots.find((s) => s.rawKey === stickyRawKey);
         const onlyBriefConnBackoff =
           stickySlot !== undefined &&
           stickySlot.enabled &&
@@ -1094,7 +1356,7 @@ export class UpstreamKeyPool {
           if (stickySlot.activeInflight < this.maxInflightPerSlot) {
             return this.leaseSpecificKey(stickySlot.rawKey, true);
           }
-          const spareCandidates = this.slots.filter(
+          const spareCandidates = scopedSlots.filter(
             (s) =>
               s !== stickySlot &&
               !excludeKeys?.has(s.rawKey) &&
@@ -1107,7 +1369,7 @@ export class UpstreamKeyPool {
           }
           return this.leaseSpecificKey(stickySlot.rawKey, true);
         } else if (onlyBriefConnBackoff && stickySlot) {
-          const spareCandidates = this.slots.filter(
+          const spareCandidates = scopedSlots.filter(
             (s) =>
               s !== stickySlot &&
               !excludeKeys?.has(s.rawKey) &&
@@ -1120,22 +1382,30 @@ export class UpstreamKeyPool {
           }
           // Fall through without evicting sticky affinity
         } else {
-          // Bound account is exhausted, in long rate-limit cooldown, or disabled -> break affinity cleanly!
+          // Bound account is exhausted, in long rate-limit cooldown, disabled, or moved out of group -> break affinity cleanly!
           this.affinityTable.evictConversation(conversationKey);
         }
       }
     }
 
-    const enabledSlots = this.slots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
+    const enabledSlots = scopedSlots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
     if (enabledSlots.length === 0) {
-      throw new GatewayError("No enabled upstream AWS Quick credentials available.", 503, "no_enabled_keys");
+      throw new GatewayError(
+        requiredGroup
+          ? `No enabled upstream AWS Quick credentials available in group '${requiredGroup}'.`
+          : "No enabled upstream AWS Quick credentials available.",
+        503,
+        requiredGroup ? "group_no_enabled_keys" : "no_enabled_keys",
+      );
     }
 
     // Filter out accounts whose target pool is exhausted before checking cooldowns
     const nonExhausted = enabledSlots.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
     if (nonExhausted.length === 0) {
       throw new GatewayError(
-        `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
+        requiredGroup
+          ? `All enabled AWS Quick accounts in group '${requiredGroup}' have exhausted their '${targetPool}' quota.`
+          : `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
         429,
         "quota_exhausted"
       );
@@ -1144,7 +1414,9 @@ export class UpstreamKeyPool {
     let candidates = nonExhausted.filter((s) => s.cooldownUntil === 0);
     if (candidates.length === 0) {
       throw new GatewayError(
-        "All upstream AWS Quick accounts are currently cooling down. Please retry shortly.",
+        requiredGroup
+          ? `All upstream AWS Quick accounts in group '${requiredGroup}' are currently cooling down. Please retry shortly.`
+          : "All upstream AWS Quick accounts are currently cooling down. Please retry shortly.",
         429,
         "rate_limit_exceeded",
       );
@@ -1155,13 +1427,18 @@ export class UpstreamKeyPool {
       candidates = underCap;
     }
 
-    const picked = this.pickBestCandidate(candidates, targetPool);
+    const picked = this.pickBestCandidate(candidates, targetPool, requiredGroup);
     return this.bindAndLease(picked, conversationKey);
   }
 
-  private pickBestCandidate(candidates: InternalKeySlot[], targetPool: "auto" | "api"): InternalKeySlot {
+  private pickBestCandidate(
+    candidates: InternalKeySlot[],
+    targetPool: "auto" | "api",
+    scopeGroup?: string,
+  ): InternalKeySlot {
+    const scopeKey = scopeGroup || "__global__";
     if (this.lbStrategy === "round-robin") {
-      return this.nextRoundRobin(candidates);
+      return this.nextRoundRobin(candidates, scopeKey);
     }
 
     let pool = candidates;
@@ -1175,24 +1452,40 @@ export class UpstreamKeyPool {
     }
 
     const n = this.slots.length;
-    const startIdx = this.rrIndex;
-    this.rrIndex = (this.rrIndex + 1) % Math.max(1, n);
+    const startIdx = (this.rrIndexByGroup.get(scopeKey) ?? 0) % Math.max(1, n);
 
     const sorted = [...pool].sort((a, b) => {
-      if (a.activeInflight !== b.activeInflight) return a.activeInflight - b.activeInflight;
       if (this.lbStrategy === "quota-aware") {
         const remA = getRemainingPercentForPool(a.quota, targetPool);
         const remB = getRemainingPercentForPool(b.quota, targetPool);
-        const bandA = remA !== null ? Math.floor(remA / 15) : 3;
-        const bandB = remB !== null ? Math.floor(remB / 15) : 3;
-        if (bandA !== bandB) return bandB - bandA;
+        // 1) Protect ONLY endangered low-quota (<15%, e.g. just-recovered 1% 5h-window) slots ahead of
+        //    `activeInflight` so concurrent bursts never slam a 1% slot while safe slots have capacity.
+        const endangeredA = remA !== null && remA < 15 ? 1 : 0;
+        const endangeredB = remB !== null && remB < 15 ? 1 : 0;
+        if (endangeredA !== endangeredB) return endangeredA - endangeredB;
+        // 2) Among safe slots (>=15% or newly added unsynced `null`), spread active concurrency first
+        //    so a single >=40% slot never saturates to 4 inflight and evicts parked incognito warm WS
+        //    while unsynced or 38% accounts sit idle at 0.
+        if (a.activeInflight !== b.activeInflight) return a.activeInflight - b.activeInflight;
+        // 3) When concurrency is tied (e.g. both idle), prefer healthy >=40% top tier over 15-39%/null.
+        const tierA = remA !== null && remA >= 40 ? 2 : 1;
+        const tierB = remB !== null && remB >= 40 ? 2 : 1;
+        if (tierA !== tierB) return tierB - tierA;
+      } else if (a.activeInflight !== b.activeInflight) {
+        return a.activeInflight - b.activeInflight;
       }
       const idxA = (this.slots.indexOf(a) - startIdx + n) % n;
       const idxB = (this.slots.indexOf(b) - startIdx + n) % n;
       return idxA - idxB;
     });
 
-    return sorted[0]!;
+    const chosen = sorted[0]!;
+    const chosenIdx = this.slots.indexOf(chosen);
+    this.rrIndexByGroup.set(
+      scopeKey,
+      chosenIdx >= 0 ? (chosenIdx + 1) % Math.max(1, n) : (startIdx + 1) % Math.max(1, n),
+    );
+    return chosen;
   }
 
   private bindAndLease(slot: InternalKeySlot, conversationKey?: string): KeyLease {
@@ -1208,12 +1501,13 @@ export class UpstreamKeyPool {
     return this.leaseSpecificKey(slot.rawKey, false);
   }
 
-  private nextRoundRobin(candidates: InternalKeySlot[]): InternalKeySlot {
+  private nextRoundRobin(candidates: InternalKeySlot[], scopeKey = "__global__"): InternalKeySlot {
     const n = this.slots.length;
+    const curRr = (this.rrIndexByGroup.get(scopeKey) ?? 0) % Math.max(1, n);
     for (let offset = 0; offset < n; offset += 1) {
-      const slot = this.slots[(this.rrIndex + offset) % n]!;
+      const slot = this.slots[(curRr + offset) % n]!;
       if (candidates.includes(slot)) {
-        this.rrIndex = (this.rrIndex + offset + 1) % n;
+        this.rrIndexByGroup.set(scopeKey, (curRr + offset + 1) % n);
         return slot;
       }
     }
@@ -1452,7 +1746,9 @@ export class UpstreamKeyPool {
         ? "Auto-disabled: Monthly 10h pool reached 0%"
         : "Auto-disabled: Session burst pool reached 0%";
       this.affinityTable.evictAllForKey(rawKey);
+      this.emitSlotInvalidated(slot.slotId);
       this.persist({ mirrorToEnv: false });
+      this.wakeWaitersIfPoolDepleted();
       return;
     }
 
@@ -1498,7 +1794,14 @@ export class UpstreamKeyPool {
     }
   }
 
-  addKey(rawKey: string, enabled = true, label?: string, proxyUrl?: string, chatAgentId?: string): KeySlotStatus {
+  addKey(
+    rawKey: string,
+    enabled = true,
+    label?: string,
+    proxyUrl?: string,
+    chatAgentId?: string,
+    group?: string | null,
+  ): KeySlotStatus {
     let validProxy: string | undefined;
     try {
       validProxy = validateProxyUrl(proxyUrl);
@@ -1506,8 +1809,17 @@ export class UpstreamKeyPool {
       throw new GatewayError(err instanceof Error ? err.message : "Invalid proxy URL.", 400, "invalid_proxy_url");
     }
     const validChatAgentId = validateChatAgentId(chatAgentId);
+    const validGroup = normalizeAccountGroup(group);
     let normalized = rawKey.trim();
     const webCred = parseWebCurlOrCredential(normalized);
+    if (!webCred && (!normalized || normalized.length < 4 || /[,\r\n]/.test(normalized))) {
+      throw new GatewayError(
+        "Invalid AWS Quick credential (commas/newlines are not allowed; use `local-outpost`, `id_token`, or pasted `Copy as cURL` from quick.aws.com).",
+        400,
+        "invalid_api_key",
+      );
+    }
+    if (validGroup) this.accountGroups.add(validGroup);
     if (webCred) {
       normalized = serializeWebCredential(webCred);
       // Manual renewal: if a web credential for the same AWS account already exists, refresh it in place
@@ -1517,6 +1829,7 @@ export class UpstreamKeyPool {
       if (existing) {
         const prevProxy = existing.proxyUrl || "";
         const prevAgent = existing.chatAgentId || "";
+        const prevGroup = existing.group || "";
         this.rekeySlotCredential(existing, normalized);
         existing.enabled = enabled;
         existing.autoDisabledKind = undefined;
@@ -1526,19 +1839,22 @@ export class UpstreamKeyPool {
         if (label?.trim()) existing.label = label.trim();
         if (proxyUrl !== undefined) existing.proxyUrl = validProxy;
         if (chatAgentId !== undefined) existing.chatAgentId = validChatAgentId;
-        if (!enabled || (existing.proxyUrl || "") !== prevProxy || (existing.chatAgentId || "") !== prevAgent) {
+        if (group !== undefined) existing.group = validGroup;
+        const groupChanged = (existing.group || "") !== prevGroup;
+        if (
+          !enabled ||
+          (existing.proxyUrl || "") !== prevProxy ||
+          (existing.chatAgentId || "") !== prevAgent ||
+          groupChanged
+        ) {
+          if (groupChanged || !enabled) this.affinityTable.evictAllForKey(existing.rawKey);
           this.emitSlotInvalidated(existing.slotId);
         }
         this.persist();
         if (enabled) this.notifySlotAvailable(existing, this.maxInflightPerSlot);
+        if (groupChanged || !enabled) this.wakeWaitersIfPoolDepleted();
         return this.toSlotStatus(existing, this.affinityTable.countBySlot());
       }
-    } else if (!normalized || normalized.length < 4 || /[,\r\n]/.test(normalized)) {
-      throw new GatewayError(
-        "Invalid AWS Quick credential (commas/newlines are not allowed; use `local-outpost`, `id_token`, or pasted `Copy as cURL` from quick.aws.com).",
-        400,
-        "invalid_api_key",
-      );
     } else if (normalized.startsWith("oauth:")) {
       const oauthCred = parseOAuthCredential(normalized);
       if (oauthCred) {
@@ -1549,6 +1865,7 @@ export class UpstreamKeyPool {
         if (existing) {
           const prevProxy = existing.proxyUrl || "";
           const prevAgent = existing.chatAgentId || "";
+          const prevGroup = existing.group || "";
           this.rekeySlotCredential(existing, normalized);
           existing.enabled = enabled;
           existing.autoDisabledKind = undefined;
@@ -1558,30 +1875,69 @@ export class UpstreamKeyPool {
           if (label?.trim()) existing.label = label.trim();
           if (proxyUrl !== undefined) existing.proxyUrl = validProxy;
           if (chatAgentId !== undefined) existing.chatAgentId = validChatAgentId;
-          if (!enabled || (existing.proxyUrl || "") !== prevProxy || (existing.chatAgentId || "") !== prevAgent) {
+          if (group !== undefined) existing.group = validGroup;
+          const groupChanged = (existing.group || "") !== prevGroup;
+          if (
+            !enabled ||
+            (existing.proxyUrl || "") !== prevProxy ||
+            (existing.chatAgentId || "") !== prevAgent ||
+            groupChanged
+          ) {
+            if (groupChanged || !enabled) this.affinityTable.evictAllForKey(existing.rawKey);
             this.emitSlotInvalidated(existing.slotId);
           }
           this.persist();
           if (enabled) this.notifySlotAvailable(existing, this.maxInflightPerSlot);
+          if (groupChanged || !enabled) this.wakeWaitersIfPoolDepleted();
           return this.toSlotStatus(existing, this.affinityTable.countBySlot());
         }
       }
     }
+    const existingDirect = this.slots.find((s) => s.rawKey === normalized);
+    const prevProxy = existingDirect?.proxyUrl || "";
+    const prevAgent = existingDirect?.chatAgentId || "";
+    const prevGroup = existingDirect?.group || "";
     const autoWebLabel = webCred ? (webCred.email || `AWS #${webCred.accountId.slice(-4)}`) : undefined;
     const slot = this.upsertInternal(normalized, enabled, label || autoWebLabel);
     if (proxyUrl !== undefined) slot.proxyUrl = validProxy;
     if (chatAgentId !== undefined) slot.chatAgentId = validChatAgentId;
+    if (group !== undefined) slot.group = validGroup;
+    const directGroupChanged = Boolean(existingDirect) && (slot.group || "") !== prevGroup;
+    if (
+      existingDirect &&
+      (!enabled ||
+        (slot.proxyUrl || "") !== prevProxy ||
+        (slot.chatAgentId || "") !== prevAgent ||
+        directGroupChanged)
+    ) {
+      if (directGroupChanged || !enabled) this.affinityTable.evictAllForKey(slot.rawKey);
+      this.emitSlotInvalidated(slot.slotId);
+    }
     this.persist();
     if (enabled) this.notifySlotAvailable(slot, this.maxInflightPerSlot);
+    if (existingDirect && (directGroupChanged || !enabled)) this.wakeWaitersIfPoolDepleted();
     return this.toSlotStatus(slot, this.affinityTable.countBySlot());
   }
 
   updateSlotMeta(
     slotId: string,
-    patch: { enabled?: boolean; label?: string; proxyUrl?: string; chatAgentId?: string; clearCooldown?: boolean }
+    patch: { enabled?: boolean; label?: string; group?: string | null; proxyUrl?: string; chatAgentId?: string; clearCooldown?: boolean }
   ): KeySlotStatus {
     const slot = this.slots.find((s) => s.slotId === slotId);
     if (!slot) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
+
+    // Validate all mutable fields upfront before mutating slot or pool state.
+    const nextGroup = patch.group !== undefined ? normalizeAccountGroup(patch.group) : slot.group;
+    let nextProxy = slot.proxyUrl;
+    if (patch.proxyUrl !== undefined) {
+      try {
+        nextProxy = validateProxyUrl(patch.proxyUrl);
+      } catch (err) {
+        throw new GatewayError(err instanceof Error ? err.message : "Invalid proxy URL.", 400, "invalid_proxy_url");
+      }
+    }
+    const nextChatAgentId =
+      patch.chatAgentId !== undefined ? validateChatAgentId(patch.chatAgentId) : slot.chatAgentId;
 
     if (patch.clearCooldown) {
       slot.cooldownUntil = 0;
@@ -1591,15 +1947,24 @@ export class UpstreamKeyPool {
     if (patch.label !== undefined) {
       slot.label = patch.label.trim() || undefined;
     }
-    if (patch.proxyUrl !== undefined) {
-      try {
-        slot.proxyUrl = validateProxyUrl(patch.proxyUrl);
-      } catch (err) {
-        throw new GatewayError(err instanceof Error ? err.message : "Invalid proxy URL.", 400, "invalid_proxy_url");
+    let shouldInvalidateSlot = false;
+    let groupChanged = false;
+    if (patch.group !== undefined) {
+      if (nextGroup) this.accountGroups.add(nextGroup);
+      if ((slot.group || "") !== (nextGroup || "")) {
+        slot.group = nextGroup;
+        groupChanged = true;
+        this.affinityTable.evictAllForKey(slot.rawKey);
+        shouldInvalidateSlot = true;
       }
     }
-    if (patch.chatAgentId !== undefined) {
-      slot.chatAgentId = validateChatAgentId(patch.chatAgentId);
+    if (patch.proxyUrl !== undefined && (slot.proxyUrl || "") !== (nextProxy || "")) {
+      slot.proxyUrl = nextProxy;
+      shouldInvalidateSlot = true;
+    }
+    if (patch.chatAgentId !== undefined && (slot.chatAgentId || "") !== (nextChatAgentId || "")) {
+      slot.chatAgentId = nextChatAgentId;
+      shouldInvalidateSlot = true;
     }
     if (typeof patch.enabled === "boolean") {
       slot.enabled = patch.enabled;
@@ -1615,11 +1980,18 @@ export class UpstreamKeyPool {
         slot.autoDisabledReason = undefined;
         slot.autoDisabledKind = undefined;
         this.affinityTable.evictAllForKey(slot.rawKey);
+        shouldInvalidateSlot = true;
       }
     }
+    if (shouldInvalidateSlot) {
+      this.emitSlotInvalidated(slot.slotId);
+    }
     this.persist();
-    if (slot.enabled && (patch.enabled === true || patch.clearCooldown)) {
+    if (slot.enabled && (patch.enabled === true || patch.clearCooldown || groupChanged)) {
       this.notifySlotAvailable(slot, this.maxInflightPerSlot);
+    }
+    if (groupChanged || patch.enabled === false) {
+      this.wakeWaitersIfPoolDepleted();
     }
     return this.toSlotStatus(slot, this.affinityTable.countBySlot());
   }
@@ -1629,11 +2001,16 @@ export class UpstreamKeyPool {
     if (idx < 0) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
     const [removed] = this.slots.splice(idx, 1);
     if (removed) {
+      removed.enabled = false;
       this.seenEnvKeyHashes.add(hashEnvKeyForSeedTracking(removed.rawKey));
       this.affinityTable.evictAllForKey(removed.rawKey);
+      this.quotaProbeCooldownBySlot.delete(removed.slotId);
+      delete this.savedIdentities[removed.slotId];
       evictQuotaCachesForKey(removed.rawKey);
+      this.emitSlotInvalidated(removed.slotId);
     }
     this.persist();
+    this.wakeWaitersIfPoolDepleted();
   }
 
   affinitySnapshot(limit = 50): AffinityBindingView[] {
@@ -1649,6 +2026,7 @@ export class UpstreamKeyPool {
     return {
       slotId: slot.slotId,
       ...(slot.label ? { label: slot.label } : {}),
+      ...(slot.group ? { group: slot.group } : {}),
       authType: slot.authType,
       addedAt: slot.addedAt,
       maskedKey: slot.maskedKey,

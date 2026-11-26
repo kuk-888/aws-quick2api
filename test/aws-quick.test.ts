@@ -43,9 +43,10 @@ import {
   mapAttachmentUploadError,
   MAX_PARKED_WS_PER_SLOT,
   pinnedHttpGet,
+  QuickExecutionEngine,
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
-import { GatewayError } from "../src/core/types.js";
+import { GatewayError, type GatewayStreamEvent, type ParsedProtocolTurn } from "../src/core/types.js";
 import { assertDataDirWritable, findInsecurePlaceholderConfig, loadConfigFromEnv, readDotEnvRaw, resolveGatewayDataDir } from "../src/core/config.js";
 import { UpstreamKeyPool, validateChatAgentId } from "../src/core/key-pool.js";
 import {
@@ -3636,7 +3637,13 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       );
     };
 
-    type Scenario = "idle_timeout" | "mid_chunk_disconnect" | "turn_aborted_partial";
+    type Scenario =
+      | "idle_timeout"
+      | "mid_chunk_disconnect"
+      | "turn_aborted_partial"
+      | "thinking_multi_segment"
+      | "thinking_across_cloud_tool"
+      | "thinking_infinite_stall";
     let activeScenario: Scenario = "idle_timeout";
     const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
     await new Promise<void>((resolve) => wss.once("listening", resolve));
@@ -3675,6 +3682,48 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
               payload: { input_tokens: 120, output_tokens: 18, total_tokens: 138, context_window: 200_000 },
             });
             sendCloudOut(sock, { type: "turn_aborted", thread_id: tid, payload: {} });
+          } else if (activeScenario === "thinking_multi_segment") {
+            // Segment 1 thinking -> thinking_complete -> >140ms total elapsed -> Segment 2 thinking -> text
+            sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "seg 1 " } });
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) sendCloudOut(sock, { type: "thinking_complete", thread_id: tid, payload: {} });
+            }, 30);
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) sendCloudOut(sock, { type: "thinking_start", thread_id: tid, payload: {} });
+            }, 95);
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) {
+                sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "seg 2" } });
+                sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "MULTI_SEG_OK" } });
+                sendCloudOut(sock, { type: "message_complete", thread_id: tid, payload: {} });
+              }
+            }, 165);
+          } else if (activeScenario === "thinking_across_cloud_tool") {
+            // Thinking -> cloud tool_progress & tool_result -> >140ms total elapsed -> Thinking -> text
+            sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "reading..." } });
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) sendCloudOut(sock, { type: "tool_progress", thread_id: tid, payload: { tool_id: "t1" } });
+            }, 55);
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) sendCloudOut(sock, { type: "tool_result", thread_id: tid, payload: { tool_id: "t1" } });
+            }, 115);
+            setTimeout(() => {
+              if (sock.readyState === sock.OPEN) {
+                sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "done!" } });
+                sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "TOOL_THINK_OK" } });
+                sendCloudOut(sock, { type: "message_complete", thread_id: tid, payload: {} });
+              }
+            }, 175);
+          } else if (activeScenario === "thinking_infinite_stall") {
+            // Genuine single-segment infinite thinking loop with NO thinking_complete/tool/text
+            const iv = setInterval(() => {
+              if (sock.readyState !== sock.OPEN) {
+                clearInterval(iv);
+                return;
+              }
+              sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "loop " } });
+            }, 25);
+            sock.once("close", () => clearInterval(iv));
           }
         }
       });
@@ -3759,6 +3808,23 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.ok(r3.events.some((e) => e.type === "usage" && e.metrics.outputTokens === 18));
       assert.ok(r3.events.some((e) => e.type === "done" && e.stopReason === "stop"));
       assert.equal(r3.stats.warmIdleSessions, 0, "turn_aborted must NEVER park the WS for reuse");
+
+      // 4) Multi-segment thinking across thinking_complete (>140ms total) must NOT false-trip 504
+      const r4 = await runScenario("thinking_multi_segment", { runIdleTimeoutMs: 140 });
+      assert.equal(r4.caught, undefined, "thinking_complete must reset thinkingOnlyStartedAt");
+      assert.equal(r4.events.filter((e) => e.type === "text").map((e) => e.text).join(""), "MULTI_SEG_OK");
+
+      // 5) Thinking across cloud tool_progress / tool_result (>140ms total) must NOT false-trip 504
+      const r5 = await runScenario("thinking_across_cloud_tool", { runIdleTimeoutMs: 140 });
+      assert.equal(r5.caught, undefined, "tool_progress/tool_result must reset thinkingOnlyStartedAt");
+      assert.equal(r5.events.filter((e) => e.type === "text").map((e) => e.text).join(""), "TOOL_THINK_OK");
+
+      // 6) Genuine single-segment continuous thinking loop (>140ms) MUST still trip 504 timeout_error
+      const r6 = await runScenario("thinking_infinite_stall", { runIdleTimeoutMs: 140 });
+      assert.ok(r6.caught instanceof GatewayError, "genuine infinite thinking stall must throw GatewayError");
+      assert.equal(r6.caught.status, 504);
+      assert.equal(r6.caught.code, "timeout_error");
+      assert.match(r6.caught.message, /thinking stream stalled/i);
     } finally {
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     }
@@ -5297,11 +5363,11 @@ setInterval(() => {}, 10_000);
       const stubWsObj = {
         readyState: 1,
         close() { stubWsObj.readyState = 3; },
-        on() {},
-        off() {},
-        once() {},
-        ping() {},
-        send() {},
+        on() { },
+        off() { },
+        once() { },
+        ping() { },
+        send() { },
       };
       const stubWs = stubWsObj as unknown as import("ws").default;
       wp.park({
@@ -5404,8 +5470,2031 @@ setInterval(() => {}, 10_000);
       assert.equal(JSON.parse(readFileSync(tFile, "utf8")).records.length, 1);
       tl1.clear();
       assert.equal(JSON.parse(readFileSync(tFile, "utf8")).records.length, 0, "clear() must persist empty traces immediately");
+
+      // 9) v0.1.21 P1/P2: RequestTraceLogger persists thinkingEffort & post-sanitization effectiveSystemPromptChars
+      const tl2 = new RequestTraceLogger(20, tFile);
+      const tid2 = tl2.startTrace("anthropic-messages", {
+        requestedModel: "quick-smart-max",
+        systemPrompt: "X".repeat(1000),
+        rawBody: { messages: [{ role: "user", content: "hello" }] },
+        fullTranscriptText: "hello",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: true,
+        estimatedInputTokens: 300,
+      });
+      tl2.bindExecutionMeta(tid2, {
+        slotId: "slot_eff",
+        maskedKey: "oauth:test...1234",
+        execMode: "incognito",
+        thinkingEffort: "max",
+        effectiveSystemPromptChars: 240,
+      });
+      tl2.finishSuccess(tid2, "stop");
+      tl2.flush();
+      const tl2Reloaded = new RequestTraceLogger(20, tFile);
+      const d2 = tl2Reloaded.getDetail(tid2)!;
+      assert.equal(d2.thinkingEffort, "max");
+      assert.equal(d2.upstreamSentChars, 245, "cold upstreamSentChars must reflect post-sanitization system prompt chars");
+
+      // 10) v0.1.21 P2: deepSanitizeClientSystemPrompt strips short `</RULE>` closing tag and keeps newline after heading
+      const { deepSanitizeClientSystemPrompt } = await import("../src/core/tool-bridge.js");
+      const cleanedRule = deepSanitizeClientSystemPrompt(
+        "<user_rules><RULE[/repo/AGENTS.md]>STRICT_RULE_123</RULE></user_rules>",
+      );
+      assert.ok(cleanedRule.includes("### Rules (AGENTS.md)\nSTRICT_RULE_123"), `unexpected rule output: ${cleanedRule}`);
+      assert.ok(!/<\/?RULE/i.test(cleanedRule), `lingering RULE tag in: ${cleanedRule}`);
+
+      // 11) v0.1.21 P1: parallel_tool_calls: false trimming skips warmPool.park so Turn 2 doesn't diverge on stale upstream thread
+      const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+      const { UsageTracker } = await import("../src/services/usage-tracker.js");
+      const { StreamingToolCallFilter } = await import("../src/core/tool-bridge.js");
+      const { StreamingUiTagSanitizer } = await import("../src/core/ui-tag-sanitizer.js");
+      const { encodeCloudInputFrame, decodeCloudOutputFrame, encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+      const { EventEmitter } = await import("node:events");
+      const encodeMockServerOut = (ev: Record<string, unknown>) => {
+        const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+        return encodeEventStream(
+          { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+          Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+        );
+      };
+      const makeMockWs = (emitPayloads: Array<Record<string, unknown>>) => {
+        const ws = new EventEmitter() as unknown as import("ws").WebSocket & {
+          readyState: number;
+          closed: boolean;
+          sentCount: number;
+          send: (data: Buffer) => void;
+          close: () => void;
+          terminate: () => void;
+          ping: () => void;
+        };
+        ws.readyState = 1; // WebSocket.OPEN
+        ws.closed = false;
+        ws.sentCount = 0;
+        ws.ping = () => { };
+        ws.close = () => {
+          ws.closed = true;
+          ws.readyState = 3;
+        };
+        ws.terminate = () => {
+          ws.closed = true;
+          ws.readyState = 3;
+        };
+        ws.send = () => {
+          ws.sentCount += 1;
+          if (ws.sentCount === 1) {
+            setImmediate(() => {
+              ws.emit("message", encodeMockServerOut({ type: "session_established", payload: {} }));
+            });
+          } else if (ws.sentCount === 2) {
+            setImmediate(() => {
+              for (const p of emitPayloads) {
+                ws.emit("message", encodeMockServerOut(p));
+              }
+            });
+          }
+        };
+        return ws;
+      };
+      const warmPoolTrim = new WarmSessionPool({ maxWarmSessions: 4, warmSessionTtlMs: 60_000 });
+      const wsTrimmed = makeMockWs([
+        {
+          type: "text_delta",
+          payload: {
+            delta:
+              '<tool_call>{"name":"get_weather","arguments":{"city":"Tokyo"}}</tool_call>' +
+              '<tool_call>{"name":"get_stock","arguments":{"symbol":"AAPL"}}</tool_call>',
+          },
+        },
+        { type: "message_complete", thread_id: "thr-trim-1", payload: {} },
+      ]);
+      const trimTools = [
+        { name: "get_weather", inputSchema: { type: "object" } },
+        { name: "get_stock", inputSchema: { type: "object" } },
+      ];
+      const trimEvents = await collectTurnEvents(
+        runTurnStream({
+          ws: wsTrimmed,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-balanced",
+            rawBody: { parallel_tool_calls: false, messages: [{ role: "user", content: "call both" }] },
+            fullTranscriptText: "call both",
+            currentInputPrefixHash: "prefix-trim-1",
+            conversationKey: "conv-trim-1",
+            images: [],
+            tools: trimTools,
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 10,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-trim",
+          execMode: "incognito",
+          selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+          chunks: ["call both"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "call both",
+          toolFilter: new StreamingToolCallFilter(new Set(["get_weather", "get_stock"])),
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: "thr-trim-1",
+          effectiveRootThreadId: "thr-trim-1",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: false,
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        }),
+      );
+      assert.equal(trimEvents.toolCalls.length, 1, "must strictly emit 1 tool call when parallel_tool_calls: false");
+      assert.equal(warmPoolTrim.stats().warmIdleSessions, 0, "must NOT park WS when parallel tool calls were trimmed");
+      assert.equal(wsTrimmed.closed, true, "trimmed WS must be closed instead of parked");
+
+      // Companion check: single tool call (no trimming) with parallel_tool_calls: false MUST still park normally
+      const wsSingle = makeMockWs([
+        {
+          type: "text_delta",
+          payload: { delta: '<tool_call>{"name":"get_weather","arguments":{"city":"Tokyo"}}</tool_call>' },
+        },
+        { type: "message_complete", thread_id: "thr-trim-2", payload: {} },
+      ]);
+      const singleEvents = await collectTurnEvents(
+        runTurnStream({
+          ws: wsSingle,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-balanced",
+            rawBody: { parallel_tool_calls: false, messages: [{ role: "user", content: "call one" }] },
+            fullTranscriptText: "call one",
+            currentInputPrefixHash: "prefix-trim-2",
+            conversationKey: "conv-trim-2",
+            images: [],
+            tools: trimTools,
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 10,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-trim",
+          execMode: "incognito",
+          selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+          chunks: ["call one"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "call one",
+          toolFilter: new StreamingToolCallFilter(new Set(["get_weather", "get_stock"])),
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: "thr-trim-2",
+          effectiveRootThreadId: "thr-trim-2",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: false,
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        }),
+      );
+      assert.equal(singleEvents.toolCalls.length, 1);
+      assert.equal(warmPoolTrim.stats().warmIdleSessions, 1, "untrimmed single tool call must still park WS normally");
+
+      // 12) v0.1.21 UX: SHOW_ROUTED_MODEL_IN_THINKING (`true` vs `always` vs `false`), observed model cache (`routed≈`),
+      // trailing mismatch correction across protocols, single-block blank-line separation, and pool-state persistence
+      const { parseRoutedModelThinkingMode } = await import("../src/core/turn-stream-runner.js");
+      assert.equal(parseRoutedModelThinkingMode(undefined), "true");
+      assert.equal(parseRoutedModelThinkingMode(true), "true");
+      assert.equal(parseRoutedModelThinkingMode("true"), "true");
+      assert.equal(parseRoutedModelThinkingMode("auto"), "true");
+      assert.equal(parseRoutedModelThinkingMode("always"), "always");
+      assert.equal(parseRoutedModelThinkingMode(false), "false");
+      assert.equal(parseRoutedModelThinkingMode("false"), "false");
+      assert.equal(parseRoutedModelThinkingMode("off"), "false");
+
+      let resolvedFromCb = "";
+      const wsRoutedThink = makeMockWs([
+        { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-opus-5-5" } },
+        { type: "thinking_delta", payload: { delta: "Step 1: analyze." } },
+        { type: "text_delta", payload: { delta: "Final answer." } },
+        { type: "message_complete", thread_id: "thr-rt-1", payload: {} },
+      ]);
+      const rtEvents = await collectTurnEvents(
+        runTurnStream({
+          ws: wsRoutedThink,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-smart-max",
+            rawBody: { messages: [{ role: "user", content: "solve" }] },
+            fullTranscriptText: "solve",
+            images: [],
+            tools: [],
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 10,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-rt",
+          execMode: "incognito",
+          selection: { model: "quick-smart-max", agentMode: "smart", thinkingEffort: "max" },
+          chunks: ["solve"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "solve",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: "thr-rt-1",
+          effectiveRootThreadId: "thr-rt-1",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: "true",
+          onResolvedModel: (m) => { resolvedFromCb = m; },
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        }),
+      );
+      assert.equal(resolvedFromCb, "us.anthropic.claude-opus-5-5");
+      assert.equal(
+        rtEvents.thinking,
+        "[AWS Quick] mode=smart · effort=max · routed=us.anthropic.claude-opus-5-5\n\nStep 1: analyze.",
+        "routed header and real thinking must be separated by a clean blank line",
+      );
+
+      // Observed model cache (`routed≈`) with NO routing_decision (real AWS Quick OAuth flow):
+      // 12a) Cache hit on `turn_usage`: single thinking block, zero trailing correction
+      const wsObservedHit = makeMockWs([
+        { type: "thinking_delta", payload: { delta: "Analyzing with opus." } },
+        { type: "text_delta", payload: { delta: "Done." } },
+        { type: "turn_usage", payload: { input_tokens: 10, output_tokens: 5, resolved_model_id: "us.anthropic.claude-opus-5-5" } },
+        { type: "message_complete", thread_id: "thr-obs-hit", payload: {} },
+      ]);
+      const obsHitRaw: GatewayStreamEvent[] = [];
+      for await (const ev of runTurnStream({
+        ws: wsObservedHit,
+        isReusedOpenWs: false,
+        encodeFrame: encodeCloudInputFrame,
+        decodeFrame: decodeCloudOutputFrame,
+        isWeb: false,
+        surfaceType: "DESKTOP",
+        appVersion: "1.0.0",
+        surfaceName: "desktop",
+        outpostId: "op-1",
+        turn: {
+          requestedModel: "quick-smart-max",
+          rawBody: { messages: [{ role: "user", content: "hi" }] },
+          fullTranscriptText: "hi",
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          stream: true,
+          estimatedInputTokens: 5,
+        },
+        apiKey: "oauth:test",
+        slotId: "slot-rt",
+        execMode: "incognito",
+        selection: { model: "quick-smart-max", agentMode: "smart", thinkingEffort: "max" },
+        chunks: ["hi"],
+        effectiveCustomPrompt: null,
+        attachments: [],
+        rawPromptForRephrase: "hi",
+        toolFilter: null,
+        uiTagSanitizer: new StreamingUiTagSanitizer(),
+        threadId: "thr-obs-hit",
+        effectiveRootThreadId: "thr-obs-hit",
+        isIncognito: true,
+        isWarmIncremental: false,
+        isInternalHelperCall: false,
+        isRephraseRetry: false,
+        webSearchEnabled: false,
+        showRoutedModelInThinking: "true",
+        observedModelHint: "us.anthropic.claude-opus-5-5",
+        runIdleTimeoutMs: 10_000,
+        runMaxTimeoutMs: 10_000,
+        usageTracker: new UsageTracker(),
+        warmPool: warmPoolTrim,
+      })) {
+        obsHitRaw.push(ev);
+      }
+      assert.equal(
+        obsHitRaw.some((e) => e.type === "thinking" && e.lateRoutingCorrection),
+        false,
+        "matching observed hint must NOT emit any trailing correction",
+      );
+      const obsHitJoined = obsHitRaw.filter((e) => e.type === "thinking").map((e) => e.text).join("");
+      assert.equal(
+        obsHitJoined,
+        "[AWS Quick] mode=smart · effort=max · routed≈us.anthropic.claude-opus-5-5\n\nAnalyzing with opus.",
+      );
+
+      // 12b) Short effort=off reply: default `true` mode keeps plain effort=off replies clean (no synthetic thinking block),
+      // while `always` mode upgrades pending header in-place to exact `routed=` when `turn_usage` arrives before flush!
+      const makeShortOffStream = (mode: "true" | "always") =>
+        runTurnStream({
+          ws: makeMockWs([
+            { type: "text_delta", payload: { delta: "OK" } },
+            { type: "turn_usage", payload: { input_tokens: 10, output_tokens: 2, resolved_model_id: "us.anthropic.claude-sonnet-5-5" } },
+            { type: "message_complete", thread_id: `thr-short-off-${mode}`, payload: {} },
+          ]),
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-balanced",
+            rawBody: { messages: [{ role: "user", content: "ping" }] },
+            fullTranscriptText: "ping",
+            images: [],
+            tools: [],
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 5,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-rt",
+          execMode: "incognito",
+          selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+          chunks: ["ping"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "ping",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: `thr-short-off-${mode}`,
+          effectiveRootThreadId: `thr-short-off-${mode}`,
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: mode,
+          observedModelHint: "us.anthropic.claude-sonnet-5-5",
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        });
+      const shortOffTrue = await collectTurnEvents(makeShortOffStream("true"));
+      assert.equal(
+        shortOffTrue.thinking,
+        "",
+        "default true mode must not inject synthetic thinking into plain effort=off text replies",
+      );
+      const shortOffAlways = await collectTurnEvents(makeShortOffStream("always"));
+      assert.equal(
+        shortOffAlways.thinking,
+        "[AWS Quick] mode=balanced · effort=off · routed=us.anthropic.claude-sonnet-5-5\n",
+        "always mode must emit and upgrade pending routed header in-place on effort=off replies",
+      );
+
+      // 12c) Mismatched `turn_usage` after long streaming text: emits trailing correction event;
+      // verify Responses (trailing reasoning item), Chat (reasoning_content), Anthropic (drops post-text thinking), and collectTurnEvents (in-place Line 1 upgrade)
+      const longAnswer = "A".repeat(220);
+      const makeMismatchStream = () =>
+        runTurnStream({
+          ws: makeMockWs([
+            { type: "thinking_delta", payload: { delta: "Thinking..." } },
+            { type: "text_delta", payload: { delta: longAnswer } },
+            { type: "turn_usage", payload: { input_tokens: 15, output_tokens: 60, resolved_model_id: "us.anthropic.claude-opus-5-6" } },
+            { type: "message_complete", thread_id: "thr-obs-miss", payload: {} },
+          ]),
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-smart-max",
+            rawBody: { messages: [{ role: "user", content: "go" }] },
+            fullTranscriptText: "go",
+            images: [],
+            tools: [],
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 5,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-rt",
+          execMode: "incognito",
+          selection: { model: "quick-smart-max", agentMode: "smart", thinkingEffort: "max" },
+          chunks: ["go"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "go",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: "thr-obs-miss",
+          effectiveRootThreadId: "thr-obs-miss",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: "true",
+          observedModelHint: "us.anthropic.claude-opus-5-5",
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        });
+      const missCollected = await collectTurnEvents(makeMismatchStream());
+      assert.equal(
+        missCollected.thinking,
+        "[AWS Quick] mode=smart · effort=max · routed=us.anthropic.claude-opus-5-6\n\nThinking...",
+        "non-streaming collectTurnEvents must upgrade routed≈ to exact routed= in place with zero duplicate lines",
+      );
+      const dummyTurn: ParsedProtocolTurn = {
+        requestedModel: "quick-smart-max",
+        rawBody: { model: "quick-smart-max", stream: true },
+        fullTranscriptText: "go",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: true,
+        estimatedInputTokens: 5,
+      };
+      let respSse = "";
+      for await (const c of openAiResponsesAdapter.streamSse(makeMismatchStream(), dummyTurn)) respSse += c;
+      assert.ok(respSse.includes("routed≈us.anthropic.claude-opus-5-5"), "Responses SSE must show observed hint first");
+      assert.equal(
+        respSse.includes("actual_routed=us.anthropic.claude-opus-5-6"),
+        false,
+        "Responses SSE must drop post-text reasoning correction to preserve spec-valid [reasoning, message] item ordering",
+      );
+      const respCompletedLine = respSse
+        .split("\n\n")
+        .map((blk) => blk.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim())
+        .filter(Boolean)
+        .map((s) => JSON.parse(s!))
+        .find((ev) => ev.type === "response.completed");
+      assert.deepEqual(
+        respCompletedLine?.response?.output?.map((o: { type: string }) => o.type),
+        ["reasoning", "message"],
+        "Responses SSE completed output must strictly be [reasoning, message] without trailing reasoning item",
+      );
+      let chatSse = "";
+      for await (const c of openAiChatAdapter.streamSse(makeMismatchStream(), dummyTurn)) chatSse += c;
+      assert.ok(chatSse.includes("actual_routed=us.anthropic.claude-opus-5-6"), "OpenAI Chat SSE must emit trailing reasoning_content correction");
+      let anthSse = "";
+      for await (const c of anthropicMessagesAdapter.streamSse(makeMismatchStream(), dummyTurn)) anthSse += c;
+      assert.ok(anthSse.includes("routed≈us.anthropic.claude-opus-5-5"), "Anthropic SSE must show observed hint in opening thinking block");
+      assert.equal(anthSse.includes("actual_routed=us.anthropic.claude-opus-5-6"), false, "Anthropic SSE must drop post-text thinking to stay spec-valid");
+
+      // 12d) `always` mode emits routed header even when client explicitly sets `reasoning_effort: "none"`, while `true` respects it
+      const runDisabledThinking = async (mode: "true" | "always" | "false") => {
+        const ws = makeMockWs([
+          { type: "routing_decision", payload: { resolved_model_id: "us.anthropic.claude-sonnet-5-5" } },
+          { type: "text_delta", payload: { delta: "Hi" } },
+          { type: "message_complete", thread_id: `thr-rt-${mode}`, payload: {} },
+        ]);
+        return collectTurnEvents(
+          runTurnStream({
+            ws,
+            isReusedOpenWs: false,
+            encodeFrame: encodeCloudInputFrame,
+            decodeFrame: decodeCloudOutputFrame,
+            isWeb: false,
+            surfaceType: "DESKTOP",
+            appVersion: "1.0.0",
+            surfaceName: "desktop",
+            outpostId: "op-1",
+            turn: {
+              requestedModel: "quick-balanced",
+              rawBody: { reasoning_effort: "none", messages: [{ role: "user", content: "hi" }] },
+              fullTranscriptText: "hi",
+              images: [],
+              tools: [],
+              toolChoice: "auto",
+              trailingToolResults: [],
+              stream: true,
+              estimatedInputTokens: 5,
+            },
+            apiKey: "oauth:test",
+            slotId: "slot-rt",
+            execMode: "incognito",
+            selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+            chunks: ["hi"],
+            effectiveCustomPrompt: null,
+            attachments: [],
+            rawPromptForRephrase: "hi",
+            toolFilter: null,
+            uiTagSanitizer: new StreamingUiTagSanitizer(),
+            threadId: `thr-rt-${mode}`,
+            effectiveRootThreadId: `thr-rt-${mode}`,
+            isIncognito: true,
+            isWarmIncremental: false,
+            isInternalHelperCall: false,
+            isRephraseRetry: false,
+            webSearchEnabled: false,
+            showRoutedModelInThinking: mode,
+            runIdleTimeoutMs: 10_000,
+            runMaxTimeoutMs: 10_000,
+            usageTracker: new UsageTracker(),
+            warmPool: warmPoolTrim,
+          }),
+        );
+      };
+      const trueDisabled = await runDisabledThinking("true");
+      assert.equal(trueDisabled.thinking, "", "true mode must respect explicit reasoning_effort=none");
+      const falseDisabled = await runDisabledThinking("false");
+      assert.equal(falseDisabled.thinking, "", "false mode must suppress routed header");
+      const alwaysDisabled = await runDisabledThinking("always");
+      assert.equal(
+        alwaysDisabled.thinking,
+        "[AWS Quick] mode=balanced · effort=off · routed=us.anthropic.claude-sonnet-5-5\n",
+        "always mode must emit compact single-line routed header even when reasoning_effort=none",
+      );
+
+      // 12d-bis) Case-insensitive explicit disable ("NONE") & leading-whitespace before real thinking_delta
+      const wsCaseDisable = makeMockWs([
+        { type: "thinking_delta", payload: { delta: "hidden?" } },
+        { type: "text_delta", payload: { delta: "Answer." } },
+        { type: "message_complete", thread_id: "thr-case-off", payload: {} },
+      ]);
+      const caseOffRes = await collectTurnEvents(
+        runTurnStream({
+          ws: wsCaseDisable,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+          outpostId: "op-1",
+          turn: {
+            requestedModel: "quick-smart-max",
+            rawBody: { reasoning_effort: "NONE", messages: [{ role: "user", content: "hi" }] },
+            fullTranscriptText: "hi",
+            images: [],
+            tools: [],
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 5,
+          },
+          apiKey: "oauth:test",
+          slotId: "slot-rt",
+          execMode: "incognito",
+          selection: { model: "quick-smart-max", agentMode: "smart", thinkingEffort: "off" },
+          chunks: ["hi"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "hi",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          threadId: "thr-case-off",
+          effectiveRootThreadId: "thr-case-off",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          isRephraseRetry: false,
+          webSearchEnabled: false,
+          showRoutedModelInThinking: "true",
+          observedModelHint: "us.anthropic.claude-opus-5-5",
+          runIdleTimeoutMs: 10_000,
+          runMaxTimeoutMs: 10_000,
+          usageTracker: new UsageTracker(),
+          warmPool: warmPoolTrim,
+        }),
+      );
+      assert.equal(caseOffRes.thinking.includes("[AWS Quick]"), false, "uppercase reasoning_effort=NONE must suppress routed thinking header in true mode");
+
+      const wsLeadWs = makeMockWs([
+        { type: "text_delta", payload: { delta: "   \n" } },
+        { type: "thinking_delta", payload: { delta: "Real reasoning." } },
+        { type: "text_delta", payload: { delta: "Final." } },
+        { type: "message_complete", thread_id: "thr-lead-ws", payload: {} },
+      ]);
+      const leadWsEvents: GatewayStreamEvent[] = [];
+      for await (const ev of runTurnStream({
+        ws: wsLeadWs,
+        isReusedOpenWs: false,
+        encodeFrame: encodeCloudInputFrame,
+        decodeFrame: decodeCloudOutputFrame,
+        isWeb: false,
+        surfaceType: "DESKTOP",
+        appVersion: "1.0.0",
+        surfaceName: "desktop",
+        outpostId: "op-1",
+        turn: {
+          requestedModel: "quick-smart-max",
+          rawBody: { messages: [{ role: "user", content: "hi" }] },
+          fullTranscriptText: "hi",
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          stream: true,
+          estimatedInputTokens: 5,
+        },
+        apiKey: "oauth:test",
+        slotId: "slot-rt",
+        execMode: "incognito",
+        selection: { model: "quick-smart-max", agentMode: "smart", thinkingEffort: "max" },
+        chunks: ["hi"],
+        effectiveCustomPrompt: null,
+        attachments: [],
+        rawPromptForRephrase: "hi",
+        toolFilter: null,
+        uiTagSanitizer: new StreamingUiTagSanitizer(),
+        threadId: "thr-lead-ws",
+        effectiveRootThreadId: "thr-lead-ws",
+        isIncognito: true,
+        isWarmIncremental: false,
+        isInternalHelperCall: false,
+        isRephraseRetry: false,
+        webSearchEnabled: false,
+        showRoutedModelInThinking: "true",
+        observedModelHint: "us.anthropic.claude-opus-5-5",
+        runIdleTimeoutMs: 10_000,
+        runMaxTimeoutMs: 10_000,
+        usageTracker: new UsageTracker(),
+        warmPool: warmPoolTrim,
+      })) {
+        leadWsEvents.push(ev);
+      }
+      const firstTextIdx = leadWsEvents.findIndex((e) => e.type === "text");
+      const firstThinkIdx = leadWsEvents.findIndex((e) => e.type === "thinking");
+      assert.ok(firstThinkIdx >= 0 && (firstTextIdx === -1 || firstThinkIdx < firstTextIdx), "leading whitespace before thinking_delta must not emit text ahead of thinking");
+
+      // 12e) Pool-state persistence + QuickExecutionEngine observed cache seeding
+      const poolRoutedDir = path.join(tmpDir, "routed-settings-pool");
+      mkdirSync(poolRoutedDir, { recursive: true });
+      const poolR1 = new UpstreamKeyPool(
+        loadConfigFromEnv({ QUICK_TOKENS: "oauth:r1", DATA_DIR: poolRoutedDir, SHOW_ROUTED_MODEL_IN_THINKING: "true" }),
+      );
+      assert.equal(poolR1.getSettings().showRoutedModelInThinking, "true");
+      poolR1.updateSettings({ showRoutedModelInThinking: "always" });
+      await poolR1.flushStateAsync();
+      poolR1.dispose();
+      const poolR2 = new UpstreamKeyPool(
+        loadConfigFromEnv({ QUICK_TOKENS: "oauth:r1", DATA_DIR: poolRoutedDir, SHOW_ROUTED_MODEL_IN_THINKING: "true" }),
+      );
+      assert.equal(poolR2.getSettings().showRoutedModelInThinking, "always", "showRoutedModelInThinking must persist via pool-state.json across restarts");
+      poolR2.updateSettings({ showRoutedModelInThinking: "false" });
+      await poolR2.flushStateAsync();
+      poolR2.dispose();
+      const poolR3 = new UpstreamKeyPool(
+        loadConfigFromEnv({ QUICK_TOKENS: "oauth:r1", DATA_DIR: poolRoutedDir }),
+      );
+      assert.equal(poolR3.getSettings().showRoutedModelInThinking, "false");
+      poolR3.dispose();
+
+      // Legacy pool-state.json without showRoutedModelInThinking must honor .env config on upgrade
+      const legacyDir = path.join(tmpDir, "routed-legacy-upgrade");
+      mkdirSync(legacyDir, { recursive: true });
+      writeFileSync(
+        path.join(legacyDir, "pool-state.json"),
+        JSON.stringify({ version: 1, activeKeys: ["oauth:r1"], disabledKeys: [], lbStrategy: "quota-aware" }),
+      );
+      const poolLegacy = new UpstreamKeyPool(
+        loadConfigFromEnv({ QUICK_TOKENS: "oauth:r1", DATA_DIR: legacyDir, SHOW_ROUTED_MODEL_IN_THINKING: "false" }),
+      );
+      assert.equal(poolLegacy.getSettings().showRoutedModelInThinking, "false", "legacy pool-state upgrade must inherit .env preference");
+      poolLegacy.dispose();
+
+      const seedEngine = new QuickExecutionEngine({
+        config: loadConfigFromEnv({ QUICK_TOKENS: "oauth:r1" }),
+        usageTracker: new UsageTracker(),
+      });
+      seedEngine.seedObservedModels([
+        { slotId: "slotA", agentMode: "smart", resolvedModel: "us.anthropic.claude-opus-5-4" },
+        { slotId: "slotA", agentMode: "smart", resolvedModel: "us.anthropic.claude-opus-5-5" },
+        { slotId: "slotB", agentMode: "balanced", resolvedModel: "us.anthropic.claude-sonnet-5-5" },
+      ]);
+      assert.equal(seedEngine.getObservedModelHint("slotA", "smart"), "us.anthropic.claude-opus-5-5");
+      assert.equal(seedEngine.getObservedModelHint("slotC", "smart"), "us.anthropic.claude-opus-5-5", "unknown slot must fall back to mode-level latest observation");
+      assert.equal(seedEngine.getObservedModelHint("slotA", "balanced"), "us.anthropic.claude-sonnet-5-5");
+      await seedEngine.disposeAll();
+
+      // 13) v0.1.21 UX: dynamic OOB inline window fits in a single WS frame even for 100% 3-byte CJK context
+      const { buildOutOfBandContextPrompt, splitPromptIntoSafeChunks } = await import("../src/core/media-utils.js");
+      const cjkHuge = `顶部需求：请汇总日志。\n${"这是一段中文上下文历史日志内容。".repeat(3_500)}\n尾部问题：直接返回状态码。`;
+      const cjkWrapped = buildOutOfBandContextPrompt(cjkHuge, "conversation_context_cjk12345.txt", 11_000, false, "顶部需求：请汇总日志。");
+      const cjkChunks = splitPromptIntoSafeChunks(cjkWrapped, "S".repeat(10_000), 49_500);
+      assert.equal(cjkChunks.chunks.length, 1, "dynamic OOB CJK excerpt must never spill into multiple WS chunks");
+      assert.ok(cjkWrapped.includes("尾部问题：直接返回状态码。"));
+
+      // 14) Client-agnostic volatile metadata normalization (`normalizeUserTurnForHash`):
+      // Cursor (`<user_info>`, `<open_and_recently_viewed_files>`), Codex (`<environment_context>`),
+      // Cline/Roo/Kilo (`<environment_details>`), DSH/Windsurf/Antigravity (`<workspace_context>`, `<ADDITIONAL_METADATA>`, timestamps)
+      // must keep BOTH `conversationKey` AND `priorPrefixHash` 100% stable across turns while never stripping HTML/code tags
+      const { deriveConversationAffinityKey } = await import("../src/core/session-affinity.js");
+      const ideSamples: Array<[string, string, string]> = [
+        [
+          "Cursor",
+          "<user_info>Time: 16:00:01</user_info><open_and_recently_viewed_files>a.ts</open_and_recently_viewed_files>\nFix bug X in <div>",
+          "<user_info>Time: 16:05:59</user_info><open_and_recently_viewed_files>a.ts,b.ts</open_and_recently_viewed_files>\nFix bug X in <div>",
+        ],
+        [
+          "Codex",
+          "<environment_context><cwd>/repo</cwd><shell>zsh</shell></environment_context>\nRefactor auth",
+          "<environment_context><cwd>/repo/sub</cwd><shell>zsh</shell></environment_context>\nRefactor auth",
+        ],
+        [
+          "DSH/Antigravity",
+          "<workspace_context>branch=main</workspace_context><ADDITIONAL_METADATA>Current local time: 2026-11-26T16:00:00+08:00</ADDITIONAL_METADATA>\nCurrent time: 2026-11-26 16:00:01\nRun build",
+          "<workspace_context>branch=feat</workspace_context><ADDITIONAL_METADATA>Current local time: 2026-11-26T16:35:59+08:00</ADDITIONAL_METADATA>\nCurrent time: 2026-11-26 16:35:59\nRun build",
+        ],
+      ];
+      for (const [ideName, t1User, t2UserMutated] of ideSamples) {
+        const ck1 = deriveConversationAffinityKey({ headers: {}, rawBody: {}, firstUserText: t1User });
+        const ck2 = deriveConversationAffinityKey({ headers: {}, rawBody: {}, firstUserText: t2UserMutated });
+        assert.equal(ck2, ck1, `${ideName}: mutating volatile IDE metadata in Turn 1 must keep conversationKey identical`);
+        const hT1 = computeDialogPrefixHashes({
+          systemPrompt: ideName,
+          toolNamesSignature: "read_file",
+          items: [{ role: "user", text: t1User, images: [], hasTools: false }],
+        });
+        const hT2 = computeDialogPrefixHashes({
+          systemPrompt: ideName,
+          toolNamesSignature: "read_file",
+          items: [
+            { role: "user", text: t2UserMutated, images: [], hasTools: false },
+            { role: "assistant", text: "Done.", images: [], hasTools: false },
+            { role: "user", text: "<environment_details>cwd=/app</environment_details>\nNext step", images: [], hasTools: false },
+          ],
+        });
+        assert.equal(
+          hT2.priorPrefixHash,
+          extendHashWithAssistantTurn(hT1.currentInputPrefixHash!, "Done."),
+          `${ideName}: mutating volatile IDE metadata in Turn 1 must still hit warm_incremental`,
+        );
+      }
+      // HTML tags in normal user text must NOT be stripped (distinct questions stay distinct)
+      const ckHtmlA = deriveConversationAffinityKey({ headers: {}, rawBody: {}, firstUserText: "Style <div>alpha</div> please" });
+      const ckHtmlB = deriveConversationAffinityKey({ headers: {}, rawBody: {}, firstUserText: "Style <div>beta</div> please" });
+      assert.notEqual(ckHtmlA, ckHtmlB, "normal HTML tags must never be stripped from conversation hash");
+      warmPoolTrim.invalidateAll();
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+
+  it("supports Issue #9 account group isolation (strict scheduling, real-time move/rename/delete, traces) and Issue #12 proxy fallback + qbs-event/qbsproxy inner error checks", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-v0121-i9-i12-"));
+    try {
+      // --- Part A: Issue #12 Proxy Env Fallback & NO_PROXY ---
+      const { resolveEffectiveProxyUrl } = await import("../src/utils/proxy-agent.js");
+      assert.equal(
+        resolveEffectiveProxyUrl("http://explicit:8080", "https://example.com", { HTTPS_PROXY: "http://env:9090" }),
+        "http://explicit:8080",
+        "explicit per-account proxy must take precedence",
+      );
+      assert.equal(
+        resolveEffectiveProxyUrl(undefined, "https://example.com", { https_proxy: "http://lower:7890" }),
+        "http://lower:7890",
+        "lowercase https_proxy must be honored",
+      );
+      assert.equal(
+        resolveEffectiveProxyUrl(undefined, "https://example.com", { ALL_PROXY: "socks5://127.0.0.1:1080" }),
+        "socks5://127.0.0.1:1080",
+        "ALL_PROXY fallback must be honored",
+      );
+      assert.equal(
+        resolveEffectiveProxyUrl(undefined, "https://127.0.0.1:8443/test", { HTTPS_PROXY: "http://env:9090" }),
+        undefined,
+        "loopback target must bypass env proxy fallback",
+      );
+      assert.equal(
+        resolveEffectiveProxyUrl(undefined, "https://api.internal.corp/v1", {
+          HTTPS_PROXY: "http://env:9090",
+          no_proxy: "localhost,.internal.corp",
+        }),
+        undefined,
+        "NO_PROXY/no_proxy suffix rule must bypass env proxy fallback",
+      );
+
+      // --- Part B: Issue #12 OAuth qbs-event workingSessionId + inner status/error & Web qbsproxy Referer + inner status ---
+      const { fetchOAuthProfileUsage } = await import("../src/aws-quick/oauth-client.js");
+      const { fetchWebProfileUsage } = await import("../src/aws-quick/web-client.js");
+      const origFetch = globalThis.fetch;
+      const sampleOAuthCred = {
+        mode: "oauth" as const,
+        region: "us-east-1",
+        issuerUrl: "https://view.awsapps.com/start",
+        wsHost: "qbs-test.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+        clientId: "cid-i12",
+        clientSecret: "csec-i12",
+        refreshToken: "ref-i12",
+        accessToken: "acc-valid-i12",
+        expiresAt: Date.now() + 3600_000,
+      };
+      try {
+        let capturedWorkingSessionId = "";
+        globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+          const parsed = JSON.parse(String(init?.body || "{}"));
+          capturedWorkingSessionId = String(parsed?.eventBody?.invokeAgent?.workingSessionId || "");
+          return new Response(
+            JSON.stringify({
+              eventResponse: {
+                invokeAgentResponse: JSON.stringify({ status: 403, body: '{"message":"Tenant forbidden"}' }),
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }) as unknown as typeof fetch;
+
+        await assert.rejects(
+          () => fetchOAuthProfileUsage(sampleOAuthCred),
+          /inner 403.*Tenant forbidden/,
+          "qbs-event must reject inner status >= 400 and include error summary",
+        );
+        assert.ok(capturedWorkingSessionId.length >= 16, "qbs-event invokeAgent must include workingSessionId");
+
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ errorMessage: "AccessDeniedException" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          })) as unknown as typeof fetch;
+        await assert.rejects(
+          () => fetchOAuthProfileUsage(sampleOAuthCred),
+          /AccessDeniedException/,
+          "qbs-event must reject envelope.errorMessage",
+        );
+
+        let capturedReferer = "";
+        globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+          const h = (init?.headers || {}) as Record<string, string>;
+          capturedReferer = h.Referer || h.referer || "";
+          return new Response(
+            JSON.stringify({ status: 401, body: '{"error":"SessionExpired"}' }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }) as unknown as typeof fetch;
+        await assert.rejects(
+          () =>
+            fetchWebProfileUsage({
+              accountId: "123456789012",
+              mbtc: "mbtc-token",
+              cookie: "a=b",
+            }),
+          /inner 401.*SessionExpired/,
+          "web qbsproxy must reject inner status >= 400",
+        );
+        assert.equal(capturedReferer, "https://quick.aws.com/", "web qbsproxy must send Referer header");
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+
+      // --- Part C: Issue #9 Account Groups + Strict Key Binding + Real-Time Isolation + Persistence ---
+      const cfg = loadConfigFromEnv({ QUICK_TOKENS: "", DATA_DIR: tmpDir, GATEWAY_TOKEN: "sk-global-i9-token-1234" });
+      const pool = new UpstreamKeyPool({ ...cfg, lbStrategy: "round-robin" });
+      const clientKeys = new ClientGatewayKeyManager({
+        gatewayTokens: cfg.gatewayTokens,
+        dataDir: tmpDir,
+      });
+
+      pool.createGroup("team-a");
+      pool.createGroup("team-b");
+      const a1 = pool.addKey("key_team_a_one_11111", true, "A1", undefined, undefined, "team-a");
+      const a2 = pool.addKey("key_team_a_two_22222", true, "A2", undefined, undefined, "team-a");
+      const b1 = pool.addKey("key_team_b_one_33333", true, "B1", undefined, undefined, "team-b");
+      const g1 = pool.addKey("key_global_one_44444", true, "G1");
+
+      const { view: keyAView, rawToken: keyAToken } = clientKeys.createKey({
+        name: "Team A Key",
+        accountGroup: "team-a",
+      });
+      assert.equal(keyAView.accountGroup, "team-a");
+      const authA = clientKeys.authenticateClient(keyAToken);
+      assert.equal(authA.accountGroup, "team-a");
+
+      // Strict isolation: 10 leases for KeyA must ONLY pick A1 or A2, never B1 or G1
+      const pickedSlots = new Set<string>();
+      for (let i = 0; i < 10; i += 1) {
+        const lease = await pool.leaseKeyWithWait("quick-balanced", undefined, undefined, {
+          accountGroup: authA.accountGroup,
+          maxWaitMs: 0,
+        });
+        pickedSlots.add(lease.slotId);
+        assert.equal(lease.group, "team-a");
+        lease.release();
+      }
+      assert.deepEqual([...pickedSlots].sort(), [a1.slotId, a2.slotId].sort());
+
+      // Sticky affinity + real-time group move: bind conv-a to a1, then move a1 to team-b -> MUST immediately stop leasing a1
+      const stickyFirst = await pool.leaseKeyWithWait("quick-balanced", new Set(["key_team_a_two_22222"]), "conv-team-a-1", {
+        accountGroup: "team-a",
+        maxWaitMs: 0,
+      });
+      assert.equal(stickyFirst.slotId, a1.slotId);
+      stickyFirst.release();
+      pool.updateSlotMeta(a1.slotId, { group: "team-b" });
+      const afterMove = await pool.leaseKeyWithWait("quick-balanced", undefined, "conv-team-a-1", {
+        accountGroup: "team-a",
+        maxWaitMs: 0,
+      });
+      assert.equal(afterMove.slotId, a2.slotId, "moving a1 out of team-a must immediately evict affinity and stay inside team-a");
+      afterMove.release();
+
+      // When ALL team-a accounts are exhausted/disabled while team-b & global remain healthy -> MUST fail strictly (never fallback!)
+      pool.reportQuotaExhausted("key_team_a_two_22222", "quick-balanced", "team-a exhausted");
+      await assert.rejects(
+        () => pool.leaseKeyWithWait("quick-balanced", undefined, "conv-team-a-1", { accountGroup: "team-a", maxWaitMs: 50 }),
+        (err: unknown) => {
+          const e = err as { status?: number; code?: string; message?: string };
+          return (e.status === 503 || e.status === 429) && /team-a/.test(e.message || "");
+        },
+        "exhausted group must error strictly and never fall back to team-b or global pool",
+      );
+      // Confirm global/team-b remain unaffected
+      const bLease = await pool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "team-b", maxWaitMs: 0 });
+      assert.ok(bLease.slotId === b1.slotId || bLease.slotId === a1.slotId);
+      bLease.release();
+      const globalLease = await pool.leaseKeyWithWait("quick-balanced", undefined, undefined, { maxWaitMs: 0 });
+      assert.ok(
+        [pool.statusSnapshot()[0]!.slotId, b1.slotId, a1.slotId, g1.slotId].includes(globalLease.slotId) &&
+        globalLease.slotId !== a2.slotId,
+        "global pool must remain healthy and skip exhausted team-a slot",
+      );
+      globalLease.release();
+
+      // Group rename propagates to slots & sub-keys and persists across restart
+      pool.updateSlotMeta(a2.slotId, { enabled: true });
+      const renamed = pool.renameGroup("team-a", "team-alpha");
+      assert.equal(renamed.movedSlots, 1);
+      assert.equal(clientKeys.renameAccountGroup("team-a", "team-alpha"), 1);
+      pool.flushStateToDisk();
+      clientKeys.flushStatsToDisk();
+
+      const poolReloaded = new UpstreamKeyPool({ ...cfg, lbStrategy: "round-robin" });
+      const keysReloaded = new ClientGatewayKeyManager({ gatewayTokens: cfg.gatewayTokens, dataDir: tmpDir });
+      assert.equal(poolReloaded.statusSnapshot().find((s) => s.slotId === a2.slotId)?.group, "team-alpha");
+      assert.equal(keysReloaded.authenticateClient(keyAToken).accountGroup, "team-alpha");
+
+      // Group delete ungroups slots and blocks bound key cleanly (never leaks to global pool)
+      const deleted = poolReloaded.deleteGroup("team-alpha");
+      assert.equal(deleted.ungroupedSlots, 1);
+      await assert.rejects(
+        () => poolReloaded.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "team-alpha", maxWaitMs: 0 }),
+        (err: unknown) => (err as { status?: number; code?: string }).status === 503 && (err as { code?: string }).code === "group_no_enabled_keys",
+      );
+      // Orphaned group summary: deleted group still referenced by bound sub-key reports defined=false
+      const orphanSummary = poolReloaded
+        .listGroupSummaries(keysReloaded.countByAccountGroup())
+        .find((g) => g.name === "team-alpha");
+      assert.ok(orphanSummary, "deleted group with bound key must remain visible as orphaned");
+      assert.equal(orphanSummary?.defined, false);
+      assert.equal(orphanSummary?.boundKeys, 1);
+
+      // Concurrency & Race Boundaries (R1-R3):
+      // R1: Queued waiter in group "race-a" seamlessly acquires slot after live renameGroup("race-a" -> "race-a2")
+      const racePool = new UpstreamKeyPool({ ...cfg, dataDir: undefined, maxInflightPerSlot: 1 });
+      const raSlot = racePool.addKey("oauth:race-a", true, "RA", undefined, undefined, "race-a");
+      const rbSlot = racePool.addKey("oauth:race-b", true, "RB", undefined, undefined, "race-b");
+      const holdA = await racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-a", maxWaitMs: 0 });
+      const queuedRenamePromise = racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-a", maxWaitMs: 2_000 });
+      await new Promise((r) => setTimeout(r, 25));
+      racePool.renameGroup("race-a", "race-a2");
+      holdA.release();
+      const leasedAfterRename = await queuedRenamePromise;
+      assert.equal(leasedAfterRename.slotId, raSlot.slotId, "queued waiter must follow live renameGroup without spurious 503");
+      assert.equal(leasedAfterRename.group, "race-a2");
+      leasedAfterRename.release();
+
+      // R2: Queue saturation in group "race-a2" must NEVER reject a waiter in independent group "race-b"
+      const holdA2 = await racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-a2", maxWaitMs: 0 });
+      const holdB = await racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-b", maxWaitMs: 0 });
+      const acA = new AbortController();
+      const satWaiters = Array.from({ length: 4 }, () =>
+        racePool
+          .leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-a2", maxWaitMs: 2_000, signal: acA.signal })
+          .catch(() => null),
+      );
+      await new Promise((r) => setTimeout(r, 20));
+      const waitBPromise = racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-b", maxWaitMs: 1_500 });
+      setTimeout(() => holdB.release(), 30);
+      const leasedB = await waitBPromise;
+      assert.equal(leasedB.slotId, rbSlot.slotId, "group B waiter must not be blocked by group A queue saturation");
+      leasedB.release();
+      acA.abort();
+      await Promise.all(satWaiters);
+      holdA2.release();
+
+      // R3: removeKey on busy last slot immediately wakes queued waiter (<500ms) with 503 AND fires onSlotInvalidated
+      const invalidatedIds: string[] = [];
+      racePool.setOnSlotInvalidated((sid) => invalidatedIds.push(sid));
+      const holdDel = await racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-b", maxWaitMs: 0 });
+      const tDel0 = Date.now();
+      const waitDelPromise = racePool.leaseKeyWithWait("quick-balanced", undefined, undefined, { accountGroup: "race-b", maxWaitMs: 3_000 });
+      await new Promise((r) => setTimeout(r, 25));
+      racePool.removeKey(rbSlot.slotId);
+      await assert.rejects(
+        () => waitDelPromise,
+        (err: unknown) => (err as { status?: number; code?: string }).status === 503 && (err as { code?: string }).code === "group_no_enabled_keys",
+      );
+      assert.ok(Date.now() - tDel0 < 1_000, "removeKey must wake depleted group waiters immediately instead of hanging");
+      assert.ok(invalidatedIds.includes(rbSlot.slotId), "removeKey must invoke onSlotInvalidated to evict parked WS");
+      holdDel.release();
+      racePool.dispose();
+
+      // RequestTraceLogger persists accountGroup alongside key & account
+      const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+      const tracePath = path.join(tmpDir, "traces-i9.json");
+      const tl = new RequestTraceLogger(20, tracePath);
+      const trId = tl.startTrace(
+        "anthropic-messages",
+        {
+          requestedModel: "quick-balanced",
+          rawBody: { messages: [{ role: "user", content: "hi" }] },
+          fullTranscriptText: "hi",
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          stream: false,
+          estimatedInputTokens: 3,
+        },
+        { keyId: keyAView.id, keyName: "Team A Key", accountGroup: "team-alpha" },
+      );
+      tl.bindExecutionMeta(trId, {
+        slotId: a2.slotId,
+        maskedKey: a2.maskedKey,
+        accountLabel: "A2",
+        accountGroup: "team-alpha",
+        execMode: "incognito",
+      });
+      tl.finishSuccess(trId, "stop");
+      tl.flush();
+      const tlReload = new RequestTraceLogger(20, tracePath);
+      const detail = tlReload.getDetail(trId)!;
+      assert.equal(detail.clientKeyName, "Team A Key");
+      assert.equal(detail.accountGroup, "team-alpha");
+      assert.equal(detail.accountLabel, "A2");
+
+      // UI check: dashboard HTML includes group management modal, key group selector, and #### heading regex
+      const html = renderDashboardHtml("/dashboard", "testnonce");
+      assert.ok(html.includes('id="groupsModal"'));
+      assert.ok(html.includes('id="ckGroupSelect"'));
+      assert.ok(html.includes('id="credGroupFilter"'));
+      assert.ok(html.includes("^#{3,4}"));
+
+      pool.dispose();
+      poolReloaded.dispose();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("deep-audit regression: startup trace seeding resilience, O(N) hash scanner, proxy NO_PROXY/IPv6, inner-status mapping, and atomic group invariants", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-deep-audit-"));
+    try {
+      // 1. P0: Unknown/retired model 404 persisted in request-traces.json must NEVER brick next startup
+      const tracePath = path.join(tmpDir, "request-traces.json");
+      const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+      const seedTl = new RequestTraceLogger(20, tracePath);
+      const badTraceId = seedTl.startTrace("openai-chat", {
+        requestedModel: "gpt-4o-totally-unknown",
+        rawBody: { model: "gpt-4o-totally-unknown", messages: [{ role: "user", content: "hi" }] },
+        fullTranscriptText: "hi",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: false,
+        estimatedInputTokens: 2,
+      });
+      seedTl.finishError(badTraceId, 404, "Model 'gpt-4o-totally-unknown' not found.");
+      seedTl.flush();
+
+      const bootCfg = loadConfigFromEnv({
+        HOST: "127.0.0.1",
+        PORT: "0",
+        GATEWAY_TOKEN: "sk-aq-deep-audit-token-1234567890",
+        ADMIN_PASSWORD: "AuditPassword123!",
+        QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+        DATA_DIR: tmpDir,
+        ENV_FILE_PATH: path.join(tmpDir, ".env"),
+        ENABLE_DASHBOARD: "true",
+      });
+      const gw = createGatewayServer({ config: bootCfg });
+      await new Promise<void>((resolve) => gw.server.listen(0, "127.0.0.1", resolve));
+      const addr = gw.server.address();
+      assert.ok(addr && typeof addr === "object");
+      const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+      try {
+        // Admin login to verify HTTP admin invariants (orphan resurrection, batch set-group, rename-onto-orphan)
+        const loginResp = await fetch(`${baseUrl}/v1/admin/login`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ password: "AuditPassword123!" }),
+        });
+        assert.equal(loginResp.status, 200);
+        const loginJson = (await loginResp.json()) as { token: string };
+        const adminHeaders = { "content-type": "application/json", authorization: `Bearer ${loginJson.token}` };
+
+        // Create group "vip" + bound sub-key + group "team-a", then delete "vip"
+        const g1 = await fetch(`${baseUrl}/v1/admin/groups`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ name: "vip" }) });
+        assert.equal(g1.status, 200);
+        const g2 = await fetch(`${baseUrl}/v1/admin/groups`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ name: "team-a" }) });
+        assert.equal(g2.status, 200);
+        const ckResp = await fetch(`${baseUrl}/v1/admin/client-keys`, {
+          method: "POST",
+          headers: adminHeaders,
+          body: JSON.stringify({ name: "VIP Key", accountGroup: "vip" }),
+        });
+        assert.equal(ckResp.status, 200);
+        const ckData = (await ckResp.json()) as { key: { id: string } };
+        const delVip = await fetch(`${baseUrl}/v1/admin/groups/vip`, { method: "DELETE", headers: adminHeaders });
+        assert.equal(delVip.status, 200);
+
+        // Renaming "team-a" onto orphaned "vip" MUST fail with 409 (never breach isolation)
+        const conflictRename = await fetch(`${baseUrl}/v1/admin/groups/team-a`, {
+          method: "PATCH",
+          headers: adminHeaders,
+          body: JSON.stringify({ name: "vip" }),
+        });
+        assert.equal(conflictRename.status, 409);
+
+        // Unrelated PATCH on orphaned sub-key MUST NOT resurrect deleted group "vip"
+        const patchOrphan = await fetch(`${baseUrl}/v1/admin/client-keys/${ckData.key.id}`, {
+          method: "PATCH",
+          headers: adminHeaders,
+          body: JSON.stringify({ enabled: false }),
+        });
+        assert.equal(patchOrphan.status, 200);
+        const patchOrphanBody = (await patchOrphan.json()) as { groups: Array<{ name: string; defined: boolean }> };
+        const vipAfterPatch = patchOrphanBody.groups.find((g) => g.name === "vip");
+        assert.equal(vipAfterPatch?.defined, false, "toggling orphaned sub-key must not resurrect deleted group");
+
+        // Batch set-group with missing `group` field MUST return 400 (not silently ungroup!)
+        const badBatch = await fetch(`${baseUrl}/v1/admin/keys/batch`, {
+          method: "POST",
+          headers: adminHeaders,
+          body: JSON.stringify({ action: "set-group", slotIds: [], accountGroup: "team-a" }),
+        });
+        assert.equal(badBatch.status, 400);
+
+        // Group names "." / ".." / "a/b" MUST be rejected with 400
+        for (const badName of [".", "..", "team/sub"]) {
+          const badGrp = await fetch(`${baseUrl}/v1/admin/groups`, {
+            method: "POST",
+            headers: adminHeaders,
+            body: JSON.stringify({ name: badName }),
+          });
+          assert.equal(badGrp.status, 400, `group name '${badName}' must be rejected`);
+        }
+      } finally {
+        await gw.close();
+      }
+
+      // 2. P1: O(N) linear hash scanner (no quadratic ReDoS & no cross-prose tag swallowing)
+      const { normalizeUserTurnForHash, normalizeSystemPromptForHash } = await import("../src/utils/hash.js");
+      const evil = "<timestamp>".repeat(40_000);
+      const t0 = Date.now();
+      assert.equal(normalizeUserTurnForHash(evil), evil);
+      assert.equal(normalizeSystemPromptForHash(evil), evil);
+      assert.ok(Date.now() - t0 < 500, `O(N) scanner must finish well under 500ms, took ${Date.now() - t0}ms`);
+
+      const proseWithRealEnvelope =
+        "Why did <user_info> fail in prod?\n<user_info>\nOS: macOS\nCurrent time: 12:00\n</user_info>";
+      assert.equal(normalizeUserTurnForHash(proseWithRealEnvelope), "Why did <user_info> fail in prod?");
+
+      // 3. P1: Proxy NO_PROXY (IPv6, *.wildcard, port-scope), scheme preference, and invalid ALL_PROXY resilience
+      const { resolveEffectiveProxyUrl } = await import("../src/utils/proxy-agent.js");
+      const proxyEnv = {
+        HTTP_PROXY: "http://127.0.0.1:8081",
+        HTTPS_PROXY: "http://127.0.0.1:8082",
+        NO_PROXY: "*.amazonaws.com,[2001:db8::1],2001:db8::2,portonly.example.com:8443",
+      };
+      assert.equal(resolveEffectiveProxyUrl(undefined, "https://oidc.us-east-1.amazonaws.com/", proxyEnv), undefined);
+      assert.equal(resolveEffectiveProxyUrl(undefined, "https://[2001:db8::1]/test", proxyEnv), undefined);
+      assert.equal(resolveEffectiveProxyUrl(undefined, "https://[2001:db8::2]/test", proxyEnv), undefined);
+      assert.equal(resolveEffectiveProxyUrl(undefined, "https://portonly.example.com:8443/x", proxyEnv), undefined);
+      assert.equal(resolveEffectiveProxyUrl(undefined, "https://portonly.example.com/x", proxyEnv), "http://127.0.0.1:8082");
+      assert.equal(resolveEffectiveProxyUrl(undefined, "http://external.example.com/x", proxyEnv), "http://127.0.0.1:8081");
+      assert.equal(
+        resolveEffectiveProxyUrl(undefined, "https://quick.aws.com/", { ALL_PROXY: "socks4://127.0.0.1:1080" }),
+        undefined,
+        "unsupported ambient ALL_PROXY scheme must be skipped cleanly without throwing",
+      );
+
+      // 4. P1: mapAttachmentUploadError extracts `(inner 429)` and `(inner 401)` statuses accurately
+      const { mapAttachmentUploadError, buildOutOfBandContextPrompt } = await import("../src/core/media-utils.js");
+      const inner429 = mapAttachmentUploadError(new Error("qbs-event files/upload failed (inner 429): Throttled"), "Upload failed");
+      assert.equal(inner429.status, 429);
+      assert.equal(inner429.code, "rate_limit_exceeded");
+      const inner401 = mapAttachmentUploadError(new Error("AWS Quick Web qbsproxy files/upload failed (inner 401): Expired"), "Upload failed");
+      assert.equal(inner401.status, 401);
+      assert.equal(inner401.code, "upstream_auth_error");
+
+      // 5. P2: buildOutOfBandContextPrompt with maxInlineChars=0 returns compact header only (never 800-char tail overflow)
+      const cjkHuge = "中文上下文内容".repeat(5_000);
+      const compactOob = buildOutOfBandContextPrompt(cjkHuge, "ctx.txt", 0, false, "最近提问");
+      assert.ok(compactOob.length < 450, `maxInlineChars=0 must emit only OOB header, got ${compactOob.length} chars`);
+
+      // 6. P1/P2: Atomic validation in clientKeys.updateKey, keyPool.addKey/updateSlotMeta, and stale trace accountGroup cleanup
+      const pool = new UpstreamKeyPool({ ...bootCfg, dataDir: undefined });
+      assert.throws(() => pool.addKey("x", true, undefined, undefined, undefined, "ghost-group"), /invalid_api_key|Invalid AWS Quick credential/i);
+      assert.equal(pool.listGroupSummaries().some((g) => g.name === "ghost-group"), false, "failed addKey must not leave ghost group");
+      const slot = pool.addKey("oauth:valid-slot-atomicity", true, "S1", undefined, undefined, "orig-grp");
+      assert.throws(() => pool.updateSlotMeta(slot.slotId, { group: "mutated-grp", chatAgentId: "bad id with spaces" }));
+      assert.equal(pool.statusSnapshot().find((s) => s.slotId === slot.slotId)?.group, "orig-grp", "failed updateSlotMeta must not partially mutate group");
+      pool.dispose();
+
+      const ckMgr = new ClientGatewayKeyManager({ gatewayTokens: new Set<string>(), dataDir: undefined });
+      const { view: ckView } = ckMgr.createKey({ name: "AtomicKey", accountGroup: "orig-grp" });
+      assert.throws(() => ckMgr.updateKey(ckView.id, { enabled: false, accountGroup: "bad,group" }));
+      assert.equal(ckMgr.listKeys().find((k) => k.id === ckView.id)?.enabled, true, "failed updateKey must not mutate enabled");
+      assert.throws(() => ckMgr.updateKey(ckView.id, { accountGroup: "team-x", expiresAt: "not-a-date" }));
+      assert.equal(ckMgr.listKeys().find((k) => k.id === ckView.id)?.accountGroup, "orig-grp", "failed updateKey must not mutate accountGroup");
+
+      const tl2 = new RequestTraceLogger(10);
+      const tid2 = tl2.startTrace("openai-chat", {
+        requestedModel: "quick-balanced",
+        rawBody: { messages: [{ role: "user", content: "hi" }] },
+        fullTranscriptText: "hi",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: false,
+        estimatedInputTokens: 2,
+      });
+      tl2.bindExecutionMeta(tid2, { slotId: "s1", maskedKey: "k1", accountGroup: "team-a", execMode: "incognito" });
+      tl2.bindExecutionMeta(tid2, { slotId: "s2", maskedKey: "k2", execMode: "incognito" });
+      assert.equal(tl2.getDetail(tid2)?.accountGroup, undefined, "failover to ungrouped slot must clear stale accountGroup");
+
+      // 7. P0 regressions: corrupt non-string resolvedModel in traces, multi-message first user turn
+      //    (Codex/Cursor/Claude Code leading metadata message), short-turn systemPrompt IDE tag stripping,
+      //    tag+clock non-collapse, and <user_data>/<attached_files> preservation.
+      const corruptDir = path.join(tmpDir, "corrupt-trace-boot");
+      (await import("node:fs")).mkdirSync(corruptDir, { recursive: true });
+      writeFileSync(
+        path.join(corruptDir, "request-traces.json"),
+        JSON.stringify({
+          version: 1,
+          records: [
+            {
+              id: "req_unknown_404",
+              startedAt: new Date().toISOString(),
+              status: "error",
+              httpStatus: 404,
+              protocol: "openai-chat",
+              stream: false,
+              requestedModel: "gpt-4o",
+              metrics: { resolvedModel: 12345 },
+            },
+            {
+              id: "req_bad_metrics_arr",
+              startedAt: new Date().toISOString(),
+              status: "success",
+              httpStatus: 200,
+              protocol: "openai-chat",
+              stream: false,
+              requestedModel: "quick-smart",
+              metrics: ["not-an-object"],
+            },
+          ],
+        }),
+      );
+      const corruptGw = await createGatewayServer({
+        config: loadConfigFromEnv({
+          PORT: "0",
+          HOST: "127.0.0.1",
+          DATA_DIR: corruptDir,
+          ENABLE_DASHBOARD: "false",
+          QUICK_TOKENS: "oauth:corrupt-boot-key",
+        }),
+      });
+      await corruptGw.close();
+
+      // Multi-message Turn 1 (Codex CLI Responses pattern: input[0] = volatile <environment_context> ONLY,
+      // input[1] = actual user prompt) must keep conversationKey identical across mutations on all 3 protocols.
+      const { openAiResponsesAdapter: respAdp, openAiChatAdapter: chatAdp } = await import("../src/protocols/openai.js");
+      const { anthropicMessagesAdapter: anthAdp } = await import("../src/protocols/anthropic.js");
+      const codexT1 = respAdp.parse(
+        {
+          model: "quick-smart",
+          input: [
+            { role: "user", content: "<environment_context><cwd>/repo/a</cwd><shell>zsh</shell></environment_context>" },
+            { role: "user", content: "Refactor auth middleware cleanly" },
+          ],
+        },
+        {},
+      );
+      const codexT2 = respAdp.parse(
+        {
+          model: "quick-smart",
+          input: [
+            { role: "user", content: "<environment_context><cwd>/repo/b</cwd><shell>bash</shell></environment_context>" },
+            { role: "user", content: "Refactor auth middleware cleanly" },
+            { role: "assistant", content: "Done." },
+            { role: "user", content: "Now add tests" },
+          ],
+        },
+        {},
+      );
+      assert.equal(codexT2.conversationKey, codexT1.conversationKey, "Responses multi-user leading <environment_context> must keep conversationKey stable");
+
+      const chatMultiT1 = chatAdp.parse(
+        {
+          model: "quick-smart",
+          messages: [
+            { role: "user", content: "<user_info>Time: 10:00:00</user_info>" },
+            { role: "user", content: "Explain the event loop" },
+          ],
+        },
+        {},
+      );
+      const chatMultiT2 = chatAdp.parse(
+        {
+          model: "quick-smart",
+          messages: [
+            { role: "user", content: "<user_info>Time: 10:05:00</user_info>" },
+            { role: "user", content: "Explain the event loop" },
+            { role: "assistant", content: "Sure." },
+            { role: "user", content: "More detail" },
+          ],
+        },
+        {},
+      );
+      assert.equal(chatMultiT2.conversationKey, chatMultiT1.conversationKey, "Chat multi-user leading <user_info> must keep conversationKey stable");
+
+      const anthMultiT1 = anthAdp.parse(
+        {
+          model: "quick-smart",
+          max_tokens: 128,
+          system: "You are helpful.\n<git_status>M src/a.ts</git_status>",
+          messages: [{ role: "user", content: "继续" }],
+        },
+        {},
+      );
+      const anthMultiT2 = anthAdp.parse(
+        {
+          model: "quick-smart",
+          max_tokens: 128,
+          system: "You are helpful.\n<git_status>M src/b.ts\nM src/c.ts</git_status>",
+          messages: [
+            { role: "user", content: "继续" },
+            { role: "assistant", content: "好的。" },
+            { role: "user", content: "下一步" },
+          ],
+        },
+        {},
+      );
+      assert.equal(
+        anthMultiT2.conversationKey,
+        anthMultiT1.conversationKey,
+        "Short first turn (<16 chars) with mutating <git_status> in systemPrompt must keep conversationKey stable",
+      );
+
+      // Tag-only + clock-line must not collapse unrelated turns to "<TIME_LINE>", and <user_data>/<attached_files> stay preserved
+      const tagClockA = normalizeUserTurnForHash("<user_info>host=a</user_info>\nCurrent time: 16:00:00");
+      const tagClockB = normalizeUserTurnForHash("<user_info>host=b</user_info>\nCurrent time: 16:05:00");
+      assert.notEqual(tagClockA, tagClockB, "tag-only + clock-line turns must not collide on bare <TIME_LINE>");
+      assert.notEqual(
+        normalizeUserTurnForHash("Parse <user_data>id=1</user_data>"),
+        normalizeUserTurnForHash("Parse <user_data>id=2</user_data>"),
+        "<user_data> XML payload must not be stripped",
+      );
+      assert.notEqual(
+        normalizeUserTurnForHash("Review <attached_files>a.ts</attached_files>"),
+        normalizeUserTurnForHash("Review <attached_files>b.ts</attached_files>"),
+        "<attached_files> must not be stripped",
+      );
+
+      // 8. P1/P2 regressions: PoolStateWriter writeEpoch anti-clobber, RequestTraceLogger finishError secret redaction,
+      //    updateSlotMeta unified invalidation, admin-i18n Issue #9 ZH errors, strict settings validation, and OOB header wording.
+      const { PoolStateWriter } = await import("../src/core/pool-state-store.js");
+      const epochPath = path.join(tmpDir, "epoch-pool-state.json");
+      const epochWriter = new PoolStateWriter(epochPath, 0);
+      const basePoolState = {
+        version: 1,
+        updatedAt: new Date().toISOString(),
+        seenEnvKeyHashes: [] as string[],
+        activeKeys: ["oauth:stale-1"],
+        disabledKeys: [] as string[],
+        keyLabels: {},
+        keyProxies: {},
+        accountGroups: [] as string[],
+        keyGroups: {},
+        chatAgentId: "",
+        keyChatAgentIds: {},
+        keyAddedAt: {},
+        keyAutoDisabled: {},
+        lbStrategy: "quota-aware" as const,
+        sessionAffinityEnabled: true,
+        sessionAffinityTtlMs: 1_800_000,
+        autoDisableExhaustedKeys: true,
+        incognitoMode: true,
+        autoEnsureCodingAgent: true,
+        customAgentPrompt: "",
+        sanitizeClientSystemPrompt: false,
+        showRoutedModelInThinking: "true" as const,
+        autoRephraseOnContentFilter: false,
+        contentFilterRephrasePrompt: "",
+        contentFilterRephraseModel: "quick-fast",
+      };
+      const st1 = { ...basePoolState };
+      const st2 = { ...basePoolState, activeKeys: ["oauth:fresh-2"], lbStrategy: "round-robin" as const };
+      epochWriter.schedule(st1);
+      epochWriter.flushSync(st2);
+      await epochWriter.flushAsync();
+      const persistedEpoch = JSON.parse(readFileSync(epochPath, "utf8")) as { activeKeys: string[]; lbStrategy: string };
+      assert.deepEqual(persistedEpoch.activeKeys, ["oauth:fresh-2"], "PoolStateWriter flushSync must not be clobbered by stale async write");
+      assert.equal(persistedEpoch.lbStrategy, "round-robin");
+
+      const tlRedact = new RequestTraceLogger(10);
+      const tidR = tlRedact.startTrace("openai-chat", {
+        requestedModel: "quick-balanced",
+        rawBody: { messages: [{ role: "user", content: "hi" }] },
+        fullTranscriptText: "hi",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: false,
+        estimatedInputTokens: 2,
+      });
+      const fakeProxyUrl = ["http://", "alice", ":", "topsecret", "@proxy.local:8080"].join("");
+      const fakeTok = ["sk-aq-", "secret999999"].join("");
+      tlRedact.finishError(tidR, 502, `Upstream failed with ${fakeTok} via ${fakeProxyUrl}`);
+      const errMsgR = tlRedact.getDetail(tidR)?.errorMessage || "";
+      assert.equal(errMsgR.includes("secret999999"), false, "finishError must redact sk-aq tokens");
+      assert.equal(errMsgR.includes("topsecret"), false, "finishError must redact proxy passwords");
+      assert.ok(errMsgR.includes("sk-aq-[REDACTED]") && errMsgR.includes("***:***@"));
+
+      const invPool = new UpstreamKeyPool({ ...bootCfg, dataDir: undefined });
+      const invSlots: string[] = [];
+      invPool.setOnSlotInvalidated((sid) => invSlots.push(sid));
+      const invS = invPool.addKey("oauth:inv-test-key", true, "S");
+      invPool.updateSlotMeta(invS.slotId, { proxyUrl: "http://127.0.0.1:7890" });
+      invPool.updateSlotMeta(invS.slotId, { enabled: false });
+      assert.equal(invSlots.filter((id) => id === invS.slotId).length, 2, "updateSlotMeta must emit slot invalidation on proxyUrl and enabled=false");
+      invPool.dispose();
+
+      const { localizeAdminMessage } = await import("../src/web/admin-i18n.js");
+      assert.ok(localizeAdminMessage("Account group 'vip' not found.", "zh").includes("未找到账号分组"));
+      assert.ok(localizeAdminMessage("Account group 'vip' already exists.", "zh").includes("已存在"));
+      assert.ok(localizeAdminMessage("Invalid account group name (max 48 chars).", "zh").includes("账号分组名称无效"));
+      assert.ok(localizeAdminMessage("`group` must be a string or null.", "zh").includes("批量分组操作"));
+
+      assert.equal(compactOob.includes("The full full"), false, "OOB header must not repeat 'full'");
+
+      const badSettingGw = createGatewayServer({
+        config: loadConfigFromEnv({
+          PORT: "0",
+          HOST: "127.0.0.1",
+          DATA_DIR: path.join(tmpDir, "bad-setting-gw"),
+          ENABLE_DASHBOARD: "true",
+          ADMIN_PASSWORD: "AuditTestPassword!123",
+          QUICK_TOKENS: "oauth:bad-setting-key",
+        }),
+      });
+      await new Promise<void>((resolve) => badSettingGw.server.listen(0, "127.0.0.1", resolve));
+      const bAddr = badSettingGw.server.address();
+      assert.ok(bAddr && typeof bAddr === "object");
+      try {
+        const bUrl = `http://127.0.0.1:${bAddr.port}`;
+        const loginR = await fetch(`${bUrl}/v1/admin/login`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password: "AuditTestPassword!123" }),
+        });
+        const cCookie = (loginR.headers.get("set-cookie") || "").split(";")[0]!;
+        const badSetRes = await fetch(`${bUrl}/v1/admin/settings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cCookie, "x-console-csrf": "1" },
+          body: JSON.stringify({ showRoutedModelInThinking: "alwyas" }),
+        });
+        assert.equal(badSetRes.status, 400, "typo in showRoutedModelInThinking must return 400, not silently coerce");
+      } finally {
+        await badSettingGw.close();
+      }
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("zero-cold-start rotation: classifies Service is busy/529 as brief overload failover, evicts only failed conversation affinity, spreads >=40% healthy slots in quota-aware, and resets non-stream partial thinking on failover", async () => {
+    const { classifyUpstreamError } = await import("../src/core/upstream-errors.js");
+    const { collectTurnEvents } = await import("../src/protocols/common.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+
+    // 1. Service is busy / 529 overloaded -> isProxyOrConnErr=true (brief non-escalating backoff + failover), NEVER rateLimit/quota/auth
+    for (const err of [
+      new GatewayError("AWS Quick upstream error: Service is busy", 502, "upstream_error"),
+      new GatewayError("Model is overloaded", 529, "overloaded"),
+      new GatewayError("Service temporarily unavailable", 503, "upstream_error"),
+    ]) {
+      const cls = classifyUpstreamError(err);
+      assert.equal(cls.isProxyOrConnErr, true, `expected isProxyOrConnErr for '${err.message}'`);
+      assert.equal(cls.isRateLimitErr, false, `must NOT escalate to 30-300s rateLimit lockout for '${err.message}'`);
+      assert.equal(cls.isQuotaErr, false);
+      assert.equal(cls.isAuthErr, false);
+    }
+
+    // 2. quota-aware 3-tier bucketing: brand-new conversations spread evenly across >=40% healthy slots (100/75/50),
+    //    while low-quota slot (10%) is still deprioritized, AND ongoing sticky sessions remain 100% pinned!
+    const k1 = "oauth:rot-k1";
+    const k2 = "oauth:rot-k2";
+    const k3 = "oauth:rot-k3";
+    const kLow = "oauth:rot-klow";
+    const baseCfg = loadConfigFromEnv({
+      QUICK_TOKENS: `${k1},${k2},${k3},${kLow}`,
+      LB_STRATEGY: "quota-aware",
+      SESSION_AFFINITY: "true",
+      AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+      INCOGNITO: "true",
+    });
+    const pool = new UpstreamKeyPool({ ...baseCfg, dataDir: undefined });
+    const makeQuota = (rem: number) => ({
+      membershipType: "FREE_TRIAL",
+      daysRemainingInCycle: 10,
+      trialDaysRemaining: 20,
+      overallIncludedPlan: { usedPercent: 100 - rem, remainingPercent: rem, allowanceUsd: null },
+      sessionPool: { usedPercent: 100 - rem, remainingPercent: rem },
+      premiumApiPool: { usedPercent: 100 - rem, remainingPercent: rem },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    pool.updateSlotQuotaCache(k1, undefined, makeQuota(100));
+    pool.updateSlotQuotaCache(k2, undefined, makeQuota(75));
+    pool.updateSlotQuotaCache(k3, undefined, makeQuota(50));
+    pool.updateSlotQuotaCache(kLow, undefined, makeQuota(10));
+
+    const pickedNew = new Set<string>();
+    for (let i = 0; i < 6; i += 1) {
+      const l = pool.leaseKey("quick-smart", undefined, `brand-new-conv-${i}`);
+      pickedNew.add(l.apiKey);
+      l.release();
+    }
+    assert.deepEqual(
+      [...pickedNew].sort(),
+      [k1, k2, k3].sort(),
+      "brand-new conversations must spread evenly across all >=40% healthy slots without hitting the 10% low slot",
+    );
+    // Regression: trailing disabled slots must NOT cause rrIndex to crawl through disabled indices and hammer slot 0!
+    const disabledKeys = Array.from({ length: 10 }, (_, idx) => `oauth:rot-disabled-${idx}`);
+    const sparsePool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: [k1, k2, k3, ...disabledKeys].join(","),
+        LB_STRATEGY: "quota-aware",
+        SESSION_AFFINITY: "true",
+        AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+        INCOGNITO: "true",
+      }),
+      dataDir: undefined,
+    });
+    for (const dk of disabledKeys) {
+      const slot = sparsePool.statusSnapshot().find((s) => s.maskedKey.endsWith(dk.slice(-4)));
+      if (slot) sparsePool.updateSlotMeta(slot.slotId, { enabled: false });
+    }
+    sparsePool.updateSlotQuotaCache(k1, undefined, makeQuota(90));
+    sparsePool.updateSlotQuotaCache(k2, undefined, makeQuota(95));
+    sparsePool.updateSlotQuotaCache(k3, undefined, makeQuota(98));
+    const sparseCounts = new Map<string, number>();
+    for (let i = 0; i < 9; i += 1) {
+      const l = sparsePool.leaseKey("quick-smart", undefined, `sparse-conv-${i}`);
+      sparseCounts.set(l.apiKey, (sparseCounts.get(l.apiKey) ?? 0) + 1);
+      l.release();
+    }
+    assert.deepEqual(
+      [sparseCounts.get(k1), sparseCounts.get(k2), sparseCounts.get(k3)],
+      [3, 3, 3],
+      `disabled trailing slots must not skew quota-aware rotation: ${JSON.stringify([...sparseCounts.entries()])}`,
+    );
+    // Existing sticky conversation stays pinned to its warm slot (zero cold starts!)
+    const pinned1 = pool.leaseKey("quick-smart", undefined, "brand-new-conv-0");
+    const pinned1Key = pinned1.apiKey;
+    pinned1.release();
+    const pinned2 = pool.leaseKey("quick-smart", undefined, "brand-new-conv-0");
+    assert.equal(pinned2.apiKey, pinned1Key);
+    assert.equal(pinned2.viaAffinity, true);
+    pinned2.release();
+
+    // Concurrent protection for just-recovered 1% (Tier 0) slot:
+    // Even when all healthy >=40% slots have activeInflight >= 1 (up to cap-1) and kLow (1%) is idle (0),
+    // new concurrent requests MUST stay inside the >=40% tier and NEVER spill onto the 1% slot until healthy slots saturate!
+    pool.updateSlotQuotaCache(kLow, undefined, makeQuota(1));
+    const heldLeases: ReturnType<UpstreamKeyPool["leaseKey"]>[] = [];
+    try {
+      // Hold 6 concurrent leases (2 on each of k1/k2/k3, maxInflightPerSlot=4): kLow must receive ZERO!
+      for (let i = 0; i < 6; i += 1) {
+        const l = pool.leaseKey("quick-smart", undefined, `conc-protect-${i}`);
+        assert.notEqual(l.apiKey, kLow, `concurrent lease #${i} must NOT spill onto 1%-recovered Tier 0 slot while >=40% slots have spare capacity`);
+        heldLeases.push(l);
+      }
+      // Fill remaining capacity of k1/k2/k3 (6 more -> 4 active on each of the 3 healthy slots)
+      for (let i = 6; i < 12; i += 1) {
+        const l = pool.leaseKey("quick-smart", undefined, `conc-protect-${i}`);
+        assert.notEqual(l.apiKey, kLow, `under-cap healthy slots must absorb lease #${i} before touching Tier 0`);
+        heldLeases.push(l);
+      }
+      // 13th concurrent request: all 3 healthy slots are now at cap (4/4), so overflow safely uses kLow!
+      const overflowLease = pool.leaseKey("quick-smart", undefined, "conc-protect-overflow");
+      assert.equal(overflowLease.apiKey, kLow, "only after all >=40% healthy slots reach maxInflightPerSlot should overflow use Tier 0");
+      heldLeases.push(overflowLease);
+    } finally {
+      for (const l of heldLeases) l.release();
+    }
+    pool.dispose();
+
+    // 3. Engine failover on Service is busy:
+    //    - Evicts ONLY the failed conversation's affinity (leaves other healthy conversations on Account A untouched!)
+    //    - Non-streaming partial thinking before error emits `{ type: "reset" }` so Account B returns clean output
+    const kA = "oauth:busy-slot-a";
+    const kB = "oauth:busy-slot-b";
+    const engCfg = loadConfigFromEnv({
+      QUICK_TOKENS: `${kA},${kB}`,
+      LB_STRATEGY: "round-robin",
+      SESSION_AFFINITY: "true",
+      AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+      AUTO_ENSURE_CODING_AGENT: "false",
+      INCOGNITO: "true",
+    });
+    const engPool = new UpstreamKeyPool({ ...engCfg, dataDir: undefined });
+    // Bind both conv-fail and conv-healthy to Account A
+    const lFailSeed = engPool.leaseKey("quick-smart", new Set([kB]), "conv-fail");
+    assert.equal(lFailSeed.apiKey, kA);
+    lFailSeed.release();
+    const lHealthySeed = engPool.leaseKey("quick-smart", new Set([kB]), "conv-healthy");
+    assert.equal(lHealthySeed.apiKey, kA);
+    lHealthySeed.release();
+
+    const engine = new QuickExecutionEngine({ config: engCfg, usageTracker: new UsageTracker() });
+    const attemptedSlots: string[] = [];
+    (engine as unknown as {
+      executeTurnWithLease: (
+        turn: ParsedProtocolTurn,
+        lease: ReturnType<UpstreamKeyPool["leaseKey"]>,
+      ) => AsyncGenerator<GatewayStreamEvent>;
+    }).executeTurnWithLease = async function* (_turn, lease) {
+      attemptedSlots.push(lease.apiKey);
+      if (lease.apiKey === kA) {
+        yield { type: "thinking", text: "partial stale thinking from busy A" };
+        throw new GatewayError("AWS Quick upstream error: Service is busy", 502, "upstream_error");
+      }
+      yield { type: "thinking", text: "clean thinking from B" };
+      yield { type: "text", text: "CLEAN_ANSWER_FROM_B" };
+      yield { type: "done", stopReason: "stop" };
+    };
+
+    const nonStreamTurn: ParsedProtocolTurn = {
+      requestedModel: "quick-smart",
+      conversationKey: "conv-fail",
+      rawBody: { model: "quick-smart", messages: [{ role: "user", content: "hi" }] },
+      fullTranscriptText: "hi",
+      images: [],
+      tools: [],
+      toolChoice: "auto",
+      trailingToolResults: [],
+      stream: false,
+      estimatedInputTokens: 5,
+    };
+
+    const collected = await collectTurnEvents(engine.executeTurnWithPool(nonStreamTurn, engPool));
+    assert.deepEqual(attemptedSlots, [kA, kB], "must fail over from busy Account A to healthy Account B");
+    assert.equal(collected.text, "CLEAN_ANSWER_FROM_B");
+    assert.equal(collected.thinking, "clean thinking from B", "non-streaming reset must discard Account A partial thinking");
+
+    // Verify conv-fail moved to B, while conv-healthy stayed 100% warmly pinned to A (zero collateral cold starts!),
+    // AND Account A was NOT escalated to rateLimitHits (no 30-300s avalanche lockout).
+    assert.equal(engPool.affinityTable.lookup("conv-fail", 60_000), kB);
+    assert.equal(engPool.affinityTable.lookup("conv-healthy", 60_000), kA, "other healthy conversations on A must stay pinned");
+    const slotASnap = engPool.statusSnapshot().find((s) => s.slotId === lFailSeed.slotId)!;
+    assert.equal(slotASnap.rateLimitHits, 0, "Service is busy must use brief transient backoff, not escalating 429 lockout");
+    assert.ok(slotASnap.cooldownRemainingMs > 0 && slotASnap.cooldownRemainingMs <= 6_000);
+    engPool.dispose();
+  });
+
+  it("preserves inline latest user request in OOB prompt even when heavy IDE customPrompt exceeds 36KB-75KB", async () => {
+    const { finalizePromptChunksAndOutOfBandText } = await import("../src/core/turn-attachment-builder.js");
+    const { RequestAttachmentCache } = await import("../src/core/request-attachment-cache.js");
+
+    const dummyOAuthCred = {
+      region: "us-east-1",
+      issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+      wsHost: "us-east-1.quick.aws.com",
+      clientId: "cid-oob-test",
+      clientSecret: "csec-oob-test",
+      refreshToken: "rt-oob-test",
+      accessToken: "at-oob-test",
+      expiresAt: Date.now() + 3600_000,
+    };
+
+    const makeMockCache = () => {
+      const cache = new RequestAttachmentCache();
+      (cache as unknown as { getOrUploadAttachment: () => Promise<unknown> }).getOrUploadAttachment = async () => ({
+        type: "file",
+        name: "conversation_context_deadbeef.txt",
+        mimeType: "text/plain",
+        size: 100_000,
+        path: "/workspace/conversation_context_deadbeef.txt",
+        fileId: "file-deadbeef",
+      });
+      return cache;
+    };
+
+    const makeTurn = (latestUser: string): ParsedProtocolTurn => ({
+      requestedModel: "quick-smart",
+      rawBody: { model: "quick-smart", messages: [{ role: "user", content: latestUser }] },
+      fullTranscriptText: latestUser,
+      incrementalUserText: latestUser,
+      images: [],
+      tools: [],
+      toolChoice: "auto",
+      trailingToolResults: [],
+      stream: true,
+      estimatedInputTokens: 20_000,
+    });
+
+    // 1. Heavy 75KB Claude Code customPrompt + 100KB prompt -> final chunk MUST keep user's latest task inline (never 0 chars!)
+    const heavyCustom = "SYSTEM_RULE_LINE_1234567890\n".repeat(2_700); // ~75KB
+    const bigPrompt = "Historical log line abcdefghijklmnopqrstuvwxyz\n".repeat(2_100) + "\nPlease fix LATEST_USER_TASK_7749 right now.";
+    const resHeavy = await finalizePromptChunksAndOutOfBandText({
+      turn: makeTurn("Please fix LATEST_USER_TASK_7749 right now."),
+      slotId: "slot-oob-1",
+      threadId: "deadbeef-0000-0000-0000-000000000001",
+      isWarmIncremental: false,
+      prompt: bigPrompt,
+      customPrompt: heavyCustom,
+      attachments: [],
+      isOAuthAccount: true,
+      oauthCred: dummyOAuthCred,
+      reqAttCache: makeMockCache(),
+    });
+    const finalChunkHeavy = resHeavy.chunks[resHeavy.chunks.length - 1] || "";
+    assert.ok(
+      finalChunkHeavy.includes("LATEST_USER_TASK_7749"),
+      "final chunk must preserve user's latest request inline when customPrompt is 75KB",
+    );
+
+    // 2. Borderline 40KB customPrompt + 60KB prompt -> fits in 1 single WS chunk AND keeps user's latest task inline!
+    const borderCustom = "SYSTEM_RULE_LINE_1234567890\n".repeat(1_420); // ~39.8KB
+    const borderPrompt = "Historical log line abcdefghijklmnopqrstuvwxyz\n".repeat(1_250) + "\nPlease fix BORDER_USER_TASK_40K right now.";
+    const resBorder = await finalizePromptChunksAndOutOfBandText({
+      turn: makeTurn("Please fix BORDER_USER_TASK_40K right now."),
+      slotId: "slot-oob-2",
+      threadId: "deadbeef-0000-0000-0000-000000000002",
+      isWarmIncremental: false,
+      prompt: borderPrompt,
+      customPrompt: borderCustom,
+      attachments: [],
+      isOAuthAccount: true,
+      oauthCred: dummyOAuthCred,
+      reqAttCache: makeMockCache(),
+    });
+    assert.equal(resBorder.chunks.length, 1, "40KB customPrompt + OOB prompt should still fit cleanly in 1 WS chunk");
+    assert.ok(
+      resBorder.chunks[0]!.includes("BORDER_USER_TASK_40K"),
+      "single WS chunk must keep user's latest request inline",
+    );
+  });
+
+  it("pre-release UX audit regressions: pre-abort/preBuffered error draining, safe-slot concurrency spread without 1% spill, per-group rrIndex fairness, <ide_selection> anti-crosstalk, and zero-excerpt OOB header", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+    const { StreamingUiTagSanitizer } = await import("../src/core/ui-tag-sanitizer.js");
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { normalizeUserTurnForHash } = await import("../src/utils/hash.js");
+    const { buildOutOfBandContextPrompt } = await import("../src/core/media-utils.js");
+    const { encodeGatewayJsonFrame, decodeGatewayFrame } = await import("../src/aws-quick/event-stream-cbor.js");
+
+    // 1a. Pre-aborted AbortSignal MUST throw 499 (never return silent empty HTTP 200!)
+    class DummyWs extends EventEmitter {
+      readyState = 1;
+      send() { }
+      close() {
+        this.readyState = 3;
+      }
+      terminate() {
+        this.readyState = 3;
+      }
+    }
+    const abortedAc = new AbortController();
+    abortedAc.abort();
+    const baseTurn: ParsedProtocolTurn = {
+      requestedModel: "quick-smart",
+      rawBody: { model: "quick-smart", messages: [{ role: "user", content: "hi" }] },
+      fullTranscriptText: "hi",
+      images: [],
+      tools: [],
+      toolChoice: "auto",
+      trailingToolResults: [],
+      stream: true,
+      estimatedInputTokens: 5,
+      signal: abortedAc.signal,
+    };
+    await assert.rejects(
+      async () => {
+        for await (const _ev of runTurnStream({
+          ws: new DummyWs() as unknown as import("ws").default,
+          isReusedOpenWs: true,
+          encodeFrame: encodeGatewayJsonFrame,
+          decodeFrame: decodeGatewayFrame,
+          isWeb: true,
+          surfaceType: "WEB_EXPERIENCE",
+          outpostId: "web0",
+          appVersion: "test",
+          surfaceName: "web",
+          threadId: "t-abort-1",
+          effectiveRootThreadId: "t-abort-1",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          turn: baseTurn,
+          selection: { model: "quick-smart", agentMode: "smart", thinkingEffort: "off" },
+          chunks: ["hi"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          slotId: "slot-a",
+          apiKey: "oauth:a",
+          execMode: "incognito",
+          warmGeneration: 0,
+          rawPromptForRephrase: "hi",
+          runMaxTimeoutMs: 5_000,
+          runIdleTimeoutMs: 5_000,
+          showRoutedModelInThinking: "true",
+          webSearchEnabled: false,
+          usageTracker: new UsageTracker(),
+          warmPool: new WarmSessionPool({}),
+        })) {
+          // drain
+        }
+      },
+      (err: unknown) => err instanceof GatewayError && err.status === 499,
+      "pre-aborted signal must throw 499 client_aborted instead of silently returning empty 200",
+    );
+
+    // 1b. preBufferedFrames error MUST be drained and thrown (never swallowed!)
+    const errFrame = Buffer.from(
+      encodeGatewayJsonFrame({ type: "error", payload: { message: "Upstream test failure", statusCode: 502 } }),
+    );
+    await assert.rejects(
+      async () => {
+        for await (const _ev of runTurnStream({
+          ws: new DummyWs() as unknown as import("ws").default,
+          isReusedOpenWs: false,
+          preSessionConnectSent: true,
+          preBufferedFrames: [errFrame],
+          encodeFrame: encodeGatewayJsonFrame,
+          decodeFrame: decodeGatewayFrame,
+          isWeb: true,
+          surfaceType: "WEB_EXPERIENCE",
+          outpostId: "web0",
+          appVersion: "test",
+          surfaceName: "web",
+          threadId: "t-prebuf-1",
+          effectiveRootThreadId: "t-prebuf-1",
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          turn: { ...baseTurn, signal: undefined },
+          selection: { model: "quick-smart", agentMode: "smart", thinkingEffort: "off" },
+          chunks: ["hi"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          slotId: "slot-b",
+          apiKey: "oauth:b",
+          execMode: "incognito",
+          warmGeneration: 0,
+          rawPromptForRephrase: "hi",
+          runMaxTimeoutMs: 5_000,
+          runIdleTimeoutMs: 5_000,
+          showRoutedModelInThinking: "true",
+          webSearchEnabled: false,
+          usageTracker: new UsageTracker(),
+          warmPool: new WarmSessionPool({}),
+        })) {
+          // drain
+        }
+      },
+      /Upstream test failure/,
+      "preBufferedFrames upstream error must be drained and thrown",
+    );
+
+    // 2. quota-aware concurrency: 41% + 2 unsynced (null) + 1% endangered -> 3 concurrent leases spread 1,1,1 across safe slots (0 on 1%)
+    const makeQuota = (rem: number) => ({
+      membershipType: "FREE_TRIAL",
+      daysRemainingInCycle: 10,
+      trialDaysRemaining: 20,
+      overallIncludedPlan: { usedPercent: 100 - rem, remainingPercent: rem, allowanceUsd: null },
+      sessionPool: { usedPercent: 100 - rem, remainingPercent: rem },
+      premiumApiPool: { usedPercent: 100 - rem, remainingPercent: rem },
+      onDemandSpend: { enabled: false, usedUsd: 0, limitUsd: null, remainingUsd: null },
+    });
+    const k41 = "oauth:aud-k41";
+    const kNull1 = "oauth:aud-null1";
+    const kNull2 = "oauth:aud-null2";
+    const k1 = "oauth:aud-k1pct";
+    const concPool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: `${k41},${kNull1},${kNull2},${k1}`,
+        LB_STRATEGY: "quota-aware",
+        SESSION_AFFINITY: "true",
+        AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+        INCOGNITO: "true",
+      }),
+      dataDir: undefined,
+    });
+    concPool.updateSlotQuotaCache(k41, undefined, makeQuota(41));
+    concPool.updateSlotQuotaCache(k1, undefined, makeQuota(1));
+    const held = [0, 1, 2].map((i) => concPool.leaseKey("quick-smart", undefined, `safe-spread-${i}`));
+    try {
+      const pickedKeys = held.map((l) => l.apiKey).sort();
+      assert.deepEqual(
+        pickedKeys,
+        [k41, kNull1, kNull2].sort(),
+        "3 concurrent requests must spread across 41% + 2 unsynced slots without hotspotting 41% or touching 1%",
+      );
+    } finally {
+      for (const l of held) l.release();
+    }
+
+    // 3. Per-group rrIndex fairness: interleaved Group A [0,1] and Group B [2,3] hits all 4 slots (0 starvation!)
+    const ga1 = "oauth:grp-a1";
+    const ga2 = "oauth:grp-a2";
+    const gb1 = "oauth:grp-b1";
+    const gb2 = "oauth:grp-b2";
+    const grpPool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: `${ga1},${ga2},${gb1},${gb2}`,
+        LB_STRATEGY: "quota-aware",
+        SESSION_AFFINITY: "false",
+        AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+        INCOGNITO: "true",
+      }),
+      dataDir: undefined,
+    });
+    grpPool.createGroup("team-a");
+    grpPool.createGroup("team-b");
+    const snap = grpPool.statusSnapshot();
+    grpPool.updateSlotMeta(snap[0]!.slotId, { group: "team-a" });
+    grpPool.updateSlotMeta(snap[1]!.slotId, { group: "team-a" });
+    grpPool.updateSlotMeta(snap[2]!.slotId, { group: "team-b" });
+    grpPool.updateSlotMeta(snap[3]!.slotId, { group: "team-b" });
+    const a1 = grpPool.leaseKey("quick-smart", undefined, undefined, "team-a"); a1.release();
+    const b1 = grpPool.leaseKey("quick-smart", undefined, undefined, "team-b"); b1.release();
+    const a2 = grpPool.leaseKey("quick-smart", undefined, undefined, "team-a"); a2.release();
+    const b2 = grpPool.leaseKey("quick-smart", undefined, undefined, "team-b"); b2.release();
+    assert.deepEqual([a1.apiKey, a2.apiKey].sort(), [ga1, ga2].sort(), "interleaved Group A must hit both slots");
+    assert.deepEqual([b1.apiKey, b2.apiKey].sort(), [gb1, gb2].sort(), "interleaved Group B must hit both slots");
+
+    // 4. <ide_selection> MUST NOT be stripped (prevents cross-talk between distinct selected-code chats)
+    const selA = normalizeUserTurnForHash("<ide_selection>function calcTax() {}</ide_selection>\nIs this thread-safe?");
+    const selB = normalizeUserTurnForHash("<ide_selection>function parseJwt() {}</ide_selection>\nIs this thread-safe?");
+    assert.notEqual(selA, selB, "<ide_selection> carries primary user subject matter and must not collide");
+
+    // 5. Zero-excerpt OOB header must NOT contradict itself with 'excerpted below'
+    const zeroHdr = buildOutOfBandContextPrompt("x".repeat(5000), "ctx.txt", 0);
+    assert.ok(!zeroHdr.includes("excerpted below"), `zero-excerpt header should not say 'excerpted below': ${zeroHdr}`);
   });
 });

@@ -194,11 +194,11 @@ export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
     inner ? `## Workspace Conventions\n${inner}` : "",
   );
   text = text
-    .replace(/<RULE\[([^\]]*)\]>/gi, (_m, p1: string) => {
+    .replace(/<RULE\[([^\]]*)\]>\s*/gi, (_m, p1: string) => {
       const base = String(p1 || "").split(/[\\/]/).pop()?.trim();
-      return base ? `### Rules (${base})` : "### Rules";
+      return base ? `### Rules (${base})\n` : "### Rules\n";
     })
-    .replace(/<\/RULE\[[^\]]*\]>/gi, "");
+    .replace(/<\/RULE(?:\[[^\]]*\])?>/gi, "");
 
   // 4. Unwrap `<skills>` XML wrapper while keeping skill paths and descriptions intact
   text = replacePairedXmlBlockLinear(text, "skills", (inner) =>

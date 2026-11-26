@@ -18,6 +18,17 @@ export class GatewayError extends Error {
 
 export type LbStrategy = "quota-aware" | "least-busy" | "round-robin";
 
+export type RoutedModelThinkingMode = "true" | "always" | "false";
+
+export function parseRoutedModelThinkingMode(raw: unknown): RoutedModelThinkingMode {
+  if (raw === false) return "false";
+  if (raw === true) return "true";
+  const val = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (val === "false" || val === "0" || val === "off" || val === "no") return "false";
+  if (val === "always" || val === "force") return "always";
+  return "true";
+}
+
 export interface NormalizedTool {
   name: string;
   description?: string;
@@ -119,7 +130,7 @@ export interface TurnTokenMetrics {
 
 export type GatewayStreamEvent =
   | { type: "reset" }
-  | { type: "thinking"; text: string }
+  | { type: "thinking"; text: string; lateRoutingCorrection?: boolean; actualRoutedModel?: string }
   | { type: "text"; text: string }
   | { type: "tool_calls"; calls: NormalizedToolCall[] }
   | { type: "usage"; metrics: TurnTokenMetrics }
@@ -161,6 +172,8 @@ export interface GatewayConfig {
   customAgentPrompt?: string;
   /** Optional: deeply sanitize heavy IDE/agent client framework wrappers in `systemPrompt` (`SANITIZE_CLIENT_SYSTEM_PROMPT`, default false so user system prompts stay untouched unless opted in). */
   sanitizeClientSystemPrompt?: boolean;
+  /** Emit routed model & thinking effort header in thinking/reasoning block (`SHOW_ROUTED_MODEL_IN_THINKING`, default `"true"`: `"true"` | `"always"` | `"false"`). */
+  showRoutedModelInThinking?: RoutedModelThinkingMode;
   /** Optional: automatically rephrase the latest user prompt into defensive engineering wording on upstream `content_filtered` and retry on the SAME requested model (`AUTO_REPHRASE_ON_CONTENT_FILTER`, default false). */
   autoRephraseOnContentFilter?: boolean;
   /** Optional custom instruction template used when auto-rephrasing after `content_filtered` (`CONTENT_FILTER_REPHRASE_PROMPT`). */

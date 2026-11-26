@@ -9,7 +9,7 @@ import {
   type ToolChoiceMode,
   type TurnTokenMetrics
 } from "../core/types.js";
-import { computeDialogPrefixHashes, type HashableDialogItem } from "../utils/hash.js";
+import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
 import { estimatePromptTokens } from "../core/media-utils.js";
 import { resolveKnownModelId } from "../services/model-catalog.js";
@@ -441,12 +441,11 @@ export function parseAnthropicMessagesRequest(
     items
   });
 
-  const firstUserItem = items.find((it) => it.role === "user");
   const conversationKey = deriveConversationAffinityKey({
     headers,
     rawBody,
     systemPrompt,
-    firstUserText: firstUserItem?.text
+    firstUserText: extractFirstUserTurnText(items)
   });
 
   return {

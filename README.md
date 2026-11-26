@@ -24,7 +24,7 @@
   - Web 管理台内置 **2 步 OAuth PKCE 网页授权**（自动发现租户分片、90 天自动续期、自动提取真实邮箱与用户名）。
   - 支持浏览器 `Copy as cURL` 导入 Cookie、JSON 批量导入导出，以及 macOS 本机 `local-outpost` 会话复用。
 - **长上下文与流式稳定性**：
-  - 超长上下文（`>46 KB`）在 OAuth 账号下自动走 AWS Quick **原生带外 `.txt` 附件上传**（1 帧秒传 + 60s DLP 轮询校验 + 同步保留文首提问与末尾上下文 + 第 2 轮热续传；上传遇 401/429 直接刷新或切号而不静默降级）；非 OAuth 账号按 `≤46.5 KB` 安全分片（内置 45s `turn_usage` 兜底与最高 12 块保护上限）；流式请求超 16 KB 或带工具调用时在获取上游槽位后提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），既保留预租约真实 `429` 状态码又避免 Cloudflare `524` 超时。
+  - 超长上下文在 OAuth 账号下自动走 AWS Quick **原生带外 `.txt` 附件上传**（动态按真实 UTF-8/JSON 字节密度二分内联最高 32 KB，上传同时并行推测拨号 WS 省去 ~1s 握手耗时；60s DLP 轮询校验 + 重型 `>36 KB` 系统提示词下仍保底保留用户最新提问 + 第 2 轮热续传；上传遇 401/429 直接刷新或切号而不静默降级）；非 OAuth 账号按 `≤46.5 KB` 安全分片（内置 45s `turn_usage` 兜底与最高 12 块保护上限）；流式请求超 16 KB 或带工具调用时在获取上游槽位后提前发 `HTTP 200` + `: keepalive` 心跳（Anthropic 协议首帧后发标准 `event: ping`），既保留预租约真实 `429` 状态码又避免 Cloudflare `524` 超时；多段深度思考与云端工具轮次自动重置思考计时，避免长思考任务中途误报 `504`。
   - 内置流式 XML 净化器：自动将 AWS Quick 私有的 `<decision>` / `<decisions>` / `<artifact>` 交互标签转为标准 Markdown，同时保护代码块原样输出。
 - **自定义 Agent 自动绑定与零污染工具桥接**：
   - 默认开启 `AUTO_ENSURE_CODING_AGENT=true`：首次调用未绑定 Agent 的账号时，自动通过 AWS Quick 原生 WebSocket 协议查找已有自定义 Agent 或按模板创建并发布 `Coding Assistant`，持久化写入 `.env`（后续 0ms 额外开销）。
@@ -33,13 +33,14 @@
 - **防误拦截净化与可选防御重述自愈**：
   - 自动无害剥离第三方 CLI 高危账单头（`x-anthropic-billing-header`）、柔化冲突身份头并将出站 `<system-reminder>` 转为中性注释（不影响前缀哈希与热续传）；内置 `warmup` 软拒答守卫拦截提示词注入误判。
   - Web 管理台「路由与策略」提供默认关闭的 **`AUTO_REPHRASE_ON_CONTENT_FILTER`** 开关与可微调提示词模板：开启后仅在收到上游 `content_filtered` 且尚未吐出正文时，由轻量辅助模型（默认 `quick-fast`）将最后一句重述为防御性工程表述，并通过原生 `edit_message` 热分支（或冷重试）**死守用户请求的原模型重试 1 次**（绝不降级偷换模型，下一轮继续 `warm_incremental` 热续接）。
-- **多账号调度与独立代理**：
-  - 支持余量感知（`quota-aware`）、最少并发（`least-busy`）、轮询（`round-robin`）与会话粘性亲和；额度耗尽自动熔断，遇到 401/429/502/503 自动切换至健康账号。
-  - 零依赖单账号独立出口代理，原生支持 `http://`、`https://`、`socks5://`、`socks5h://`（远程 DNS 解析）及常见简写（`ip:port`、`user:pass@ip:port`、`ip:port:user:pass`），内置住宅代理 `ECONNRESET` 瞬态断连自动重试。
+- **多账号分组隔离、调度与独立代理**：
+  - 支持余量感知（`quota-aware`：严格隔离保护 `<15%` 残血号，其余健康号先按当前并发摊平、并发相同时优先 `>=40%` 顶档并按分组独立轮询防单号热点与跨组饿死）、最少并发（`least-busy`）、轮询（`round-robin`）与会话粘性亲和；额度耗尽自动熔断，遇到 401/429/502/503/529/`Service is busy` 自动短退避切换健康账号（仅解绑当前失败会话粘性、零连锁冷启动）。
+  - 支持**账号分组与子 Key 绑定隔离**：在「凭证池」中可随时新建、重命名、删除分组并通过下拉弹窗为单号或勾选账号批量分配分组；在「网关子密钥」中可将指定 `sk-aq-...` 绑定到某一分组并执行**严格组内调度**（仅调度该分组内账号，组内无可用号或额度耗尽直接明确报错，绝不跨组或回退全局池），账号改组/删组立即驱逐旧亲和与热连接并实时生效，实时请求日志同步记录分组与命中账号。
+  - 零依赖单账号独立出口代理（未配置单号代理时自动兜底读取全局 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` 并遵循含 IPv6/通配符的 `NO_PROXY`），原生支持 `http://`、`https://`、`socks5://`、`socks5h://`（远程 DNS 解析）及常见简写（`ip:port`、`user:pass@ip:port`、`ip:port:user:pass`），内置住宅代理 `ECONNRESET` 瞬态断连自动重试。
 - **无痕隐私与独占 WS 长连接热续传**：
-  - 默认开启**原生无痕模式（`incognito: true`）+ 单会话独占 WebSocket 长连接保活热续传**：既不写入 AWS 云端历史记录、不刷爆官方侧边栏，又能像官方桌面端一样全协议（含 Claude Code / Codex / Witan 工具调用）增量续传，多轮首字低至 **1.4~3.2s**；5 重隔离锁杜绝串话，断连自动无感降级 `46.5 KB` 满载分片零失忆；关闭无痕时同步支持云端 `thread_id` 断连重连续传。
+  - 默认开启**原生无痕模式（`incognito: true`）+ 单会话独占 WebSocket 长连接保活热续传**：既不写入 AWS 云端历史记录、不刷爆官方侧边栏，又能像官方桌面端一样全协议增量续传（通用 IDE 动态外壳归一化，兼容 Claude Code / Codex CLI / Cursor / Cline / Roo / Kilo / Witan 等动态改写上下文标签仍保持高命中率），多轮首字低至 **1.2~3.2s**；5 重隔离锁杜绝串话，断连自动无感降级 `46.5 KB` 满载分片零失忆；关闭无痕时同步支持云端 `thread_id` 断连重连续传。
 - **内置 Web 管理台（`aws-quick-admin`）**：
-  - 访问 `/dashboard` 即可使用（中英双语、浅色/暗色主题）：总览图表与路由模型统计、实时配额与试用到期倒计时、按勾选精准同步额度、一键批量清理云端会话、`sk-aq-...` 子密钥管控（模型白名单/并发/限额/有效期）及实时请求追踪。
+  - 访问 `/dashboard` 即可使用（中英双语、浅色/暗色主题）：总览图表与路由模型统计、实时配额刷新与试用到期倒计时、异常号一键重测复活、下拉式分组管理与批量分配、工具栏折叠下拉与全站统一二次确认、一键批量清理云端会话、`sk-aq-...` 子密钥管控（绑定账号分组/模型白名单/并发/限额/有效期）、思考块路由头开关热切换及实时请求追踪。
 
 ---
 
@@ -120,7 +121,7 @@ flowchart LR
 | `quick-smart-think` | `smart` | `high` | `us.anthropic.claude-opus-5-5` | 旗舰推理 + 高强度深度思考 |
 | `quick-advanced` | `advanced` | `high` | 视账号 Advanced 权限而定 | 高级工作流（Free 套餐建议在管理台禁用） |
 
-> **说明**：底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，上表基于 Free / 常规套餐多次实测结果整理（后续可能随 AWS 上游调度策略调整）。实际路由到的底层模型会实时显示在思考块、OpenAI `system_fingerprint` 以及控制台请求日志中。
+> **说明**：底层模型由 AWS Quick 服务端根据模式与思考强度动态分配，上表基于 Free / 常规套餐多次实测结果整理（后续可能随 AWS 上游调度策略调整）。默认 `SHOW_ROUTED_MODEL_IN_THINKING=true` 时，在开启思考（`effort != off` 或上游实际输出思考流）的轮次首行实时展示档位、思考程度及观测到的底层实际模型（`routed=` / `routed≈`；非流式直接输出精确 `routed=`），同时保持纯文本 `effort=off` 回复纯净不注入伪思考块；所有请求均通过 HTTP 响应头（`x-quick-mode`、`x-quick-effort`、`x-quick-routed-model`）、OpenAI `system_fingerprint` 与控制台请求日志透出，支持在管理台「路由与策略」随时热切换为 `true` / `always` / `false`。
 >
 > **别名与参数覆盖**：兼容带括号说明的写法（如 `quick-balanced(Sonnet)`、`quick-smart(max)`），支持通过 `reasoning_effort`、`reasoning.effort`、`thinking.enabled`、`enable_thinking`、`-max` 后缀或方括号语法（`quick-smart[effort=max]`）按请求覆盖并原生透传思考强度（`off` / `low` / `medium` / `high` / `max`）。
 
@@ -188,10 +189,10 @@ docker compose pull && docker compose up -d
 | `DISABLED_MODELS` | - | 需隐藏的模型 ID，逗号分隔（Free 账号建议填 `quick-advanced`） |
 | `INCOGNITO` | `true` | 原生无痕模式，不落云端历史（管理台支持热切换）。**共享号池/需云端零留存**保持 `true`；**个人独享/高并发**（如 Claude Code 多子代理）建议设为 `false`，WS 断开或被并发驱逐后仍可凭云端 `thread_id` 热续传，显著减少冷重放 |
 | `WEB_SEARCH_ENABLED` | `true` | 开启 AWS Quick 原生联网搜索 |
-| `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | 在思考块中显示实际路由模型 |
+| `SHOW_ROUTED_MODEL_IN_THINKING` | `true` | 控制思考块首行是否展示档位、思考程度与实时观测到的底层实际模型（支持在管理台「路由与策略」热切换并持久化至 `pool-state.json`，仅向下游输出绝不回传上游、零审查影响）：`true`（默认，仅在开启思考或上游输出思考流时显示 `routed=`/`routed≈`，纯文本 `effort=off` 与显式禁用思考时保持纯净不注入）、`always`（强制全显，含 `effort=off` 与显式禁用思考的请求）、`false`（关闭思考块头，仍保留 `x-quick-*` 响应头与后台日志） |
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | 桌面端版本号请求头覆盖 |
-| `HTTPS_PROXY` / `HTTP_PROXY` | - | 全局默认代理（单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独配置） |
+| `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | - | 全局默认出口代理（兼容大小写与 `NO_PROXY`；单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独覆盖） |
 | `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | 可选开关（管理台支持热切换，默认关闭以保证用户自定义 `system` 提示词 100% 原样透传）：重型 Agent 客户端（Claude Code / Cursor / Kilo / Antigravity / ZCode 等）遇 `smart` 频繁误拦或拒调本地工具时建议开启，自动柔化冲突身份声明与伪系统 XML 标签，完整保留业务规则正文 |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型润色最后一句提问并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | 防御性重述提示词模板（留空使用内置默认模板，可在管理台直接微调并一键恢复默认） |

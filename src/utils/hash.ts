@@ -50,6 +50,189 @@ export function computeConversationHash(parts: readonly string[]): string {
   return h.digest("hex").slice(0, 32);
 }
 
+/**
+ * Generalized, client-agnostic tag-name matcher for volatile per-turn IDE metadata envelopes injected by
+ * coding agents (Claude Code, Codex CLI, Cursor, DSH, Cline, Roo, Kilo, Windsurf, Trae, Antigravity,
+ * OpenCode, etc.). Matches compound `<prefix_suffix>` / `<system-reminder>` / `<current_time>` envelopes
+ * only — never touches normal HTML/JSX/code tags (`<div>`, `<input>`, `Array<T>`, etc.) or explicit
+ * `@file` attachments (`<attached_files>`, `<file_content>`).
+ *
+ * Used solely for conversation affinity & prefix-hash stability; never mutates outbound upstream prompts.
+ */
+const VOLATILE_IDE_TAG_NAME_RE =
+  /^(?:system[-_]reminder|(?:user|ide|editor|workspace|cursor|client|session|environment|env|runtime|additional|git|tab|open_and_recently_viewed)[-_](?:info|context|details|metadata|status|files?|opened_file|state|reminder|commands?)|current_time|current_date|timestamp|datetime)$/;
+
+const MAX_TAG_ATTR_LEN = 160;
+
+/**
+ * Strict linear-time O(N) balanced-innermost XML/HTML tag block stripper.
+ * Prevents quadratic ReDoS on repeated unmatched opening tags (e.g. 50k `<timestamp>`) and avoids
+ * swallowing user prose when an unclosed tag mention precedes a real IDE metadata envelope.
+ */
+function stripTagBlocksLinear(
+  input: string,
+  matchesTagName: (lowerTagName: string) => boolean,
+  replacement = "",
+): string {
+  if (!input || !input.includes("<")) return input;
+  const lower = input.toLowerCase();
+  const len = input.length;
+  const nextCloseCache = new Map<string, number>();
+  const nextOpenCache = new Map<string, number>();
+  let out = "";
+  let pos = 0;
+
+  const isTagBoundaryChar = (code: number): boolean =>
+    code === 62 /* > */ || code === 47 /* / */ || code === 32 /* space */ || code === 9 || code === 10 || code === 13;
+
+  const findNextClose = (tag: string, from: number): number => {
+    const cached = nextCloseCache.get(tag);
+    if (cached === -1) return -1;
+    if (cached !== undefined && cached >= from) return cached;
+    const needle = `</${tag}>`;
+    const idx = lower.indexOf(needle, from);
+    nextCloseCache.set(tag, idx);
+    return idx;
+  };
+
+  const findNextOpenSameTag = (tag: string, from: number): number => {
+    const cached = nextOpenCache.get(tag);
+    if (cached === -1) return -1;
+    if (cached !== undefined && cached >= from) return cached;
+    const needle = `<${tag}`;
+    let searchAt = from;
+    while (searchAt < len) {
+      const idx = lower.indexOf(needle, searchAt);
+      if (idx === -1) {
+        nextOpenCache.set(tag, -1);
+        return -1;
+      }
+      const after = idx + needle.length;
+      if (after < len && isTagBoundaryChar(lower.charCodeAt(after))) {
+        nextOpenCache.set(tag, idx);
+        return idx;
+      }
+      searchAt = idx + 1;
+    }
+    nextOpenCache.set(tag, -1);
+    return -1;
+  };
+
+  while (pos < len) {
+    const lt = input.indexOf("<", pos);
+    if (lt === -1) {
+      out += input.slice(pos);
+      break;
+    }
+    if (lt > pos) out += input.slice(pos, lt);
+
+    // Parse tag name starting at lt + 1
+    let nameEnd = lt + 1;
+    while (nameEnd < len) {
+      const ch = lower.charCodeAt(nameEnd);
+      const isNameChar =
+        (ch >= 97 && ch <= 122) || // a-z
+        (ch >= 48 && ch <= 57) || // 0-9
+        ch === 95 || // _
+        ch === 45; // -
+      if (!isNameChar) break;
+      nameEnd += 1;
+    }
+    const tag = nameEnd > lt + 1 ? lower.slice(lt + 1, nameEnd) : "";
+    if (!tag || nameEnd >= len || !isTagBoundaryChar(lower.charCodeAt(nameEnd)) || !matchesTagName(tag)) {
+      out += "<";
+      pos = lt + 1;
+      continue;
+    }
+
+    // Find closing '>' of the opening tag within MAX_TAG_ATTR_LEN
+    const maxGt = Math.min(len - 1, nameEnd + MAX_TAG_ATTR_LEN);
+    let gt = -1;
+    for (let k = nameEnd; k <= maxGt; k += 1) {
+      const ch = input.charCodeAt(k);
+      if (ch === 62 /* > */) {
+        gt = k;
+        break;
+      }
+      if (ch === 60 /* < */) break;
+    }
+    if (gt === -1) {
+      out += "<";
+      pos = lt + 1;
+      continue;
+    }
+
+    const closeIdx = findNextClose(tag, gt + 1);
+    if (closeIdx === -1) {
+      out += "<";
+      pos = lt + 1;
+      continue;
+    }
+
+    // If another opening <tag...> appears before </tag>, treat this outer one as unclosed prose
+    // so only the innermost balanced IDE envelope is stripped.
+    const innerOpen = findNextOpenSameTag(tag, gt + 1);
+    if (innerOpen !== -1 && innerOpen < closeIdx) {
+      out += input.slice(lt, gt + 1);
+      pos = gt + 1;
+      continue;
+    }
+
+    if (replacement) out += replacement;
+    pos = closeIdx + tag.length + 3; // skip `</${tag}>`
+  }
+  return out;
+}
+
+const VOLATILE_CLOCK_LINE_RE =
+  /^(?:current(?:\s+local)?\s+(?:date|time)|today(?:'s)?\s+date|当前(?:本地)?(?:时间|日期)|现在时间)\s*[:：].*$/gim;
+
+function normalizeVolatileTimestamps(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/^(?:current(?:\s+local)?\s+(?:date|time)|today(?:'s)?\s+date|timestamp|now|当前(?:本地)?(?:时间|日期)|现在时间)\s*[:：].*$/gim, "<TIME_LINE>")
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "<ISO_TS>")
+    .replace(/\b\d{4}年\d{1,2}月\d{1,2}日(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/g, "<CN_TS>")
+    .replace(/\b\d{2}:\d{2}:\d{2}\b/g, "<HMS>")
+    .replace(/((?:request|trace|turn|invocation)[_-]?id["':=\s]+)[0-9a-f-]{8,36}\b/gi, "$1<ID>");
+}
+
+/**
+ * Single source of truth for normalizing a user turn solely for sticky affinity (`conversationKey`)
+ * and `warm_incremental` prefix hashing. Strips volatile IDE metadata envelopes and explicit clock
+ * header lines while preserving real user content (explicit `@file` attachments, pasted log timestamps/IDs,
+ * and HTML/code tags). Falls back to trimmed raw text if nothing else remains.
+ */
+export function normalizeUserTurnForHash(input: string): string {
+  if (!input) return "";
+  const normalizedLf = input.replace(/\r\n/g, "\n");
+  const stripped = stripTagBlocksLinear(normalizedLf, (tag) => VOLATILE_IDE_TAG_NAME_RE.test(tag))
+    .replace(VOLATILE_CLOCK_LINE_RE, "<TIME_LINE>")
+    .trim();
+  const substantive = stripped.replace(/<TIME_LINE>/g, "").trim();
+  return substantive ? stripped : normalizedLf.trim();
+}
+
+/**
+ * Extracts the coalesced first logical user turn (all leading consecutive `user` items before the
+ * first `assistant` item, matching `computeDialogPrefixHashes`) so clients that send volatile IDE
+ * metadata (`<environment_context>`, `<user_info>`, `<system-reminder>`) in a separate leading
+ * `user` message keep stable `conversationKey` stickiness across turns.
+ */
+export function extractFirstUserTurnText(items: ReadonlyArray<{ role: string; text: string }>): string | undefined {
+  const parts: string[] = [];
+  for (const it of items) {
+    if (it.role === "assistant") {
+      if (parts.length > 0) break;
+      continue;
+    }
+    if (it.role === "user" && it.text.trim()) {
+      parts.push(it.text.trim());
+    }
+  }
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
+}
+
 /** Stable digest of attached images so two dialogs differing only by an image never share a warm agent. */
 function imagesDigest(images: readonly NormalizedImage[]): string {
   if (!images.length) return "";
@@ -69,16 +252,9 @@ function filesDigest(files: readonly NormalizedFile[]): string {
 
 export function normalizeSystemPromptForHash(systemPrompt: string): string {
   if (!systemPrompt) return "";
-  return systemPrompt
-    .replace(/\r\n/g, "\n")
-    // Strip common volatile timestamp / date / clock lines injected by Agent clients on every turn
-    .replace(/<(?:current_time|current_date|timestamp|datetime)[^>]*>[\s\S]*?<\/(?:current_time|current_date|timestamp|datetime)>/gi, "<TS_BLOCK>")
-    .replace(/^(?:current(?:\s+local)?\s+(?:date|time)|today(?:'s)?\s+date|timestamp|now|当前(?:本地)?(?:时间|日期)|现在时间)\s*[:：].*$/gim, "<TIME_LINE>")
-    .replace(/\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?\b/g, "<ISO_TS>")
-    .replace(/\b\d{4}年\d{1,2}月\d{1,2}日(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/g, "<CN_TS>")
-    .replace(/\b\d{2}:\d{2}:\d{2}\b/g, "<HMS>")
-    .replace(/((?:request|trace|turn|invocation)[_-]?id["':=\s]+)[0-9a-f-]{8,36}\b/gi, "$1<ID>")
-    .trim();
+  return normalizeVolatileTimestamps(
+    stripTagBlocksLinear(systemPrompt, (tag) => VOLATILE_IDE_TAG_NAME_RE.test(tag), "<TS_BLOCK>"),
+  ).trim();
 }
 
 export interface HashableToolCallRef {
@@ -222,7 +398,7 @@ export function computeDialogPrefixHashes(params: {
       incrementalFiles = grpFiles;
     }
 
-    const hashText = grpText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim() || grpText.trim();
+    const hashText = normalizeUserTurnForHash(grpText);
     const hashParts = isPureSingleUser
       ? [runningHash, `USER:${hashText}`, `IMG:${imagesDigest(grpImages)}`]
       : [runningHash, `INPUT:${hashText}`, `IMG:${imagesDigest(grpImages)}`];

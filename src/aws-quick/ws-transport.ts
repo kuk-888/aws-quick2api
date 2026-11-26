@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import WebSocket from "ws";
 import { appendWsRecvBuf } from "../core/media-utils.js";
 import { GatewayError } from "../core/types.js";
-import { getProxyAgent } from "../utils/proxy-agent.js";
+import { getProxyAgent, resolveEffectiveProxyUrl } from "../utils/proxy-agent.js";
 import {
   ChunkedFrameAssembler,
   decodeCloudOutputFrame,
@@ -95,11 +95,11 @@ export async function dialQuickWebSocket(params: {
   const surfaceType = isWeb ? "WEB_EXPERIENCE" : SURFACE_TYPE;
   const appVersion = isWeb ? "qbiz-web-bridge" : APP_VERSION;
   const surfaceName: "web" | "desktop" = isWeb ? "web" : "desktop";
-  const effectiveProxy = proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
-  const wsAgent = getProxyAgent(effectiveProxy);
 
   if (isWeb && cred.web) {
     const conn = buildWebWsConnection(cred.web, workingSessionId);
+    const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, conn.url);
+    const wsAgent = getProxyAgent(effectiveProxy);
     if (beforeDial) await beforeDial();
     const ws = new WebSocket(conn.url, conn.protocols, {
       headers: conn.headers,
@@ -130,6 +130,8 @@ export async function dialQuickWebSocket(params: {
       `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
       `&replayContext=${encodeURIComponent(replayContext)}` +
       `&channel=prod`;
+    const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, wsUrl);
+    const wsAgent = getProxyAgent(effectiveProxy);
     if (beforeDial) await beforeDial();
     const oauthWsOpts: Record<string, unknown> = {
       handshakeTimeout: 15_000,
@@ -183,6 +185,8 @@ export async function dialQuickWebSocket(params: {
     `&workingSessionId=${encodeURIComponent(workingSessionId)}` +
     `&replayContext=${encodeURIComponent(replayContext)}` +
     `&channel=prod`;
+  const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, wsUrl);
+  const wsAgent = getProxyAgent(effectiveProxy);
   if (beforeDial) await beforeDial();
   const ws = new WebSocket(wsUrl, {
     handshakeTimeout: 15_000,
@@ -290,7 +294,7 @@ export async function deleteCloudSessionsForKey(
         sendTimer = null;
       }
       detachMsg();
-      ws.on("error", () => {});
+      ws.on("error", () => { });
       try {
         ws.close();
       } catch { }
@@ -369,7 +373,7 @@ export async function listChatAgentsForKey(
       settled = true;
       clearTimeout(timer);
       detachMsg();
-      ws.on("error", () => {});
+      ws.on("error", () => { });
       try {
         ws.close();
       } catch { }
@@ -454,7 +458,7 @@ export async function createAndPublishCodingAgentForKey(
       clearTimeout(timer);
       if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
       detachMsg();
-      ws.on("error", () => {});
+      ws.on("error", () => { });
       try {
         ws.close();
       } catch { }
@@ -577,7 +581,7 @@ export async function updateAndPublishAgentForKey(
       clearTimeout(timer);
       if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
       detachMsg();
-      ws.on("error", () => {});
+      ws.on("error", () => { });
       try {
         ws.close();
       } catch { }

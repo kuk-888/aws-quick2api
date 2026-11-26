@@ -33,6 +33,7 @@ import {
 import { listLiveModels, resolveModelSelection } from "../services/model-catalog.js";
 import type { ExecutionModeTag, UsageTracker } from "../services/usage-tracker.js";
 import { redactSecrets } from "../utils/hash.js";
+import { resolveEffectiveProxyUrl } from "../utils/proxy-agent.js";
 import type { UpstreamKeyPool } from "./key-pool.js";
 import {
   assertSafeRemoteImageUrl,
@@ -61,7 +62,12 @@ import {
   buildPromptAndAttachmentsForTurn,
   finalizePromptChunksAndOutOfBandText,
 } from "./turn-attachment-builder.js";
-import { runTurnStream, type ContentFilterCaptureContext } from "./turn-stream-runner.js";
+import {
+  parseRoutedModelThinkingMode,
+  runTurnStream,
+  type ContentFilterCaptureContext,
+  type RoutedModelThinkingMode,
+} from "./turn-stream-runner.js";
 import {
   GatewayError,
   type GatewayConfig,
@@ -93,6 +99,7 @@ export {
   DEFAULT_CODING_AGENT_DESCRIPTION,
   DEFAULT_CODING_AGENT_INSTRUCTIONS,
   DEFAULT_CODING_AGENT_NAME,
+  parseRoutedModelThinkingMode,
   DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
   DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
   estimatePromptTokens,
@@ -118,9 +125,11 @@ export class QuickExecutionEngine {
   private readonly modelListFetcher?: (apiKey: string) => Promise<SDKModel[]>;
   private readonly webSocketFactory?: QuickWebSocketFactory;
   private readonly autoEnsureCodingAgent: boolean;
-  private readonly showRoutedModelInThinking: boolean;
+  private readonly showRoutedModelInThinking: RoutedModelThinkingMode;
   private readonly webSearchEnabled: boolean;
   private readonly workingSessionIds = new Map<string, string>();
+  private readonly observedModelBySlotMode = new Map<string, string>();
+  private readonly observedModelByMode = new Map<string, string>();
   private readonly warmPool: WarmSessionPool;
   private readonly ensuringAgentBySlot = new Map<string, Promise<string | undefined>>();
   private readonly autoEnsureFailedSlots = new Map<string, { failedAt: number; count: number }>();
@@ -141,8 +150,36 @@ export class QuickExecutionEngine {
       warmSessionTtlMs: options.config.warmSessionTtlMs,
     });
     this.autoEnsureCodingAgent = process.env.AUTO_ENSURE_CODING_AGENT !== "false";
-    this.showRoutedModelInThinking = process.env.SHOW_ROUTED_MODEL_IN_THINKING !== "false";
+    this.showRoutedModelInThinking =
+      options.config.showRoutedModelInThinking ??
+      parseRoutedModelThinkingMode(process.env.SHOW_ROUTED_MODEL_IN_THINKING);
     this.webSearchEnabled = process.env.WEB_SEARCH_ENABLED !== "false";
+  }
+
+  /** Records the real upstream `resolved_model_id` observed from `routing_decision` or `turn_usage`. */
+  recordObservedModel(slotId: string | undefined, agentMode: string | undefined, modelId: string | undefined): void {
+    const mode = typeof agentMode === "string" ? agentMode.trim() : "";
+    const model = typeof modelId === "string" ? modelId.trim() : "";
+    if (!mode || !model) return;
+    this.observedModelByMode.set(mode, model);
+    if (typeof slotId === "string" && slotId.trim()) {
+      this.observedModelBySlotMode.set(`${slotId.trim()}:${mode}`, model);
+    }
+  }
+
+  /** Returns the most recently observed real upstream model for `(slotId, agentMode)` or `agentMode`. */
+  getObservedModelHint(slotId: string, agentMode: string): string | undefined {
+    const mode = (agentMode || "").trim();
+    if (!mode) return undefined;
+    const bySlot = slotId?.trim() ? this.observedModelBySlotMode.get(`${slotId.trim()}:${mode}`) : undefined;
+    return bySlot || this.observedModelByMode.get(mode);
+  }
+
+  /** Seeds observed model cache at startup from persisted metadata-only traces (oldest -> newest). */
+  seedObservedModels(entries: Array<{ slotId?: string; agentMode?: string; resolvedModel?: string }>): void {
+    for (const entry of entries) {
+      this.recordObservedModel(entry.slotId, entry.agentMode, entry.resolvedModel);
+    }
   }
 
   runtimeStats() {
@@ -346,11 +383,11 @@ export class QuickExecutionEngine {
 
       const boundMatch = currentBoundId
         ? customAgents.find(
-            (a) =>
-              (normalizeChatAgentShortId(a.shortId || a.agentId) === currentBoundId ||
-                a.agentId === currentBoundId) &&
-              matchNames.has(a.name.trim().toLowerCase()),
-          )
+          (a) =>
+            (normalizeChatAgentShortId(a.shortId || a.agentId) === currentBoundId ||
+              a.agentId === currentBoundId) &&
+            matchNames.has(a.name.trim().toLowerCase()),
+        )
         : undefined;
       const candidate =
         boundMatch || customAgents.find((a) => matchNames.has(a.name.trim().toLowerCase()));
@@ -421,12 +458,17 @@ export class QuickExecutionEngine {
       slotId?: string;
       maskedKey: string;
       accountLabel?: string;
+      accountGroup?: string;
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
       contentFilterRecovered?: boolean;
       warmFallbackToCold?: boolean;
       accountFailoverCount?: number;
       usedDefaultSystemAgent?: boolean;
+      agentMode?: string;
+      thinkingEffort?: string;
+      resolvedModel?: string;
+      effectiveSystemPromptChars?: number;
       /**
        * Controls the SSE `flushEarly` 15s keepalive timer:
        * - `false`: disarm/cancel timer while uploading OOB attachments, dialing WS, or failing over;
@@ -434,6 +476,7 @@ export class QuickExecutionEngine {
        */
       flushEarlyReady?: boolean;
     }) => void,
+    poolOpts?: { accountGroup?: string | null },
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
     // Pre-lease validation: reject empty prompts, attachment count overflows, and SSRF URLs before leasing a slot.
     const allImages = [...(turn.images || []), ...(turn.incrementalImages || [])];
@@ -474,206 +517,278 @@ export class QuickExecutionEngine {
     const excluded = new Set<string>();
     const retriedAuthRefreshSlots = new Set<string>();
     const attachmentCache = new RequestAttachmentCache();
-    const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount()), 10);
+    let requiredAccountGroup = poolOpts?.accountGroup?.trim() || undefined;
+    const unsubscribeGroupRename = requiredAccountGroup
+      ? keyPool.subscribeGroupRename((oldName, newName) => {
+        if (requiredAccountGroup === oldName) requiredAccountGroup = newName;
+      })
+      : undefined;
+    const maxAttempts = Math.min(Math.max(1, keyPool.enabledKeyCount(requiredAccountGroup)), 10);
     let remainingWaitBudgetMs = 18_000;
     let retriedSameSlotConnLimit = false;
 
-    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-      const waitStartedAt = Date.now();
-      const lease = await keyPool.leaseKeyWithWait(
-        turn.requestedModel,
-        excluded.size > 0 ? excluded : undefined,
-        turn.conversationKey,
-        {
-          signal: turn.signal,
-          maxWaitMs: Math.max(0, Math.min(15_000, remainingWaitBudgetMs)),
-        },
-      );
-      remainingWaitBudgetMs = Math.max(0, remainingWaitBudgetMs - (Date.now() - waitStartedAt));
-      // Capture warm-session generation BEFORE reading chatAgentId / awaiting async ops so any
-      // concurrent hot-switch during ensure/resolveModel/rephrase prevents stale WS parking.
-      let expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
-      const poolSettings = keyPool.getSettings();
-      const isIncognito = poolSettings.incognitoMode;
-      const shouldAutoEnsure =
-        poolSettings.autoEnsureCodingAgent !== undefined
-          ? poolSettings.autoEnsureCodingAgent
-          : this.autoEnsureCodingAgent;
-      let effectiveChatAgentId =
-        normalizeChatAgentShortId(lease.chatAgentId || poolSettings.chatAgentId || "") || undefined;
-      let yieldedOutput = false;
-      let hasEmittedClientText = false;
-      let hasEmittedThinking = false;
-      let retriedContentFilterRephrase = false;
-      let lastExecMode: ExecutionModeTag | undefined;
-      let capturedFilterCtx: ContentFilterCaptureContext | undefined;
-      const closeCapturedFilterWs = () => {
-        if (capturedFilterCtx?.ws) {
-          const staleWs = capturedFilterCtx.ws;
-          const errFn = capturedFilterCtx.onIdleErr;
-          capturedFilterCtx.ws = undefined;
-          capturedFilterCtx.onIdleErr = undefined;
-          if (errFn) staleWs.off("error", errFn);
-          staleWs.on("error", () => { });
-          try {
-            staleWs.close();
-          } catch { }
-        }
-      };
-      const wrappedMeta: typeof onExecMeta = (meta) => {
-        lastExecMode = meta.execMode;
-        onExecMeta?.({
-          ...meta,
-          ...(attempt > 0 ? { accountFailoverCount: attempt } : {}),
-        });
-      };
-      const isInternalCall = Boolean(turn.rawBody?.__internalRephrase);
-      const allowContentFilterRephrase =
-        poolSettings.autoRephraseOnContentFilter === true && !isInternalCall;
-
-      try {
-        if (!effectiveChatAgentId && shouldAutoEnsure && !isInternalCall && !turn.signal?.aborted) {
-          const failRec = this.autoEnsureFailedSlots.get(lease.slotId);
-          const backoffMs = failRec
-            ? [30_000, 120_000, 600_000, 1_800_000][Math.min(failRec.count - 1, 3)]!
-            : 0;
-          if (!failRec || Date.now() - failRec.failedAt > backoffMs) {
-            const ensurePromise = this.ensureCodingAgentForKey(
-              lease.apiKey,
-              lease.slotId,
-              keyPool,
-              lease.proxyUrl,
-            ).catch(() => undefined);
-            if (turn.signal) {
-              effectiveChatAgentId = await new Promise<string | undefined>((resolve) => {
-                if (turn.signal!.aborted) return resolve(undefined);
-                const onAbort = () => resolve(undefined);
-                turn.signal!.addEventListener("abort", onAbort, { once: true });
-                ensurePromise.then((val) => {
-                  turn.signal!.removeEventListener("abort", onAbort);
-                  resolve(val);
-                });
-              });
-            } else {
-              effectiveChatAgentId = await ensurePromise;
-            }
-            if (effectiveChatAgentId) {
-              effectiveChatAgentId = normalizeChatAgentShortId(effectiveChatAgentId) || undefined;
-              expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
-            }
+    try {
+      for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+        const waitStartedAt = Date.now();
+        const lease = await keyPool.leaseKeyWithWait(
+          turn.requestedModel,
+          excluded.size > 0 ? excluded : undefined,
+          turn.conversationKey,
+          {
+            signal: turn.signal,
+            maxWaitMs: Math.max(0, Math.min(15_000, remainingWaitBudgetMs)),
+            ...(requiredAccountGroup ? { accountGroup: requiredAccountGroup } : {}),
+          },
+        );
+        remainingWaitBudgetMs = Math.max(0, remainingWaitBudgetMs - (Date.now() - waitStartedAt));
+        // Capture warm-session generation BEFORE reading chatAgentId / awaiting async ops so any
+        // concurrent hot-switch during ensure/resolveModel/rephrase prevents stale WS parking.
+        let expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
+        const poolSettings = keyPool.getSettings();
+        const isIncognito = poolSettings.incognitoMode;
+        const shouldAutoEnsure =
+          poolSettings.autoEnsureCodingAgent !== undefined
+            ? poolSettings.autoEnsureCodingAgent
+            : this.autoEnsureCodingAgent;
+        let effectiveChatAgentId =
+          normalizeChatAgentShortId(lease.chatAgentId || poolSettings.chatAgentId || "") || undefined;
+        let yieldedOutput = false;
+        let hasEmittedClientText = false;
+        let hasEmittedThinking = false;
+        let retriedContentFilterRephrase = false;
+        let lastExecMode: ExecutionModeTag | undefined;
+        let capturedFilterCtx: ContentFilterCaptureContext | undefined;
+        const closeCapturedFilterWs = () => {
+          if (capturedFilterCtx?.ws) {
+            const staleWs = capturedFilterCtx.ws;
+            const errFn = capturedFilterCtx.onIdleErr;
+            capturedFilterCtx.ws = undefined;
+            capturedFilterCtx.onIdleErr = undefined;
+            if (errFn) staleWs.off("error", errFn);
+            staleWs.on("error", () => { });
+            try {
+              staleWs.close();
+            } catch { }
           }
-        }
-        if (turn.signal?.aborted) {
-          throw new GatewayError("Request aborted before starting upstream turn.", 499, "client_aborted");
-        }
-        const initialLeaseOpts = {
-          attachmentCache,
-          expectedWarmGeneration,
-          ...(allowContentFilterRephrase
-            ? {
-              onContentFilterCapture: (ctx: NonNullable<typeof capturedFilterCtx>) => {
-                closeCapturedFilterWs();
-                capturedFilterCtx = ctx;
-              },
-            }
-            : {}),
         };
-        for await (const ev of this.executeTurnWithLease(
-          turn,
-          lease,
-          isIncognito,
-          wrappedMeta,
-          effectiveChatAgentId,
-          keyPool,
-          initialLeaseOpts,
-        )) {
-          if (ev.type === "text" || ev.type === "tool_calls") {
-            yieldedOutput = true;
-            hasEmittedClientText = true;
-          } else if (ev.type === "thinking") {
-            yieldedOutput = true;
-            hasEmittedThinking = true;
-          }
-          yield ev;
-        }
-        closeCapturedFilterWs();
-        lease.markSuccess();
-        return;
-      } catch (err) {
-        // Immediately disarm any armed 15s `flushEarly` timer before rephrase/warm-fallback/failover
-        // so slow retries or next-account OOB errors never prematurely commit HTTP 200 keepalive.
-        wrappedMeta({
-          slotId: lease.slotId,
-          maskedKey: lease.maskedKey,
-          accountLabel: lease.label,
-          execMode: lastExecMode || (isIncognito ? "incognito" : "cloud"),
-          flushEarlyReady: false,
-        });
-        let gwErr = mapSdkError(err);
+        const wrappedMeta: typeof onExecMeta = (meta) => {
+          lastExecMode = meta.execMode;
+          onExecMeta?.({
+            ...meta,
+            ...(attempt > 0 ? { accountFailoverCount: attempt } : {}),
+          });
+        };
+        const isInternalCall = Boolean(turn.rawBody?.__internalRephrase);
+        const allowContentFilterRephrase =
+          poolSettings.autoRephraseOnContentFilter === true && !isInternalCall;
 
-        // Opt-in defensive auto-rephrase on upstream `content_filtered` (strictly keeps the requested model).
-        if (
-          gwErr.code === "content_filter" &&
-          allowContentFilterRephrase &&
-          (!hasEmittedClientText || !turn.stream) &&
-          !retriedContentFilterRephrase &&
-          !turn.signal?.aborted
-        ) {
-          retriedContentFilterRephrase = true;
-          const filterCtx = capturedFilterCtx;
-          const rawTargetText =
-            filterCtx?.activePromptText || turn.incrementalUserText || turn.fullTranscriptText;
-          const rephrased = await this.rephrasePromptForContentFilter(
-            rawTargetText,
-            lease,
-            poolSettings,
-            turn.signal,
-            effectiveChatAgentId,
-          ).catch(() => undefined);
-
-          if (rephrased && rephrased.trim() && rephrased.trim() !== rawTargetText.trim()) {
-            const editBranch =
-              filterCtx?.ws &&
-                filterCtx.ws.readyState === WebSocket.OPEN &&
-                filterCtx.isWarmIncremental &&
-                filterCtx.messageId
-                ? {
-                  ws: filterCtx.ws,
-                  outpostId: filterCtx.outpostId || "web0",
-                  originalMessageId: filterCtx.messageId,
-                  rootSessionId: filterCtx.rootSessionId,
-                  threadId: filterCtx.threadId,
-                  handoffErrListener: undefined as (() => void) | undefined,
-                }
-                : undefined;
-            if (editBranch && capturedFilterCtx) {
-              const keepSafeErr = () => { };
-              editBranch.ws.on("error", keepSafeErr);
-              editBranch.handoffErrListener = keepSafeErr;
-              if (capturedFilterCtx.onIdleErr) {
-                editBranch.ws.off("error", capturedFilterCtx.onIdleErr);
-                capturedFilterCtx.onIdleErr = undefined;
+        try {
+          if (!effectiveChatAgentId && shouldAutoEnsure && !isInternalCall && !turn.signal?.aborted) {
+            const failRec = this.autoEnsureFailedSlots.get(lease.slotId);
+            const backoffMs = failRec
+              ? [30_000, 120_000, 600_000, 1_800_000][Math.min(failRec.count - 1, 3)]!
+              : 0;
+            if (!failRec || Date.now() - failRec.failedAt > backoffMs) {
+              const ensurePromise = this.ensureCodingAgentForKey(
+                lease.apiKey,
+                lease.slotId,
+                keyPool,
+                lease.proxyUrl,
+              ).catch(() => undefined);
+              if (turn.signal) {
+                effectiveChatAgentId = await new Promise<string | undefined>((resolve) => {
+                  if (turn.signal!.aborted) return resolve(undefined);
+                  const onAbort = () => resolve(undefined);
+                  turn.signal!.addEventListener("abort", onAbort, { once: true });
+                  ensurePromise.then((val) => {
+                    turn.signal!.removeEventListener("abort", onAbort);
+                    resolve(val);
+                  });
+                });
+              } else {
+                effectiveChatAgentId = await ensurePromise;
               }
-              capturedFilterCtx.ws = undefined;
+              if (effectiveChatAgentId) {
+                effectiveChatAgentId = normalizeChatAgentShortId(effectiveChatAgentId) || undefined;
+                const liveSlot = keyPool.statusSnapshot().find((s) => s.slotId === lease.slotId);
+                const liveAgentId = normalizeChatAgentShortId(liveSlot?.chatAgentId || "") || undefined;
+                const liveProxy = keyPool.proxyUrlForKey(lease.apiKey) || "";
+                if (
+                  liveSlot &&
+                  liveSlot.enabled &&
+                  (!requiredAccountGroup || liveSlot.group === requiredAccountGroup) &&
+                  (!liveAgentId || liveAgentId === effectiveChatAgentId) &&
+                  liveProxy === (lease.proxyUrl || "")
+                ) {
+                  expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
+                }
+              }
+            }
+          }
+          if (turn.signal?.aborted) {
+            throw new GatewayError("Request aborted before starting upstream turn.", 499, "client_aborted");
+          }
+          const initialLeaseOpts = {
+            attachmentCache,
+            expectedWarmGeneration,
+            ...(allowContentFilterRephrase
+              ? {
+                onContentFilterCapture: (ctx: NonNullable<typeof capturedFilterCtx>) => {
+                  closeCapturedFilterWs();
+                  capturedFilterCtx = ctx;
+                },
+              }
+              : {}),
+          };
+          for await (const ev of this.executeTurnWithLease(
+            turn,
+            lease,
+            isIncognito,
+            wrappedMeta,
+            effectiveChatAgentId,
+            keyPool,
+            initialLeaseOpts,
+          )) {
+            if (ev.type === "text" || ev.type === "tool_calls") {
+              yieldedOutput = true;
+              hasEmittedClientText = true;
+            } else if (ev.type === "thinking") {
+              yieldedOutput = true;
+              hasEmittedThinking = true;
+            }
+            yield ev;
+          }
+          closeCapturedFilterWs();
+          lease.markSuccess();
+          return;
+        } catch (err) {
+          // Immediately disarm any armed 15s `flushEarly` timer before rephrase/warm-fallback/failover
+          // so slow retries or next-account OOB errors never prematurely commit HTTP 200 keepalive.
+          wrappedMeta({
+            slotId: lease.slotId,
+            maskedKey: lease.maskedKey,
+            accountLabel: lease.label,
+            execMode: lastExecMode || (isIncognito ? "incognito" : "cloud"),
+            flushEarlyReady: false,
+          });
+          let gwErr = mapSdkError(err);
+
+          // Opt-in defensive auto-rephrase on upstream `content_filtered` (strictly keeps the requested model).
+          if (
+            gwErr.code === "content_filter" &&
+            allowContentFilterRephrase &&
+            (!hasEmittedClientText || !turn.stream) &&
+            !retriedContentFilterRephrase &&
+            !turn.signal?.aborted
+          ) {
+            retriedContentFilterRephrase = true;
+            const filterCtx = capturedFilterCtx;
+            const rawTargetText =
+              filterCtx?.activePromptText || turn.incrementalUserText || turn.fullTranscriptText;
+            const rephrased = await this.rephrasePromptForContentFilter(
+              rawTargetText,
+              lease,
+              poolSettings,
+              turn.signal,
+              effectiveChatAgentId,
+            ).catch(() => undefined);
+
+            if (rephrased && rephrased.trim() && rephrased.trim() !== rawTargetText.trim()) {
+              const editBranch =
+                filterCtx?.ws &&
+                  filterCtx.ws.readyState === WebSocket.OPEN &&
+                  filterCtx.isWarmIncremental &&
+                  filterCtx.messageId
+                  ? {
+                    ws: filterCtx.ws,
+                    outpostId: filterCtx.outpostId || "web0",
+                    originalMessageId: filterCtx.messageId,
+                    rootSessionId: filterCtx.rootSessionId,
+                    threadId: filterCtx.threadId,
+                    handoffErrListener: undefined as (() => void) | undefined,
+                  }
+                  : undefined;
+              if (editBranch && capturedFilterCtx) {
+                const keepSafeErr = () => { };
+                editBranch.ws.on("error", keepSafeErr);
+                editBranch.handoffErrListener = keepSafeErr;
+                if (capturedFilterCtx.onIdleErr) {
+                  editBranch.ws.off("error", capturedFilterCtx.onIdleErr);
+                  capturedFilterCtx.onIdleErr = undefined;
+                }
+                capturedFilterCtx.ws = undefined;
+              } else {
+                closeCapturedFilterWs();
+              }
+              try {
+                if (!turn.stream && (hasEmittedClientText || hasEmittedThinking)) {
+                  yield { type: "reset" };
+                  yieldedOutput = false;
+                  hasEmittedClientText = false;
+                  hasEmittedThinking = false;
+                } else if (turn.stream && hasEmittedThinking) {
+                  yield {
+                    type: "thinking",
+                    text: "\n[Content filter triggered before answer; retrying with defensive phrasing...]\n",
+                  };
+                }
+                const rephrasedFinalPrompt =
+                  !editBranch && filterCtx?.preserveContextPrefix
+                    ? `${filterCtx.preserveContextPrefix}${rephrased.trim()}`
+                    : rephrased.trim();
+                for await (const ev of this.executeTurnWithLease(
+                  turn,
+                  lease,
+                  isIncognito,
+                  wrappedMeta,
+                  effectiveChatAgentId,
+                  keyPool,
+                  {
+                    attachmentCache,
+                    expectedWarmGeneration,
+                    overridePromptText: rephrasedFinalPrompt,
+                    ...(editBranch ? { editBranch } : { forceColdReplay: true }),
+                    isRephraseRetry: true,
+                  },
+                )) {
+                  if (ev.type === "text" || ev.type === "tool_calls") {
+                    yieldedOutput = true;
+                    hasEmittedClientText = true;
+                  } else if (ev.type === "thinking") {
+                    yieldedOutput = true;
+                    hasEmittedThinking = true;
+                  }
+                  yield ev;
+                }
+                lease.markSuccess();
+                return;
+              } catch (rephraseRetryErr) {
+                err = rephraseRetryErr;
+                gwErr = mapSdkError(rephraseRetryErr);
+              }
             } else {
               closeCapturedFilterWs();
             }
+          } else {
+            closeCapturedFilterWs();
+          }
+
+          const preClass = classifyUpstreamError(gwErr);
+          // Fail-safe: warm_incremental failure before output falls back once to cold replay on the same account.
+          // Never double-hang on 504 timeouts (already waited full timeout budget).
+          if (
+            lastExecMode === "warm_incremental" &&
+            !yieldedOutput &&
+            !turn.signal?.aborted &&
+            gwErr.status !== 504 &&
+            gwErr.code !== "content_filter" &&
+            gwErr.code !== "content_filtered" &&
+            !preClass.isQuotaErr &&
+            !preClass.isConnLimitErr &&
+            !preClass.isRateLimitErr &&
+            !preClass.isAuthErr
+          ) {
             try {
-              if (!turn.stream && (hasEmittedClientText || hasEmittedThinking)) {
-                yield { type: "reset" };
-                yieldedOutput = false;
-                hasEmittedClientText = false;
-                hasEmittedThinking = false;
-              } else if (turn.stream && hasEmittedThinking) {
-                yield {
-                  type: "thinking",
-                  text: "\n[Content filter triggered before answer; retrying with defensive phrasing...]\n",
-                };
-              }
-              const rephrasedFinalPrompt =
-                !editBranch && filterCtx?.preserveContextPrefix
-                  ? `${filterCtx.preserveContextPrefix}${rephrased.trim()}`
-                  : rephrased.trim();
               for await (const ev of this.executeTurnWithLease(
                 turn,
                 lease,
@@ -681,158 +796,123 @@ export class QuickExecutionEngine {
                 wrappedMeta,
                 effectiveChatAgentId,
                 keyPool,
-                {
-                  attachmentCache,
-                  expectedWarmGeneration,
-                  overridePromptText: rephrasedFinalPrompt,
-                  ...(editBranch ? { editBranch } : { forceColdReplay: true }),
-                  isRephraseRetry: true,
-                },
+                { attachmentCache, expectedWarmGeneration, warmFallbackToCold: true },
               )) {
-                if (ev.type === "text" || ev.type === "tool_calls") {
+                if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
                   yieldedOutput = true;
-                  hasEmittedClientText = true;
-                } else if (ev.type === "thinking") {
-                  yieldedOutput = true;
-                  hasEmittedThinking = true;
                 }
                 yield ev;
               }
               lease.markSuccess();
               return;
-            } catch (rephraseRetryErr) {
-              err = rephraseRetryErr;
-              gwErr = mapSdkError(rephraseRetryErr);
+            } catch (fallbackErr) {
+              err = fallbackErr;
             }
-          } else {
-            closeCapturedFilterWs();
           }
-        } else {
-          closeCapturedFilterWs();
-        }
+          let finalErr = mapSdkError(err);
+          let msg = finalErr.message || "";
+          let { isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
+            classifyUpstreamError(finalErr);
 
-        const preClass = classifyUpstreamError(gwErr);
-        // Fail-safe: warm_incremental failure before output falls back once to cold replay on the same account.
-        // Never double-hang on 504 timeouts (already waited full timeout budget).
-        if (
-          lastExecMode === "warm_incremental" &&
-          !yieldedOutput &&
-          !turn.signal?.aborted &&
-          gwErr.status !== 504 &&
-          gwErr.code !== "content_filter" &&
-          gwErr.code !== "content_filtered" &&
-          !preClass.isQuotaErr &&
-          !preClass.isConnLimitErr &&
-          !preClass.isRateLimitErr &&
-          !preClass.isAuthErr
-        ) {
-          try {
-            for await (const ev of this.executeTurnWithLease(
-              turn,
-              lease,
-              isIncognito,
-              wrappedMeta,
-              effectiveChatAgentId,
-              keyPool,
-              { attachmentCache, expectedWarmGeneration, warmFallbackToCold: true },
-            )) {
-              if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
-                yieldedOutput = true;
+          // On 401/403 auth errors for OAuth accounts, force-refresh once before marking auth-failed.
+          if (
+            isAuthErr &&
+            !yieldedOutput &&
+            !turn.signal?.aborted &&
+            !retriedAuthRefreshSlots.has(lease.slotId)
+          ) {
+            const parsedCred = parseQuickCredential(lease.apiKey);
+            if (parsedCred.mode === "oauth" && parsedCred.oauth) {
+              retriedAuthRefreshSlots.add(lease.slotId);
+              try {
+                await resolveOAuthAccessToken(parsedCred.oauth, true, lease.proxyUrl);
+                attempt -= 1;
+                continue;
+              } catch (refreshErr) {
+                finalErr = mapSdkError(refreshErr);
+                msg = finalErr.message || "";
+                ({ isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
+                  classifyUpstreamError(finalErr));
               }
-              yield ev;
             }
-            lease.markSuccess();
-            return;
-          } catch (fallbackErr) {
-            err = fallbackErr;
           }
-        }
-        let finalErr = mapSdkError(err);
-        let msg = finalErr.message || "";
-        let { isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
-          classifyUpstreamError(finalErr);
 
-        // On 401/403 auth errors for OAuth accounts, force-refresh once before marking auth-failed.
-        if (
-          isAuthErr &&
-          !yieldedOutput &&
-          !turn.signal?.aborted &&
-          !retriedAuthRefreshSlots.has(lease.slotId)
-        ) {
-          const parsedCred = parseQuickCredential(lease.apiKey);
-          if (parsedCred.mode === "oauth" && parsedCred.oauth) {
-            retriedAuthRefreshSlots.add(lease.slotId);
-            try {
-              await resolveOAuthAccessToken(parsedCred.oauth, true, lease.proxyUrl);
-              attempt -= 1;
+          const evictedParked = isConnLimitErr
+            ? this.warmPool.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
+            : 0;
+
+          if (
+            isConnLimitErr &&
+            evictedParked > 0 &&
+            !retriedSameSlotConnLimit &&
+            !yieldedOutput &&
+            !turn.signal?.aborted
+          ) {
+            retriedSameSlotConnLimit = true;
+            await new Promise<void>((r) => setTimeout(r, 200));
+            attempt -= 1;
+            continue;
+          }
+
+          if (isQuotaErr) {
+            keyPool.reportQuotaExhausted(lease.apiKey, turn.requestedModel, msg);
+          } else if (isConnLimitErr) {
+            keyPool.reportConnLimit(lease.apiKey);
+          } else if (isRateLimitErr) {
+            const retryAfterMatch = /retry[-_\s]?after[\s:=]+(\d+(?:\.\d+)?)/i.exec(msg);
+            const retryAfterMs = retryAfterMatch ? Number(retryAfterMatch[1]) * 1_000 : undefined;
+            keyPool.reportRateLimit(lease.apiKey, retryAfterMs);
+          } else if (isProxyOrConnErr) {
+            keyPool.reportTransientError(lease.apiKey);
+            // Evict ONLY this failed conversation's sticky binding (leaving all other healthy
+            // conversations on this account untouched) so retries never stay stuck on a busy/broken slot.
+            if (turn.conversationKey) {
+              keyPool.affinityTable.evictConversation(turn.conversationKey);
+            }
+          } else if (isAuthErr) {
+            keyPool.reportAuthFailure(lease.apiKey, msg);
+          }
+
+          const isModelNotAvailable = finalErr.code === "model_not_available";
+          const canFailover =
+            (!yieldedOutput || !turn.stream) &&
+            !turn.signal?.aborted &&
+            (isQuotaErr || isConnLimitErr || isRateLimitErr || isAuthErr || isProxyOrConnErr || isModelNotAvailable) &&
+            attempt + 1 < maxAttempts;
+
+          if (canFailover) {
+            excluded.add(lease.apiKey);
+            const hasUntriedEnabledKey = keyPool
+              .allManagedKeys()
+              .some(
+                (k) =>
+                  k.enabled &&
+                  (!requiredAccountGroup || k.group === requiredAccountGroup) &&
+                  !excluded.has(k.rawKey),
+              );
+            if (hasUntriedEnabledKey) {
+              if (yieldedOutput && !turn.stream) {
+                yield { type: "reset" };
+              }
               continue;
-            } catch (refreshErr) {
-              finalErr = mapSdkError(refreshErr);
-              msg = finalErr.message || "";
-              ({ isConnLimitErr, isQuotaErr, isRateLimitErr, isAuthErr, isProxyOrConnErr } =
-                classifyUpstreamError(finalErr));
             }
           }
+          // Never leak internal HTTP 402 (unretriable by Anthropic/OpenAI SDKs) or upstream 401/403
+          // (which tricks clients into thinking their own gateway API key is invalid) to callers.
+          if (finalErr.status === 402 && finalErr.code === "quota_exhausted") {
+            throw new GatewayError(finalErr.message, 429, "rate_limit_exceeded", undefined, 30);
+          }
+          if ((finalErr.status === 401 || finalErr.status === 403) && finalErr.code === "upstream_auth_error") {
+            throw new GatewayError(finalErr.message, 502, "upstream_auth_error");
+          }
+          throw finalErr;
+        } finally {
+          closeCapturedFilterWs();
+          lease.release();
         }
-
-        const evictedParked = isConnLimitErr
-          ? this.warmPool.evictParkedWsForSlot(lease.slotId, Number.POSITIVE_INFINITY)
-          : 0;
-
-        if (
-          isConnLimitErr &&
-          evictedParked > 0 &&
-          !retriedSameSlotConnLimit &&
-          !yieldedOutput &&
-          !turn.signal?.aborted
-        ) {
-          retriedSameSlotConnLimit = true;
-          await new Promise<void>((r) => setTimeout(r, 200));
-          attempt -= 1;
-          continue;
-        }
-
-        if (isQuotaErr) {
-          keyPool.reportQuotaExhausted(lease.apiKey, turn.requestedModel, msg);
-        } else if (isConnLimitErr) {
-          keyPool.reportConnLimit(lease.apiKey);
-        } else if (isRateLimitErr) {
-          const retryAfterMatch = /retry[-_\s]?after[\s:=]+(\d+(?:\.\d+)?)/i.exec(msg);
-          const retryAfterMs = retryAfterMatch ? Number(retryAfterMatch[1]) * 1_000 : undefined;
-          keyPool.reportRateLimit(lease.apiKey, retryAfterMs);
-        } else if (isProxyOrConnErr) {
-          keyPool.reportTransientError(lease.apiKey);
-        } else if (isAuthErr) {
-          keyPool.reportAuthFailure(lease.apiKey, msg);
-        }
-
-        const isModelNotAvailable = finalErr.code === "model_not_available";
-        const canFailover =
-          !yieldedOutput &&
-          !turn.signal?.aborted &&
-          (isQuotaErr || isConnLimitErr || isRateLimitErr || isAuthErr || isProxyOrConnErr || isModelNotAvailable) &&
-          attempt + 1 < maxAttempts;
-
-        if (canFailover) {
-          excluded.add(lease.apiKey);
-          const hasUntriedEnabledKey = keyPool
-            .allManagedKeys()
-            .some((k) => k.enabled && !excluded.has(k.rawKey));
-          if (hasUntriedEnabledKey) continue;
-        }
-        // Never leak internal HTTP 402 (unretriable by Anthropic/OpenAI SDKs) or upstream 401/403
-        // (which tricks clients into thinking their own gateway API key is invalid) to callers.
-        if (finalErr.status === 402 && finalErr.code === "quota_exhausted") {
-          throw new GatewayError(finalErr.message, 429, "rate_limit_exceeded", undefined, 30);
-        }
-        if ((finalErr.status === 401 || finalErr.status === 403) && finalErr.code === "upstream_auth_error") {
-          throw new GatewayError(finalErr.message, 502, "upstream_auth_error");
-        }
-        throw finalErr;
-      } finally {
-        closeCapturedFilterWs();
-        lease.release();
       }
+    } finally {
+      unsubscribeGroupRename?.();
     }
   }
 
@@ -844,12 +924,17 @@ export class QuickExecutionEngine {
       slotId?: string;
       maskedKey: string;
       accountLabel?: string;
+      accountGroup?: string;
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
       contentFilterRecovered?: boolean;
       warmFallbackToCold?: boolean;
       accountFailoverCount?: number;
       usedDefaultSystemAgent?: boolean;
+      agentMode?: string;
+      thinkingEffort?: string;
+      resolvedModel?: string;
+      effectiveSystemPromptChars?: number;
       /**
        * Controls the SSE `flushEarly` 15s keepalive timer:
        * - `false`: disarm/cancel timer while uploading OOB attachments, dialing WS, or failing over;
@@ -893,6 +978,7 @@ export class QuickExecutionEngine {
         : Boolean(this.config.sanitizeClientSystemPrompt)) ||
       Boolean(turnOpts?.isRephraseRetry);
     const customPromptParts: string[] = [];
+    let effectiveSystemPromptChars = 0;
     if (turn.systemPrompt?.trim()) {
       const rawSys = turn.systemPrompt.trim();
       const sysText = deepSanitizeEnabled
@@ -900,7 +986,10 @@ export class QuickExecutionEngine {
         : toolBridgePrompt
           ? sanitizeClientSystemPromptForQuick(stripHighRiskClientHeaders(rawSys), true)
           : stripHighRiskClientHeaders(rawSys);
-      if (sysText) customPromptParts.push(sysText);
+      if (sysText) {
+        effectiveSystemPromptChars = sysText.length;
+        customPromptParts.push(sysText);
+      }
     }
     if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
     const customPrompt = customPromptParts.length > 0 ? customPromptParts.join("\n\n") : null;
@@ -952,7 +1041,16 @@ export class QuickExecutionEngine {
     const cred = parseQuickCredential(lease.apiKey);
     const isWeb = cred.mode === "web" && Boolean(cred.web);
     const isOAuthAccount = cred.mode === "oauth" && Boolean(cred.oauth);
-    const effectiveProxy = lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
+    // Pass only the explicit per-credential proxy; let `fetchViaOptionalProxy` resolve ambient env
+    // proxies per target URL so `NO_PROXY` and loopback bypasses are always respected.
+    const effectiveProxy = lease.proxyUrl;
+    const proxyTargetHintUrl = isWeb
+      ? "https://quick.aws.com/"
+      : cred.oauth?.wsHost
+        ? `https://${cred.oauth.wsHost}/`
+        : cred.wsHost
+          ? `https://${cred.wsHost}/`
+          : undefined;
     const isInternalHelperCall = Boolean(turn.rawBody?.__internalRephrase);
     let workingSessionId = isInternalHelperCall
       ? crypto.randomUUID()
@@ -1222,8 +1320,12 @@ export class QuickExecutionEngine {
       slotId: lease.slotId,
       maskedKey: lease.maskedKey,
       accountLabel: lease.label,
+      ...(lease.group ? { accountGroup: lease.group } : {}),
       execMode,
-      usedProxy: Boolean(lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY),
+      usedProxy: Boolean(resolveEffectiveProxyUrl(lease.proxyUrl, proxyTargetHintUrl)),
+      agentMode: selection.agentMode,
+      thinkingEffort: selection.thinkingEffort,
+      effectiveSystemPromptChars,
       ...(turnOpts?.isRephraseRetry ? { contentFilterRecovered: true } : {}),
       ...(turnOpts?.warmFallbackToCold ? { warmFallbackToCold: true } : {}),
       ...(!normalizedChatAgentId && !isInternalHelperCall ? { usedDefaultSystemAgent: true } : {}),
@@ -1477,7 +1579,14 @@ export class QuickExecutionEngine {
       onContentFilterCapture: turnOpts?.onContentFilterCapture,
       runMaxTimeoutMs: this.config.runMaxTimeoutMs,
       runIdleTimeoutMs: this.config.runIdleTimeoutMs,
-      showRoutedModelInThinking: this.showRoutedModelInThinking,
+      showRoutedModelInThinking: keyPool
+        ? keyPool.getSettings().showRoutedModelInThinking
+        : this.showRoutedModelInThinking,
+      observedModelHint: this.getObservedModelHint(lease.slotId, selection.agentMode),
+      onResolvedModel: (modelId) => {
+        this.recordObservedModel(lease.slotId, selection.agentMode, modelId);
+        onExecMeta?.({ ...buildBaseExecMeta(), resolvedModel: modelId });
+      },
       webSearchEnabled: this.webSearchEnabled,
       usageTracker: this.usageTracker,
       warmPool: this.warmPool,

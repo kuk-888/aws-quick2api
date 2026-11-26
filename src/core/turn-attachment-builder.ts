@@ -9,6 +9,7 @@ import {
   jsonStringUtf8Bytes,
   mapAttachmentUploadError,
   mapWithConcurrency,
+  MAX_INLINE_CUSTOM_PROMPT_BYTES,
   MAX_WS_PAYLOAD_UTF8_BYTES,
   prepareHighResImageForOutOfBand,
   resolveNormalizedFiles,
@@ -197,7 +198,7 @@ export async function buildPromptAndAttachmentsForTurn(
           uploadedHighRes = true;
         } catch (imgErr) {
           const errMsg = imgErr instanceof Error ? imgErr.message : String(imgErr);
-          if (isWeb && /\(404\)|\(405\)/.test(errMsg)) {
+          if (isWeb && /\((?:inner\s+)?(?:404|405)\)/i.test(errMsg)) {
             uploadedHighRes = false;
           } else {
             throw mapAttachmentUploadError(imgErr, "Failed to upload image attachment(s) to AWS Quick");
@@ -296,8 +297,12 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
     const currentFrameBudget =
       currentAttBytes > 0 ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - currentAttBytes) : MAX_WS_PAYLOAD_UTF8_BYTES;
     const safeSingleFrameTotal = Math.max(4_096, currentFrameBudget - WS_FRAME_ENVELOPE_MARGIN_BYTES);
-    const estimatedTotalBytes = jsonStringUtf8Bytes(prompt) + jsonStringUtf8Bytes(customPrompt || "");
-    if (estimatedTotalBytes > safeSingleFrameTotal) {
+    const promptJsonBytes = jsonStringUtf8Bytes(prompt);
+    const estimatedTotalBytes = promptJsonBytes + jsonStringUtf8Bytes(customPrompt || "");
+    // Only offload `prompt` to an OOB `.txt` attachment when `prompt` itself is large enough (>2KB)
+    // that offloading actually shrinks the WS frame; never upload a tiny warm turn like "continue"
+    // just because `customPrompt` alone is near the frame ceiling.
+    if (estimatedTotalBytes > safeSingleFrameTotal && promptJsonBytes > 2_048) {
       const uploadTimeoutSignal = turn.signal
         ? AbortSignal.any([turn.signal, AbortSignal.timeout(65_000)])
         : AbortSignal.timeout(65_000);
@@ -330,10 +335,63 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
           rephrasePreservePrefix = preOobPrompt.slice(0, tailStart);
           rawPromptForRephrase = preOobPrompt.slice(tailStart);
         }
-        prompt = buildOutOfBandContextPrompt(prompt, fileName, 3_500, isWarmIncremental, openingHint);
+        // Byte-accurate dynamic inline window (up to 32,000 chars) measured directly on the actual
+        // `buildOutOfBandContextPrompt()` output (including OOB headers + `openingHint`) so the result
+        // fits cleanly without overflowing frames OR wiping the user's request to 0 chars when a heavy
+        // IDE `customPrompt` (>36KB) will already be capped to `MAX_INLINE_CUSTOM_PROMPT_BYTES` by
+        // `splitPromptIntoSafeChunks()`.
+        const postOobAttBytes = Buffer.byteLength(JSON.stringify(attachments), "utf8");
+        const customPromptBytes = jsonStringUtf8Bytes(customPrompt || "");
+        const postOobFrameBudget = Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - postOobAttBytes);
+        const postOobSafeFinalTotal = Math.max(4_096, postOobFrameBudget - WS_FRAME_ENVELOPE_MARGIN_BYTES);
+        const customSpillThreshold = Math.min(
+          MAX_INLINE_CUSTOM_PROMPT_BYTES,
+          Math.max(4_096, postOobSafeFinalTotal - 4_096),
+        );
+        let realPromptRoom: number;
+        if (customPromptBytes > customSpillThreshold) {
+          const maxKeptCustomBytes = Math.min(
+            MAX_INLINE_CUSTOM_PROMPT_BYTES,
+            Math.max(4_096, postOobSafeFinalTotal - 6_144),
+          );
+          const finalFrameRoom = Math.max(0, postOobSafeFinalTotal - maxKeptCustomBytes - 256);
+          const approxOverflowHeadBytes = Math.max(0, customPromptBytes - maxKeptCustomBytes) + 64;
+          // If overflowHead + >=2.5KB inline prompt can still fit inside 1 single frame, keep it 1-frame tight;
+          // otherwise multi-chunk splitting is already unavoidable, so keep up to 8KB of the user's latest
+          // request inline in the final chunk so the model immediately sees what is being asked.
+          realPromptRoom =
+            finalFrameRoom - approxOverflowHeadBytes >= 2_500
+              ? finalFrameRoom - approxOverflowHeadBytes
+              : Math.min(8_000, finalFrameRoom);
+        } else {
+          realPromptRoom = Math.max(0, postOobSafeFinalTotal - customPromptBytes - 128);
+        }
+        const fitInlineExcerpt = (hint: string | undefined): { lo: number; wrapped: string } => {
+          let lo = 0;
+          let hi = Math.min(32_000, prompt.length);
+          let bestWrapped = buildOutOfBandContextPrompt(prompt, fileName, 0, isWarmIncremental, hint);
+          while (lo < hi) {
+            const mid = Math.ceil((lo + hi) / 2);
+            const candidate = buildOutOfBandContextPrompt(prompt, fileName, mid, isWarmIncremental, hint);
+            if (jsonStringUtf8Bytes(candidate) <= realPromptRoom) {
+              lo = mid;
+              bestWrapped = candidate;
+            } else {
+              hi = mid - 1;
+            }
+          }
+          return { lo, wrapped: bestWrapped };
+        };
+        let fitted = fitInlineExcerpt(openingHint);
+        if (fitted.lo === 0 && openingHint) {
+          // If openingHint framing prevented any inline excerpt under a tight budget, drop openingHint
+          // so the trailing context excerpt can still fit cleanly.
+          fitted = fitInlineExcerpt(undefined);
+        }
+        prompt = fitted.wrapped;
       } catch (uploadErr) {
         const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
-        if (!(isWeb && /\(404\)|\(405\)/.test(errMsg))) {
+        if (!(isWeb && /\((?:inner\s+)?(?:404|405)\)/i.test(errMsg))) {
           throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick");
         }
       }

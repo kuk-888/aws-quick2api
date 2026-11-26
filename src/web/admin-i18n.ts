@@ -54,7 +54,15 @@ const EXACT_ZH: Record<string, string> = {
   "Invalid expiration timestamp; provide a valid date-time.": "过期时间格式无效，请提供合法的日期时间。",
   "Custom gateway token must be at least 6 characters.": "自定义网关密钥长度至少需 6 位。",
   "A gateway key with this token already exists.": "该网关密钥 Token 已存在，请勿重复创建。",
-  "Select at least one allowed model under custom allowlist mode.": "指定模型白名单模式下，请至少勾选 1 个允许访问的模型。"
+  "Select at least one allowed model under custom allowlist mode.": "指定模型白名单模式下，请至少勾选 1 个允许访问的模型。",
+  "`name` string required.": "缺少必填字符串参数 `name`。",
+  "Account group name is required.": "请输入账号分组名称。",
+  "Both current and new group names are required.": "请同时提供当前分组名称与新分组名称。",
+  "Invalid URL-encoded group name.": "分组名称 URL 编码无效。",
+  "Invalid proxy URL.": "代理地址格式无效。",
+  "Invalid `showRoutedModelInThinking` value (expected 'true', 'always', or 'false').": "`showRoutedModelInThinking` 参数无效（仅支持 'true'、'always' 或 'false'）。",
+  "`group` must be a string or null.": "批量分组操作必须传入字符串或 null 类型的 `group` 参数。",
+  "`group` string or null is required for `set-group` action.": "批量分组操作必须传入字符串或 null 类型的 `group` 参数。"
 };
 
 const EXACT_EN: Record<string, string> = {
@@ -101,6 +109,19 @@ export function localizeAdminMessage(msg: string, lang: AdminLang): string {
 
   const gkNotFound = /^Gateway key '([^']+)' not found\.$/.exec(msg);
   if (gkNotFound) return `未找到网关子密钥 '${gkNotFound[1]}'。`;
+
+  const grpNotFound = /^Account group '([^']+)' not found\.$/.exec(msg);
+  if (grpNotFound) return `未找到账号分组 '${grpNotFound[1]}'。`;
+
+  const grpExists = /^Account group '([^']+)' already exists\.$/.exec(msg);
+  if (grpExists) return `账号分组 '${grpExists[1]}' 已存在。`;
+
+  const grpNoKeys = /^No enabled upstream AWS Quick credentials available in group '([^']+)'\.$/.exec(msg);
+  if (grpNoKeys) return `分组 '${grpNoKeys[1]}' 内当前没有可用的上游 AWS Quick 凭证。`;
+
+  if (msg.startsWith("Invalid account group name")) {
+    return "账号分组名称无效（最多 48 字符，不能包含逗号、斜杠、控制字符或保留名称 . / ..）。";
+  }
 
   return msg;
 }

@@ -64,15 +64,19 @@ export function buildOutOfBandContextPrompt(
   openingHintSource?: string,
 ): string {
   const totalChars = fullPrompt.length;
-  const label = isIncremental ? "incremental context" : "full conversation/context";
-  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Read the attached file for the full text/details, then respond directly to the user's request.]`;
+  const label = isIncremental ? "full incremental context" : "full conversation/context";
+  if (maxInlineChars <= 0) {
+    return `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Inspect \`${filename}\` in a single targeted search/read without narrating the file read, then respond directly.]`;
+  }
+
+  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`, with the latest request and recent context excerpted below. Answer directly if the excerpt below already has everything needed; if earlier details, code, or facts are missing or referenced, inspect \`${filename}\` in a single targeted search/read without narrating the file read, then respond directly.]`;
 
   if (totalChars <= maxInlineChars) {
     return [header, "", fullPrompt.trim()].join("\n");
   }
 
   const headBudget = Math.min(1_100, Math.floor(maxInlineChars * 0.32));
-  const tailBudget = Math.max(800, maxInlineChars - headBudget);
+  const tailBudget = Math.max(0, maxInlineChars - headBudget);
 
   let tailStart = Math.max(0, totalChars - tailBudget);
   if (tailStart > 0) {
@@ -383,7 +387,7 @@ export function mapAttachmentUploadError(err: unknown, contextLabel: string): Ga
   if (/blocked by aws quick dlp policy/i.test(reason)) {
     return new GatewayError(reason, 400, "content_filtered");
   }
-  const statusMatch = /\((\d{3})\)/.exec(reason);
+  const statusMatch = /\((?:inner\s+)?(\d{3})\)/i.exec(reason);
   const upstreamStatus = statusMatch ? Number(statusMatch[1]) : 0;
   const isOidcRefresh = /oidc refresh_token failed/i.test(reason);
   if (upstreamStatus === 429) {

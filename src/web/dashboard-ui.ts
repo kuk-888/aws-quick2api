@@ -162,6 +162,37 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .btn-danger { color: var(--err); }
     .btn-danger:hover { border-color: var(--err); background: rgba(239,68,68,0.06); }
     .btn-xs { height: 24px; padding: 0 8px; font-size: 11.5px; border-radius: 4px; white-space: nowrap; }
+    /* Action Dropdowns (unified pixel-for-pixel with .c-sel-menu & viewport-fixed to prevent clipping) */
+    .act-dd { position: relative; display: inline-flex; align-items: center; }
+    button.act-dd-trigger {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 0 10px 0 11px; font-weight: 500;
+    }
+    .act-dd.open button.act-dd-trigger { border-color: var(--fg-muted); background: var(--panel-hover); }
+    .act-dd-chev {
+      width: 12px; height: 12px; color: var(--fg-muted); flex-shrink: 0;
+      transition: transform 0.14s ease;
+    }
+    .act-dd.open .act-dd-chev { transform: rotate(180deg); }
+    .act-dd-menu {
+      position: fixed; z-index: 120; display: none;
+      min-width: 156px; padding: 4px;
+      background: var(--panel); color: var(--fg);
+      border: 1px solid var(--border-strong); border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+    }
+    .act-dd.open .act-dd-menu { display: block; }
+    button.act-dd-item {
+      display: flex; align-items: center; justify-content: flex-start; gap: 8px;
+      width: 100%; height: auto; min-height: 0; padding: 6px 9px;
+      border: none; border-radius: 5px; background: transparent;
+      color: var(--fg); font-size: 12.5px; font-weight: 400; text-align: left;
+      cursor: pointer; white-space: nowrap;
+    }
+    button.act-dd-item:hover:not(:disabled) { background: var(--panel-hover); border-color: transparent; }
+    button.act-dd-item.danger { color: var(--err); }
+    button.act-dd-item.danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.08); border-color: transparent; }
+    .act-dd-sep { height: 1px; background: var(--border); margin: 4px 5px; }
 
     /* Login Gate */
     #loginGate {
@@ -454,7 +485,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     tr:hover td.ops-cell, tr.clickable-row:hover td.ops-cell { background: var(--panel-hover); }
     tr.row-picked td.ops-cell { background: var(--subtle); }
     .ops-stack { display: flex; flex-wrap: nowrap; gap: 4px; width: max-content; }
-    .ops-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, max-content)); gap: 4px; width: max-content; }
+    .ops-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; width: max-content; }
     .bill-cell, .run-cell { white-space: normal; max-width: 220px; }
     .bill-cell > div, .run-cell > div { white-space: normal; }
 
@@ -475,6 +506,19 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .tag-ok { color: var(--ok); border-color: rgba(16,185,129,0.35); }
     .tag-info { color: #1d4ed8; background: #eff6ff; border-color: rgba(59,130,246,0.32); }
     [data-theme="dark"] .tag-info { color: #93c5fd; background: rgba(59,130,246,0.16); border-color: rgba(96,165,250,0.32); }
+    .tag-group {
+      color: #4f46e5; background: rgba(79,70,229,0.08); border-color: rgba(79,70,229,0.28);
+      max-width: 148px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
+      transition: background-color 0.12s, border-color 0.12s;
+    }
+    .tag-group:hover { background: rgba(79,70,229,0.14); border-color: rgba(79,70,229,0.45); }
+    [data-theme="dark"] .tag-group { color: #a5b4fc; background: rgba(129,140,248,0.14); border-color: rgba(129,140,248,0.34); }
+    [data-theme="dark"] .tag-group:hover { background: rgba(129,140,248,0.22); border-color: rgba(129,140,248,0.52); }
+    .tag-group-empty {
+      color: var(--fg-muted); background: transparent; border-style: dashed; opacity: 0.72;
+      transition: opacity 0.12s, border-color 0.12s, color 0.12s;
+    }
+    .tag-group-empty:hover { opacity: 1; color: var(--fg); border-color: var(--border-strong); }
     .tag-warn { color: var(--warn); border-color: rgba(245,158,11,0.35); }
 
     .qbar-cell { width: 128px; min-width: 128px; max-width: 128px; }
@@ -485,7 +529,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .bot-stack { width: 128px; max-width: 128px; white-space: normal; }
 
     .setting-row {
-      display: flex; align-items: center; justify-content: space-between; gap: 20px;
+      display: flex; align-items: center; justify-content: space-between; gap: 16px 20px; flex-wrap: wrap;
       padding: 16px 18px; border-bottom: 1px solid var(--border);
     }
     .setting-row:last-child { border-bottom: none; }
@@ -1091,13 +1135,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 <p>支持网页 OAuth 授权（90天自动续期）、Cookie 导入、独立出口代理与云端会话一键清理</p>
               </div>
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                <button id="credSyncQuotaBtn" data-sync-quota>同步最新额度</button>
+                <button type="button" id="credManageGroupsBtn">分组管理</button>
+                <button id="credSyncQuotaBtn" data-sync-quota title="仅拉取最新 5h / 月度额度余量，不修改账号启停或冷却状态">刷新最新额度</button>
                 <button class="btn-solid" data-open-add-modal>+ 添加凭证</button>
               </div>
             </div>
             <div class="batch-bar">
               <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                <input id="credSearchInput" type="text" placeholder="搜邮箱 / 备注 / 代理..." style="width:185px;" />
+                <input id="credSearchInput" type="text" placeholder="搜邮箱 / 备注 / 分组 / 代理..." style="width:185px;" />
+                <select id="credGroupFilter">
+                  <option value="all">全部分组</option>
+                  <option value="__ungrouped__">未分组</option>
+                </select>
                 <select id="credStatusFilter">
                   <option value="all">全部状态</option>
                   <option value="healthy">正常在线</option>
@@ -1112,16 +1161,42 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 </select>
                 <span style="font-size:12px;color:var(--fg-muted);" id="credSelSummary">已选 0 项</span>
               </div>
-              <div style="display:flex;gap:6px;flex-wrap:wrap;">
-                <button type="button" id="credBatchRecheckBtn">批量检测</button>
-                <button type="button" id="credClearSessionsBtn">清理会话</button>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                <button type="button" id="credBatchGroupBtn">批量分组</button>
                 <button type="button" id="credSyncAgentsBtn" title="批量为勾选或已启用账号新增/同步 AWS Quick 云端智能体并设为默认">同步云端智能体</button>
-                <button type="button" id="credBatchImportBtn">导入 JSON</button>
+                <div class="act-dd">
+                  <button type="button" class="act-dd-trigger" aria-haspopup="true">
+                    <span>检测与维护</span>
+                    <svg class="act-dd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                  </button>
+                  <div class="act-dd-menu" role="menu">
+                    <button type="button" class="act-dd-item" id="credBatchRecheckBtn" role="menuitem" title="清除冷却并尝试复活、重测已停用或异常凭证的连通性">重测复活异常号</button>
+                    <button type="button" class="act-dd-item" id="credClearSessionsBtn" role="menuitem">清理会话</button>
+                  </div>
+                </div>
+                <div class="act-dd">
+                  <button type="button" class="act-dd-trigger" aria-haspopup="true">
+                    <span>导入 / 导出</span>
+                    <svg class="act-dd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                  </button>
+                  <div class="act-dd-menu" role="menu">
+                    <button type="button" class="act-dd-item" id="credBatchImportBtn" role="menuitem">导入 JSON</button>
+                    <button type="button" class="act-dd-item" id="credExportBtn" role="menuitem">导出 JSON</button>
+                  </div>
+                </div>
                 <input type="file" id="credBatchImportFile" accept=".json,application/json" style="display:none;" />
-                <button type="button" id="credExportBtn">导出 JSON</button>
-                <button type="button" id="credBatchEnableBtn">批量启用</button>
-                <button type="button" id="credBatchDisableBtn">批量停用</button>
-                <button type="button" class="btn-danger" id="credBatchDeleteBtn">批量删除</button>
+                <div class="act-dd">
+                  <button type="button" class="act-dd-trigger" aria-haspopup="true">
+                    <span>批量操作</span>
+                    <svg class="act-dd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+                  </button>
+                  <div class="act-dd-menu" role="menu">
+                    <button type="button" class="act-dd-item" id="credBatchEnableBtn" role="menuitem">批量启用</button>
+                    <button type="button" class="act-dd-item" id="credBatchDisableBtn" role="menuitem">批量停用</button>
+                    <div class="act-dd-sep"></div>
+                    <button type="button" class="act-dd-item danger" id="credBatchDeleteBtn" role="menuitem">批量删除</button>
+                  </div>
+                </div>
               </div>
             </div>
             <div class="table-wrap">
@@ -1283,7 +1358,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 <h3>负载均衡算法 (Load Balancing Strategy)</h3>
                 <p>Quota-Aware 会综合检测账号剩余月度额度与短时限额，优先分配给余量充足且当前并发最少的健康账号。</p>
               </div>
-              <select id="cfgLbStrategy" style="min-width: 240px;">
+              <select id="cfgLbStrategy" style="width:240px;min-width:240px;flex-shrink:0;">
                 <option value="quota-aware">Quota-Aware (余量感知 + 最少并发)</option>
                 <option value="least-busy">Least-Busy (最少活跃并发优先)</option>
                 <option value="round-robin">Round-Robin (均匀轮询)</option>
@@ -1328,6 +1403,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 <button type="button" class="btn-xs" id="editAgentPromptBtn">编辑模板</button>
                 <label class="switch"><input type="checkbox" id="cfgAutoEnsureCodingAgent" checked /><span class="slider"></span></label>
               </div>
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <h3>思考块显示路由模型与思考程度 (SHOW_ROUTED_MODEL_IN_THINKING)</h3>
+                <p>默认开启（推荐）。仅在开启思考（effort≠off 或上游输出思考）时于思考块首行展示档位、思考程度及底层实际模型（routed= / routed≈），不污染纯文本 effort=off 响应；选「强制全显」则所有请求均显示。关闭后仍保留响应头与后台日志记录。</p>
+              </div>
+              <select id="cfgShowRoutedModel" style="width:240px;min-width:240px;flex-shrink:0;" aria-label="思考块显示路由模型">
+                <option value="true">默认显示 (true · 推荐)</option>
+                <option value="always">强制全显 (always)</option>
+                <option value="false">关闭 (false)</option>
+              </select>
             </div>
 
             <div class="setting-row">
@@ -1689,7 +1776,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;padding:12px;background:var(--subtle);border:1px solid var(--border);border-radius:6px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;padding:12px;background:var(--subtle);border:1px solid var(--border);border-radius:6px;">
           <div>
             <label class="field-lbl">最大调用次数限制 (留空或 0 = 无限制)</label>
             <input id="ckMaxReqInput" type="number" min="0" step="1" class="mono" style="width:100%;" placeholder="无次数限制" />
@@ -1722,12 +1809,23 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           </div>
         </div>
 
-        <div>
-          <label class="field-lbl">模型访问权限策略</label>
-          <select id="ckScopeSelect" style="width:100%;">
-            <option value="all">允许访问全部全局已启用模型 (无单独模型限制)</option>
-            <option value="custom">仅允许访问下方勾选的指定模型 (自定义模型白名单)</option>
-          </select>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
+          <div>
+            <label class="field-lbl">绑定账号分组（留空 = 全局号池）</label>
+            <select id="ckGroupSelect" style="width:100%;">
+              <option value="">全局号池（不限制分组）</option>
+            </select>
+            <div id="ckGroupWarnBox" style="display:none;margin-top:6px;"></div>
+            <div style="font-size:11px;color:var(--fg-muted);margin-top:4px;">严格号池隔离：仅调度组内账号，组内全不可用时直接返回 503/429，绝不跨组或回退全局池。</div>
+          </div>
+
+          <div>
+            <label class="field-lbl">模型访问权限策略</label>
+            <select id="ckScopeSelect" style="width:100%;">
+              <option value="all">允许访问全部全局已启用模型 (无单独模型限制)</option>
+              <option value="custom">仅允许访问下方勾选的指定模型 (自定义模型白名单)</option>
+            </select>
+          </div>
         </div>
 
         <div id="ckModelsPickerWrap" style="display:none;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
@@ -1743,6 +1841,56 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       <div class="modal-foot">
         <button data-click="closeCkModal">取消</button>
         <button class="btn-solid" id="saveCkModalBtn">保存网关密钥配置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Account Groups Manager Modal -->
+  <div class="modal-mask" id="groupsModal" role="dialog" aria-modal="true" aria-labelledby="groupsModalTitle" data-click-self="closeGroupsModal">
+    <div class="modal-card" style="max-width: 560px;">
+      <div class="panel-hdr" style="flex-shrink:0;">
+        <h2 id="groupsModalTitle">账号分组管理 (Account Groups)</h2>
+        <button class="btn-xs btn-ghost" aria-label="关闭弹窗" data-click="closeGroupsModal">✕</button>
+      </div>
+      <div class="modal-body">
+        <div style="font-size:12px;color:var(--fg-muted);line-height:1.5;">
+          将上游账号归入不同分组，并在「网关子密钥」中绑定对应分组，即可在单实例内实现严格号池隔离（绝不跨组回退）。
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <input id="newGroupNameInput" type="text" style="flex:1;" maxlength="48" placeholder="输入新分组名称，例如：研发一组 / team-a / vip" />
+          <button type="button" class="btn-solid" id="createGroupSubmitBtn">+ 创建分组</button>
+        </div>
+        <div id="groupsModalList" style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow:auto;"></div>
+      </div>
+      <div class="modal-foot">
+        <button data-click="closeGroupsModal">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Assign Account Group Dropdown Modal (Single & Batch) -->
+  <div class="modal-mask" id="assignGroupModal" role="dialog" aria-modal="true" aria-labelledby="assignGroupModalTitle" data-click-self="closeAssignGroupModal">
+    <div class="modal-card" style="max-width: 440px;">
+      <div class="panel-hdr" style="flex-shrink:0;">
+        <h2 id="assignGroupModalTitle">设置账号分组</h2>
+        <button class="btn-xs btn-ghost" aria-label="关闭弹窗" data-click="closeAssignGroupModal">✕</button>
+      </div>
+      <div class="modal-body" style="gap:12px;">
+        <div id="assignGroupModalDesc" style="font-size:12px;color:var(--fg-muted);line-height:1.5;">
+          选择目标分组、移回全局池，或直接新建分组并分配。
+        </div>
+        <div class="field">
+          <label for="assignGroupSelect">目标分组</label>
+          <select id="assignGroupSelect" style="width:100%;"></select>
+        </div>
+        <div class="field" id="assignGroupNewWrap" style="display:none;">
+          <label for="assignGroupNewInput">新分组名称</label>
+          <input id="assignGroupNewInput" type="text" maxlength="48" placeholder="例如：team-a / vip / 研发一组" />
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" data-click="closeAssignGroupModal">取消</button>
+        <button type="button" class="btn-solid" id="assignGroupConfirmBtn">确认分组</button>
       </div>
     </div>
   </div>
@@ -1764,6 +1912,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     let sessionBearer = sessionStorage.getItem("cgw_session_bearer") || "";
     let activeTab = "overview";
     let poolSlotsCache = [];
+    let accountGroupsCache = [];
     let logsCache = [];
     let liveLogsPoll = true;
     let openTraceId = null;
@@ -1788,6 +1937,24 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "对齐 CPA 生产级路由机制，修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist to .env",
       "保存路由配置": "Save Routing",
       "内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto Defensive Rephrase on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
+      "思考块显示路由模型与思考程度 (SHOW_ROUTED_MODEL_IN_THINKING)": "Show Routed Model & Effort in Thinking Header (SHOW_ROUTED_MODEL_IN_THINKING)",
+      "思考块显示路由模型": "Show Routed Model in Thinking Header",
+      "搜邮箱 / 备注 / 分组 / 代理...": "Search email / note / group / proxy...",
+      "输入新分组名称，例如：研发一组 / team-a / vip": "Enter new group name, e.g. team-a / vip",
+      "默认开启（推荐）。仅在开启思考（effort≠off 或上游输出思考）时于思考块首行展示档位、思考程度及底层实际模型（routed= / routed≈），不污染纯文本 effort=off 响应；选「强制全显」则所有请求均显示。关闭后仍保留响应头与后台日志记录。": "On by default (recommended). Shows mode, effort, and live observed upstream model (routed= / routed≈) on line 1 of thinking blocks only when thinking is active (effort != off or upstream emits thinking), keeping plain effort=off replies clean; choose Always to show on every turn. HTTP response headers and trace logs always remain enabled.",
+      "默认显示 (true · 推荐)": "Default On (true · Recommended)",
+      "强制全显 (always)": "Force Always (always)",
+      "关闭 (false)": "Off (false)",
+      "分组管理": "Manage Groups",
+      "全部分组": "All Groups",
+      "未分组": "Ungrouped",
+      "批量分组": "Set Group",
+      "账号分组管理 (Account Groups)": "Account Groups",
+      "+ 创建分组": "+ Create Group",
+      "将上游账号归入不同分组，并在「网关子密钥」中绑定对应分组，即可在单实例内实现严格号池隔离（绝不跨组回退）。": "Assign accounts into groups and bind sub-keys to a group for strict single-instance pool isolation (never falls back to global pool).",
+      "绑定账号分组（留空 = 全局号池）": "Bound Account Group (Blank = Global Pool)",
+      "全局号池（不限制分组）": "Global Pool (Unrestricted)",
+      "严格号池隔离：仅调度组内账号，组内全不可用时直接返回 503/429，绝不跨组或回退全局池。": "Strict pool isolation: schedules only accounts in this group; returns 503/429 when unavailable and never falls back to global pool.",
       "深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)": "Deep-Sanitize Heavy Client Framework System Prompts (SANITIZE_CLIENT_SYSTEM_PROMPT)",
       "默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 <user_rules>/<system-reminder> 转为中性标题（完整保留业务规则正文）。": "Off by default (user-supplied system prompts pass through untouched). Recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive smart blocks or refuse local tool calls: softens conflicting AI identities, strips IDE anti-bypass boilerplate, and unwraps <user_rules>/<system-reminder> tags while preserving all workspace rule content.",
       "同步 Agent": "Sync Cloud Agents",
@@ -2002,7 +2169,59 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "全选": "Select All",
       "保存网关密钥配置": "Save Sub-Key",
       "版本信息与更新指南": "Version & Updates",
-      "重新检查更新": "Check Updates"
+      "重新检查更新": "Check Updates",
+      "支持网页 OAuth 授权（90天自动续期）、Cookie 导入、独立出口代理与云端会话一键清理": "Web OAuth (90-day auto-refresh), Cookie import, per-account proxy, and one-click cloud session cleanup",
+      "全部状态": "All Statuses",
+      "正常在线": "Healthy",
+      "异常 / 耗尽 / 冷却": "Abnormal / Exhausted / Cooldown",
+      "已停用": "Disabled",
+      "最新导入优先": "Newest First",
+      "最早导入优先": "Oldest First",
+      "剩余额度最多": "Most Quota Left",
+      "调度次数最多": "Most Requests",
+      "清理会话": "Clear Sessions",
+      "导入 JSON": "Import JSON",
+      "导出 JSON": "Export JSON",
+      "批量启用": "Enable Selected",
+      "批量停用": "Disable Selected",
+      "批量删除": "Delete Selected",
+      "检测与维护": "Maintenance",
+      "导入 / 导出": "Import / Export",
+      "批量操作": "Bulk Actions",
+      "刷新最新额度": "Refresh Quotas",
+      "重测复活异常号": "Recheck & Revive",
+      "选择目标分组、移回全局池，或直接新建分组并分配。": "Choose an existing group, move back to the global pool, or create a new group.",
+      "目标分组": "Target Group",
+      "新分组名称": "New Group Name",
+      "例如：team-a / vip / 研发一组": "e.g. team-a / vip / prod",
+      "确认分组": "Apply Group",
+      "账号信息": "Account Info",
+      "额度余量": "Quota Remaining",
+      "导入时间": "Added",
+      "运行状态": "Runtime Status",
+      "快捷接入、分享与在线测试": "Quick Connect, Share & Live Test",
+      "点击上方任意子密钥的「接入」按钮（或点击 Token），自动填入真实接口地址与 API Key，可直接复制发给他人或在线测一下": "Click Connect (or Token) on any sub-key above to populate the live Base URL and API Key for sharing or testing",
+      "一键分享": "Quick Share",
+      "OpenAI 接入": "OpenAI Setup",
+      "在线测试": "Live Test",
+      "一键复制分享": "Copy Share Info",
+      "复制代码": "Copy Code",
+      "加载中...": "Loading...",
+      "模型定位": "Model Role",
+      "修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist automatically",
+      "Quota-Aware 会综合检测账号剩余月度额度与短时限额，优先分配给余量充足且当前并发最少的健康账号。": "Quota-Aware evaluates both monthly and burst quotas, dispatching to healthy accounts with the most headroom and lowest concurrency.",
+      "额度耗尽 / 鉴权失效自动停用 (Auto-Disable on Exhaustion)": "Auto-Disable on Exhaustion / 401",
+      "当某个账号额度耗尽或返回 401 鉴权失效时，当场无缝切流至其他健康账号完成回复，并自动暂停该账号（周期重置后自动唤醒）。": "Seamlessly fails over mid-request when an account hits quota exhaustion or 401, and auto-pauses it until cycle reset.",
+      "无痕隐私模式 (Incognito Privacy Mode)": "Incognito Privacy Mode",
+      "默认开启。使用 AWS Quick 官方原生无痕模式（incognito），不写入云端历史且不产生高频删会话请求；关闭后对话将保留在 AWS Quick 云端记录中，可随时在凭证页一键清理。": "On by default. Uses native AWS Quick incognito mode so zero cloud history is stored; when disabled, chats stay in AWS Quick cloud history until cleared.",
+      "自动创建 / 绑定极简编程 Agent (AUTO_ENSURE_CODING_AGENT)": "Auto-Ensure Minimal Coding Agent (AUTO_ENSURE_CODING_AGENT)",
+      "默认开启。首次调用未绑定 Agent 的账号时自动创建并绑定极简编程 Agent，提升工具调用稳定性；支持自定义新建 Agent 的默认提示词模板。": "On by default. Automatically creates and binds a minimal Coding Agent on first use to improve tool-call reliability; supports custom default instructions.",
+      "默认模板": "Default",
+      "编辑模板": "Edit Template",
+      "内容过滤触发时自动重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto-Rephrase Retry on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
+      "默认关闭。仅当上游返回 content_filtered 且未吐正文时，用辅助模型将敏感措辞改写为中性专业表达，并死守原模型重试 1 次（热会话优先走原生 edit_message 分支）。": "Off by default. Only when upstream returns content_filtered before emitting text, rephrases phrasing via a helper model and retries once on the exact same model.",
+      "quick-fast (推荐)": "quick-fast (Recommended)",
+      "重述辅助模型": "Rephrase Helper Model"
     };
 
 
@@ -2154,6 +2373,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       if (openTraceDetail) renderDrawerContent();
       if (modelsCatalogCache.length) renderModelsTable();
       if (clientKeysCache.length) renderClientKeysTable();
+      if ($("groupsModal") && $("groupsModal").classList.contains("open")) renderGroupsModalList();
       if (cachedVersionInfo) {
         updateVersionPill(cachedVersionInfo);
         if ($("updateModal") && $("updateModal").classList.contains("open")) renderUpdateModal(cachedVersionInfo);
@@ -2812,6 +3032,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       return '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
           '<span style="font-weight:600;">' + esc(title) + '</span>' +
           renderAuthTag(s) +
+          (s.group
+            ? '<span class="tag tag-group" style="cursor:pointer;" data-click="editGroup" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.group) + '" title="' + esc(tr("所属分组：" + s.group + "（点击修改或移回未分组）", "Group: " + s.group + " (click to edit or ungroup)")) + '">' + esc(tr("组:", "Grp:") + s.group) + '</span>'
+            : '<span class="tag tag-group-empty" style="cursor:pointer;" data-click="editGroup" data-arg="' + esc(s.slotId) + '" data-arg2="" title="' + esc(tr("点击为该账号分配分组", "Click to assign account group")) + '">' + esc(tr("+ 分组", "+ Group")) + '</span>') +
           (planStr ? '<span class="tag">' + esc(planStr) + '</span>' : '') +
         '</div>' +
         (subParts.length ? '<div style="color:var(--fg-muted);font-size:11.5px;margin-top:2px;">' + esc(subParts.join(" · ")) + '</div>' : '') +
@@ -2886,10 +3109,43 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>' +
         '</button></div>';
 
+    function syncGroupDropdowns(preserveCkGroup) {
+      const activeNames = (accountGroupsCache || [])
+        .filter((g) => typeof g === "string" || g.defined !== false)
+        .map((g) => (typeof g === "string" ? g : g.name))
+        .filter(Boolean);
+      const credSel = $("credGroupFilter");
+      if (credSel) {
+        const cur = credSel.value || "all";
+        const validVals = new Set(["all", "__ungrouped__", ...activeNames.map((n) => "group:" + n)]);
+        credSel.innerHTML =
+          '<option value="all">' + esc(tr("全部分组", "All Groups")) + '</option>' +
+          '<option value="__ungrouped__">' + esc(tr("未分组", "Ungrouped")) + '</option>' +
+          activeNames.map((n) => '<option value="group:' + esc(n) + '">' + esc(tr("分组: ", "Group: ") + n) + '</option>').join("");
+        credSel.value = validVals.has(cur) ? cur : "all";
+        if (typeof syncSelectUi === "function") syncSelectUi(credSel);
+      }
+      const ckSel = $("ckGroupSelect");
+      if (ckSel) {
+        const target = preserveCkGroup !== undefined ? String(preserveCkGroup || "") : (ckSel.value || "");
+        const hasMissingTarget = Boolean(target && !activeNames.includes(target));
+        ckSel.innerHTML =
+          '<option value="">' + esc(tr("全局号池（不限制分组）", "Global Pool (Unrestricted)")) + '</option>' +
+          (hasMissingTarget
+            ? '<option value="' + esc(target) + '">' + esc(tr("仅限分组: ", "Strict Group: ") + target + tr("（已删除）", " (Deleted)")) + '</option>'
+            : "") +
+          activeNames.map((n) => '<option value="' + esc(n) + '">' + esc(tr("仅限分组: ", "Strict Group: ") + n) + '</option>').join("");
+        ckSel.value = target;
+        if (typeof syncSelectUi === "function") syncSelectUi(ckSel);
+      }
+    }
+
     function renderAll(data) {
       lastConsoleData = data;
       const pool = data.keyPool || [];
       poolSlotsCache = pool;
+      if (Array.isArray(data.groups)) accountGroupsCache = data.groups;
+      syncGroupDropdowns();
       updateAccountFilterDropdown(pool);
 
       const usage = data.gatewaySessionUsage || data;
@@ -2941,6 +3197,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       window.__activeCustomAgentPrompt = settings.customAgentPrompt || "";
       window.__defaultContentFilterRephrasePrompt = settings.defaultContentFilterRephrasePrompt || "";
       window.__activeContentFilterRephrasePrompt = settings.contentFilterRephrasePrompt || "";
+      if ($("cfgShowRoutedModel")) {
+        $("cfgShowRoutedModel").value = settings.showRoutedModelInThinking || "true";
+        syncSelectUi($("cfgShowRoutedModel"));
+      }
       if ($("cfgSanitizeClientSystemPrompt")) {
         $("cfgSanitizeClientSystemPrompt").checked = settings.sanitizeClientSystemPrompt === true;
       }
@@ -2998,15 +3258,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
     function getFilteredCreds() {
       const kw = ($("credSearchInput") ? $("credSearchInput").value : "").trim().toLowerCase();
+      const grp = $("credGroupFilter") ? $("credGroupFilter").value : "all";
       const st = $("credStatusFilter") ? $("credStatusFilter").value : "all";
       const sortBy = $("credSortFilter") ? $("credSortFilter").value : "newest";
       const list = poolSlotsCache.filter((s) => {
+        if (grp === "__ungrouped__" && s.group) return false;
+        if (grp && grp.startsWith("group:") && (s.group || "") !== grp.slice(6)) return false;
         if (st === "healthy" && !s.healthy) return false;
         if (st === "disabled" && s.enabled) return false;
         if (st === "abnormal" && (s.healthy || (!s.enabled && !s.autoDisabledReason))) return false;
         if (kw) {
           const idt = s.identity || {};
-          const hay = ((s.label || "") + " " + (s.maskedKey || "") + " " + (s.maskedProxy || "") + " " + (s.chatAgentId || "") + " " + (idt.userEmail || "") + " " + (idt.displayName || "")).toLowerCase();
+          const hay = ((s.label || "") + " " + (s.group || "") + " " + (s.maskedKey || "") + " " + (s.maskedProxy || "") + " " + (s.chatAgentId || "") + " " + (idt.userEmail || "") + " " + (idt.displayName || "")).toLowerCase();
           if (!hay.includes(kw)) return false;
         }
         return true;
@@ -3030,18 +3293,19 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
     function isCredFilterActive() {
       const kw = ($("credSearchInput") ? $("credSearchInput").value : "").trim();
+      const grp = $("credGroupFilter") ? $("credGroupFilter").value : "all";
       const st = $("credStatusFilter") ? $("credStatusFilter").value : "all";
-      return kw.length > 0 || (st && st !== "all");
+      return kw.length > 0 || (grp && grp !== "all") || (st && st !== "all");
     }
     function getCredSyncBtnText(filteredLen) {
       if (selectedCredIds.size > 0) {
-        return tr("同步所选 (" + selectedCredIds.size + ")", "Sync Selected (" + selectedCredIds.size + ")");
+        return tr("刷新所选额度 (" + selectedCredIds.size + ")", "Refresh Selected (" + selectedCredIds.size + ")");
       }
       if (isCredFilterActive()) {
         const cnt = typeof filteredLen === "number" ? filteredLen : getFilteredCreds().length;
-        return tr("同步当前筛选 (" + cnt + ")", "Sync Filtered (" + cnt + ")");
+        return tr("刷新筛选额度 (" + cnt + ")", "Refresh Filtered (" + cnt + ")");
       }
-      return tr("同步最新额度", "Sync Quotas");
+      return tr("刷新最新额度", "Refresh Quotas");
     }
 
     function renderCredTable() {
@@ -3057,10 +3321,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       }
       if ($("credBatchRecheckBtn") && !$("credBatchRecheckBtn").disabled) {
         $("credBatchRecheckBtn").textContent = selectedCredIds.size > 0
-          ? tr("批量检测 (" + selectedCredIds.size + ")", "Batch Check (" + selectedCredIds.size + ")")
+          ? tr("重测复活 (" + selectedCredIds.size + ")", "Recheck & Revive (" + selectedCredIds.size + ")")
           : (filterActive
-            ? tr("检测筛选 (" + filtered.length + ")", "Check Filtered (" + filtered.length + ")")
-            : tr("批量检测", "Batch Check"));
+            ? tr("重测复活筛选 (" + filtered.length + ")", "Recheck Filtered (" + filtered.length + ")")
+            : tr("重测复活异常号", "Recheck & Revive"));
       }
       if ($("credClearSessionsBtn") && !$("credClearSessionsBtn").disabled) {
         $("credClearSessionsBtn").textContent = selectedCredIds.size > 0
@@ -3108,7 +3372,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             '<button class="btn-xs" data-click="editLabel" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.label || '') + '" title="' + esc(tr('修改账号备注名称', 'Edit account label')) + '">' + esc(tr('修改备注', 'Label')) + '</button>' +
             '<button class="btn-xs" data-click="editProxy" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.maskedProxy || '') + '" title="' + esc(tr('配置该账号的独立出口代理', 'Configure per-account proxy')) + '">' + esc(tr('出口代理', 'Proxy')) + '</button>' +
             '<button class="btn-xs" data-click="editChatAgent" data-arg="' + esc(s.slotId) + '" data-arg2="' + esc(s.chatAgentId || '') + '" title="' + esc(tr('绑定或切换该账号的专属智能体 ID', 'Bind custom chat Agent ID')) + '">' + esc(tr('定义智能体', 'Custom Agent')) + '</button>' +
-            (s.cooldownRemainingMs > 0 ? '<button class="btn-xs" data-click="clearKeyCd" data-arg="' + esc(s.slotId) + '">' + esc(tr('解封', 'Uncool')) + '</button>' : '') +
+            (s.cooldownRemainingMs > 0 ? '<button class="btn-xs" style="grid-column:1/-1;" data-click="clearKeyCd" data-arg="' + esc(s.slotId) + '">' + esc(tr('解封冷却', 'Clear Cooldown')) + '</button>' : '') +
           '</div></td>' +
         '</tr>';
       }).join("") : '<tr><td colspan="7" style="text-align:center;color:var(--fg-muted);padding:24px;">' + esc(poolSlotsCache.length ? tr("当前筛选条件下无匹配凭证", "No matching credentials") : tr("暂无凭证", "No credentials")) + '</td></tr>';
@@ -3127,6 +3391,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
     if ($("credSearchInput")) $("credSearchInput").oninput = renderCredTable;
+    if ($("credGroupFilter")) $("credGroupFilter").onchange = renderCredTable;
     const restoreSelectPref = (sel, key) => {
       if (!sel) return;
       const saved = lsGet(key);
@@ -3181,6 +3446,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("credExportBtn").onclick = async () => {
         const ids = [...selectedCredIds];
         if (!ids.length) return notify(tr("请先勾选要导出的凭证（可先按状态筛选再全选）。", "Select at least one credential to export."), true);
+        const ok = await uiConfirm({
+          title: tr("导出所选凭证备份", "Export Selected Credentials"),
+          desc: tr("确认导出已勾选的 " + ids.length + " 条凭证为 JSON 文件吗？导出的文件包含上游认证凭据，请妥善保管、切勿外泄。", "Export " + ids.length + " selected credential(s) to a JSON file? The file contains upstream credentials—store it securely."),
+          okText: tr("确认导出", "Export JSON")
+        });
+        if (!ok) return;
         try {
           const res = await api("/v1/admin/keys/export", { method: "POST", body: JSON.stringify({ slotIds: ids }) });
           const items = Array.isArray(res.credentials) ? res.credentials : [];
@@ -3209,6 +3480,21 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           danger: true
         });
         if (!ok) return;
+      } else if (action === "disable") {
+        const ok = await uiConfirm({
+          title: tr("批量停用凭证", "Disable Selected Credentials"),
+          desc: tr("确认批量停用已勾选的 " + ids.length + " 条凭证吗？停用后这些账号将立即停止承接新请求并关闭其停泊热会话。", "Disable " + ids.length + " selected credential(s)? They will immediately stop serving traffic and close parked warm sessions."),
+          okText: tr("确认停用", "Disable"),
+          danger: true
+        });
+        if (!ok) return;
+      } else if (action === "enable") {
+        const ok = await uiConfirm({
+          title: tr("批量启用凭证", "Enable Selected Credentials"),
+          desc: tr("确认批量启用已勾选的 " + ids.length + " 条凭证并同步其最新额度状态吗？", "Enable " + ids.length + " selected credential(s) and sync their latest quotas?"),
+          okText: tr("确认启用", "Enable")
+        });
+        if (!ok) return;
       }
       try {
         const r = await api("/v1/admin/keys/batch", { method: "POST", body: JSON.stringify({ action, slotIds: ids }) });
@@ -3221,6 +3507,299 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     if ($("credBatchEnableBtn")) $("credBatchEnableBtn").onclick = () => void runCredBatch("enable");
     if ($("credBatchDisableBtn")) $("credBatchDisableBtn").onclick = () => void runCredBatch("disable");
     if ($("credBatchDeleteBtn")) $("credBatchDeleteBtn").onclick = () => void runCredBatch("delete");
+
+    // Hover + Click viewport-fixed Action Dropdowns (matches .c-sel-menu pixel-for-pixel, never clipped by .panel-box)
+    function closeAllActDds(except) {
+      document.querySelectorAll(".act-dd.open").forEach((x) => {
+        if (x !== except) x.classList.remove("open");
+      });
+    }
+    function openActDd(dd) {
+      if (!dd) return;
+      const trig = dd.querySelector(".act-dd-trigger");
+      const menu = dd.querySelector(".act-dd-menu");
+      if (!trig || !menu) return;
+      closeAllActDds(dd);
+      dd.classList.add("open");
+      const rect = trig.getBoundingClientRect();
+      menu.style.minWidth = Math.max(156, Math.round(rect.width)) + "px";
+      const mw = menu.offsetWidth || 160;
+      const mh = menu.offsetHeight || 110;
+      const left = Math.max(8, Math.min(rect.left, window.innerWidth - mw - 8));
+      const top = rect.bottom + 4 + mh > window.innerHeight - 8 && rect.top - mh - 4 > 8
+        ? rect.top - mh - 4
+        : rect.bottom + 4;
+      menu.style.left = Math.round(left) + "px";
+      menu.style.top = Math.round(top) + "px";
+    }
+    document.querySelectorAll(".act-dd").forEach((dd) => {
+      let leaveTimer = null;
+      const cancelLeave = () => { if (leaveTimer) { clearTimeout(leaveTimer); leaveTimer = null; } };
+      const scheduleClose = () => {
+        cancelLeave();
+        leaveTimer = setTimeout(() => { dd.classList.remove("open"); leaveTimer = null; }, 140);
+      };
+      dd.addEventListener("mouseenter", () => { cancelLeave(); openActDd(dd); });
+      dd.addEventListener("mouseleave", scheduleClose);
+      const menu = dd.querySelector(".act-dd-menu");
+      if (menu) {
+        menu.addEventListener("mouseenter", cancelLeave);
+        menu.addEventListener("mouseleave", scheduleClose);
+      }
+      const trig = dd.querySelector(".act-dd-trigger");
+      if (trig) {
+        trig.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          cancelLeave();
+          if (dd.classList.contains("open")) dd.classList.remove("open");
+          else openActDd(dd);
+        });
+      }
+      dd.querySelectorAll(".act-dd-item").forEach((item) => {
+        item.addEventListener("click", () => { cancelLeave(); dd.classList.remove("open"); });
+      });
+    });
+    document.addEventListener("click", () => closeAllActDds());
+    window.addEventListener("scroll", () => closeAllActDds(), true);
+    window.addEventListener("resize", () => closeAllActDds());
+
+    // Reusable Dropdown Modal for Assigning Account Group (Single & Batch)
+    let assignGroupResolver = null;
+    function syncAssignGroupNewInputVisibility() {
+      const sel = $("assignGroupSelect");
+      const wrap = $("assignGroupNewWrap");
+      const inp = $("assignGroupNewInput");
+      if (!sel || !wrap) return;
+      const isNew = sel.value === "__new__";
+      wrap.style.display = isNew ? "" : "none";
+      if (isNew && inp) setTimeout(() => inp.focus(), 30);
+    }
+    window.closeAssignGroupModal = (val) => {
+      if ($("assignGroupModal")) $("assignGroupModal").classList.remove("open");
+      const fn = assignGroupResolver;
+      assignGroupResolver = null;
+      if (fn) fn(val === undefined ? null : val);
+    };
+    function openAssignGroupPicker(opts) {
+      const modal = $("assignGroupModal");
+      const sel = $("assignGroupSelect");
+      const newInp = $("assignGroupNewInput");
+      if (!modal || !sel) return Promise.resolve(null);
+      if ($("assignGroupModalTitle")) $("assignGroupModalTitle").textContent = opts.title || tr("设置账号分组", "Assign Account Group");
+      if ($("assignGroupModalDesc")) $("assignGroupModalDesc").textContent = opts.desc || tr("选择目标分组、移回全局池，或直接新建分组并分配。", "Choose an existing group, move back to the global pool, or create a new group.");
+      if ($("assignGroupConfirmBtn")) $("assignGroupConfirmBtn").textContent = opts.okText || tr("确认分组", "Apply Group");
+
+      const definedGroups = (accountGroupsCache || []).filter((g) => typeof g === "string" || g.defined !== false);
+      const curVal = (opts.currentGroup || "").trim();
+      sel.innerHTML = "";
+      const addOpt = (value, label) => {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = label;
+        sel.appendChild(o);
+      };
+      addOpt("", tr("未分组（全局账号池）", "Ungrouped (Global Pool)"));
+      const seen = new Set();
+      for (const g of definedGroups) {
+        const name = typeof g === "string" ? g : g.name;
+        if (!name || seen.has(name)) continue;
+        seen.add(name);
+        const cnt = typeof g === "object" && typeof g.totalAccounts === "number" ? g.totalAccounts : null;
+        const suffix = cnt !== null ? tr("（" + cnt + " 个账号）", " (" + cnt + " acct" + (cnt === 1 ? "" : "s") + ")") : "";
+        addOpt(name, name + suffix);
+      }
+      if (curVal && !seen.has(curVal)) {
+        addOpt(curVal, curVal);
+      }
+      addOpt("__new__", tr("+ 新建分组并分配...", "+ Create new group..."));
+      sel.value = curVal || "";
+      if (newInp) newInp.value = "";
+      enhanceSelect(sel);
+      syncAssignGroupNewInputVisibility();
+      modal.classList.add("open");
+      return new Promise((resolve) => {
+        assignGroupResolver = resolve;
+      });
+    }
+    if ($("assignGroupSelect")) {
+      $("assignGroupSelect").addEventListener("change", syncAssignGroupNewInputVisibility);
+    }
+    function submitAssignGroupModal() {
+      const sel = $("assignGroupSelect");
+      const newInp = $("assignGroupNewInput");
+      if (!sel) return;
+      if (sel.value === "__new__") {
+        const name = (newInp ? newInp.value : "").trim();
+        if (!name) {
+          notify(tr("请输入新分组名称。", "Please enter a new group name."), true);
+          if (newInp) newInp.focus();
+          return;
+        }
+        window.closeAssignGroupModal(name);
+        return;
+      }
+      window.closeAssignGroupModal(sel.value || "");
+    }
+    if ($("assignGroupConfirmBtn")) {
+      $("assignGroupConfirmBtn").onclick = () => submitAssignGroupModal();
+    }
+    if ($("assignGroupNewInput")) {
+      $("assignGroupNewInput").addEventListener("keydown", (ev) => {
+        if (ev.isComposing || ev.keyCode === 229) return;
+        if (ev.key === "Enter") { ev.preventDefault(); submitAssignGroupModal(); }
+      });
+    }
+
+    if ($("credBatchGroupBtn")) {
+      $("credBatchGroupBtn").onclick = async () => {
+        const ids = [...selectedCredIds];
+        if (!ids.length) return notify(tr("请先勾选要设置分组的凭证。", "Select at least one credential first."), true);
+        const next = await openAssignGroupPicker({
+          title: tr("批量设置账号分组 (" + ids.length + " 项)", "Set Account Group (" + ids.length + " selected)"),
+          desc: tr("将所选 " + ids.length + " 个账号一键归入目标分组，或选「未分组」移回全局池。", "Assign " + ids.length + " selected account(s) to a group, or choose Ungrouped for the global pool."),
+          currentGroup: "",
+          okText: tr("确认分组", "Apply Group"),
+        });
+        if (next === null) return;
+        try {
+          const targetGroup = next.trim() || null;
+          const r = await api("/v1/admin/keys/batch", {
+            method: "POST",
+            body: JSON.stringify({ action: "set-group", slotIds: ids, group: targetGroup }),
+          });
+          if (Array.isArray(r.groups)) { accountGroupsCache = r.groups; syncGroupDropdowns(); }
+          notify(
+            targetGroup
+              ? tr("已将 " + (r.affected ?? ids.length) + " 个账号归入分组「" + targetGroup + "」。", "Assigned " + (r.affected ?? ids.length) + " account(s) to group '" + targetGroup + "'.")
+              : tr("已将 " + (r.affected ?? ids.length) + " 个账号移回未分组。", "Ungrouped " + (r.affected ?? ids.length) + " account(s)."),
+          );
+          await loadConsoleData("");
+        } catch (e) { notify(e.message, true); }
+      };
+    }
+
+    function renderGroupsModalList() {
+      const box = $("groupsModalList");
+      if (!box) return;
+      const list = accountGroupsCache || [];
+      if (!list.length) {
+        box.innerHTML = '<div style="padding:18px;text-align:center;color:var(--fg-muted);font-size:12px;border:1px dashed var(--border);border-radius:6px;">' + esc(tr("暂未创建账号分组，请在上方输入名称创建。", "No account groups yet. Create one above.")) + '</div>';
+        return;
+      }
+      box.innerHTML = list.map((g) => {
+        const isOrphaned = g.defined === false && (g.boundKeys || 0) > 0;
+        const metaText = isOrphaned
+          ? tr("已删分组 · 仍有 " + g.boundKeys + " 个子密钥绑定（请求将严格返回 503，需解绑或重建）", "Deleted group · " + g.boundKeys + " sub-key(s) still bound (returns 503 until rebound)")
+          : tr("账号 ", "Accounts ") + g.enabledAccounts + "/" + g.totalAccounts + tr("（健康 ", " (healthy ") + g.healthyAccounts + tr("）· 绑定子密钥 ", ") · Bound keys ") + (g.boundKeys || 0);
+        const actionsHtml = isOrphaned
+          ? '<button type="button" class="btn-xs" data-click="recreateOrphanGroupUi" data-arg="' + esc(g.name) + '">' + esc(tr("重建分组", "Recreate")) + '</button>' +
+            '<button type="button" class="btn-xs" data-click="jumpToClientKeysFromGroups">' + esc(tr("去解绑", "Sub-Keys")) + '</button>'
+          : '<button type="button" class="btn-xs" data-click="renameAccountGroupUi" data-arg="' + esc(g.name) + '">' + esc(tr("重命名", "Rename")) + '</button>' +
+            '<button type="button" class="btn-xs btn-danger" data-click="deleteAccountGroupUi" data-arg="' + esc(g.name) + '">' + esc(tr("删除", "Delete")) + '</button>';
+        return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid ' + (isOrphaned ? 'rgba(245,158,11,0.45)' : 'var(--border)') + ';border-radius:6px;background:var(--subtle);">' +
+          '<div style="min-width:0;flex:1;">' +
+            '<div style="display:flex;align-items:center;gap:6px;min-width:0;">' +
+              '<span style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(g.name) + '">' + esc(g.name) + '</span>' +
+              (isOrphaned ? '<span class="tag tag-warn">' + esc(tr("孤立绑定", "Orphaned")) + '</span>' : '') +
+            '</div>' +
+            '<div class="mono" style="font-size:11px;color:var(--fg-muted);margin-top:3px;">' + esc(metaText) + '</div>' +
+          '</div>' +
+          '<div style="display:flex;gap:6px;flex-shrink:0;">' + actionsHtml + '</div>' +
+        '</div>';
+      }).join("");
+    }
+    window.closeGroupsModal = () => { if ($("groupsModal")) $("groupsModal").classList.remove("open"); };
+    window.jumpToClientKeysFromGroups = () => {
+      window.closeGroupsModal();
+      const btn = document.querySelector('.nav-item[data-tab="clientkeys"]');
+      if (btn) btn.click();
+    };
+    window.recreateOrphanGroupUi = async (name) => {
+      try {
+        const r = await api("/v1/admin/groups", { method: "POST", body: JSON.stringify({ name }) });
+        accountGroupsCache = r.groups || [];
+        syncGroupDropdowns();
+        renderGroupsModalList();
+        notify(tr("已重建分组「" + r.name + "」，请为其分配上游账号。", "Recreated group '" + r.name + "'. Assign accounts to restore traffic."));
+      } catch (e) { notify(e.message, true); }
+    };
+    async function refreshGroupsFromApi() {
+      const r = await api("/v1/admin/groups");
+      accountGroupsCache = r.groups || [];
+      syncGroupDropdowns();
+      renderGroupsModalList();
+    }
+    if ($("credManageGroupsBtn")) {
+      $("credManageGroupsBtn").onclick = async () => {
+        try { await refreshGroupsFromApi(); } catch (e) { notify(e.message, true); }
+        if ($("newGroupNameInput")) $("newGroupNameInput").value = "";
+        if ($("groupsModal")) $("groupsModal").classList.add("open");
+      };
+    }
+    if ($("newGroupNameInput")) {
+      $("newGroupNameInput").onkeydown = (ev) => {
+        if (ev.isComposing || ev.keyCode === 229) return;
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          if ($("createGroupSubmitBtn") && !$("createGroupSubmitBtn").disabled) $("createGroupSubmitBtn").click();
+        }
+      };
+    }
+    if ($("createGroupSubmitBtn")) {
+      $("createGroupSubmitBtn").onclick = async () => {
+        const btn = $("createGroupSubmitBtn");
+        if (btn.disabled) return;
+        const name = ($("newGroupNameInput") ? $("newGroupNameInput").value : "").trim();
+        if (!name) return notify(tr("请输入分组名称。", "Please enter a group name."), true);
+        btn.disabled = true;
+        try {
+          const r = await api("/v1/admin/groups", { method: "POST", body: JSON.stringify({ name }) });
+          accountGroupsCache = r.groups || [];
+          syncGroupDropdowns();
+          renderGroupsModalList();
+          if ($("newGroupNameInput")) $("newGroupNameInput").value = "";
+          notify(tr("已创建分组「" + r.name + "」。", "Created group '" + r.name + "'."));
+        } catch (e) { notify(e.message, true); }
+        finally { btn.disabled = false; }
+      };
+    }
+    window.renameAccountGroupUi = async (oldName) => {
+      const next = await uiPrompt({
+        title: tr("重命名分组 · " + oldName, "Rename Group · " + oldName),
+        desc: tr("重命名后，组内所有账号与绑定该分组的子密钥会自动同步更新。", "All accounts and sub-keys bound to this group will be updated automatically."),
+        value: oldName,
+        okText: tr("保存名称", "Rename"),
+      });
+      if (next === null || !next.trim() || next.trim() === oldName) return;
+      try {
+        const r = await api("/v1/admin/groups/" + encodeURIComponent(oldName), {
+          method: "PATCH",
+          body: JSON.stringify({ name: next.trim() }),
+        });
+        accountGroupsCache = r.groups || [];
+        syncGroupDropdowns();
+        renderGroupsModalList();
+        notify(tr("已将分组重命名为「" + r.newName + "」。", "Renamed group to '" + r.newName + "'."));
+        await Promise.all([loadConsoleData(""), loadClientKeys()]);
+      } catch (e) { notify(e.message, true); }
+    };
+    window.deleteAccountGroupUi = async (name) => {
+      const ok = await uiConfirm({
+        title: tr("删除分组 · " + name, "Delete Group · " + name),
+        desc: tr("删除分组不会删除账号，但会将组内账号移回未分组；已绑定该分组的子密钥在重新绑定前将无法调度任何账号（绝不回退全局池）。", "Accounts in this group will be ungrouped (not deleted). Sub-keys bound to this group will fail with 503 until rebound (never falls back to global pool)."),
+        okText: tr("确认删除", "Delete"),
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        const r = await api("/v1/admin/groups/" + encodeURIComponent(name), { method: "DELETE" });
+        accountGroupsCache = r.groups || [];
+        syncGroupDropdowns();
+        renderGroupsModalList();
+        notify(tr("已删除分组「" + name + "」。", "Deleted group '" + name + "'."));
+        await loadConsoleData("");
+      } catch (e) { notify(e.message, true); }
+    };
     if ($("credBatchRecheckBtn")) {
       $("credBatchRecheckBtn").onclick = async () => {
         const filterActive = isCredFilterActive();
@@ -3232,6 +3811,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (!ids.length) {
           return notify(filterActive ? tr("当前筛选结果为空，没有可检测的凭证。", "No matching credentials to check.") : tr("当前没有可检测的凭证。", "No credentials to check."), true);
         }
+        const ok = await uiConfirm({
+          title: tr("重测并复活凭证 (" + ids.length + " 项)", "Recheck & Revive (" + ids.length + " accounts)"),
+          desc: tr("确认对这 " + ids.length + " 条凭证清除冷却、尝试重新激活并检测上游连通性吗？（仍返回 401/403 的账号会自动重新熔断停用）", "Clear cooldowns, re-activate, and probe upstream health for " + ids.length + " credential(s)? Accounts still returning 401/403 will be auto-disabled again."),
+          okText: tr("开始重测", "Recheck Now")
+        });
+        if (!ok) return;
         const btn = $("credBatchRecheckBtn");
         btn.disabled = true;
         ids.forEach((id) => busySyncIds.add(id));
@@ -3303,7 +3888,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (typeFilter === "thinking" && !r.hasThinking) return false;
         if (typeFilter === "error" && r.status !== "error") return false;
         if (kw) {
-          const hay = (r.requestedModel + " " + (r.accountLabel || "") + " " + (r.maskedKey || "") + " " + (r.client || "") + " " + (r.userAgent || "")).toLowerCase();
+          const hay = (r.requestedModel + " " + (r.accountLabel || "") + " " + (r.accountGroup || "") + " " + (r.maskedKey || "") + " " + (r.clientKeyName || "") + " " + (r.client || "") + " " + (r.userAgent || "")).toLowerCase();
           if (!hay.includes(kw)) return false;
         }
         return true;
@@ -3356,8 +3941,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (r.accountFailoverCount > 0) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("切号×", "Failover ×") + r.accountFailoverCount) + '</span>');
         if (r.usedDefaultSystemAgent) badges.push('<span class="tag" style="color:var(--warn);border-color:color-mix(in srgb,var(--warn) 38%,transparent);">' + esc(tr("未绑Agent", "Default Agent")) + '</span>');
         if (r.status === "error") badges.push('<span class="tag" style="color:var(--err);border-color:color-mix(in srgb,var(--err) 40%,transparent);">' + esc(tr("异常", "Error") + " " + (r.httpStatus || "")) + '</span>');
+        if (r.accountGroup) badges.push('<span class="tag tag-group">' + esc(tr("组:", "Grp:") + r.accountGroup) + '</span>');
         if (r.usedProxy) badges.push('<span class="tag">' + esc(tr("代理", "Proxy")) + '</span>');
-        if (r.hasThinking) badges.push('<span class="tag">' + esc(tr("思考", "Thinking")) + '</span>');
+        if (r.hasThinking) badges.push('<span class="tag">' + esc(tr("思考", "Thinking") + (r.thinkingEffort && r.thinkingEffort !== "off" ? ":" + r.thinkingEffort : "")) + '</span>');
+        else if (r.thinkingEffort && r.thinkingEffort !== "off") badges.push('<span class="tag">' + esc("effort:" + r.thinkingEffort) + '</span>');
         if (r.emittedToolCallsCount > 0) badges.push('<span class="tag">' + esc(tr("调工具×", "Tools ×")) + r.emittedToolCallsCount + '</span>');
         if (r.toolCount > 0 && r.emittedToolCallsCount === 0) badges.push('<span class="tag" style="opacity:0.7;">' + esc(tr("挂", "")) + r.toolCount + esc(tr("工具", " tools")) + '</span>');
 
@@ -3483,8 +4070,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<div class="kv-item"><span>' + esc(tr('执行模式 & 网络实发', 'Execution Mode & Payload')) + '</span><strong>' + esc(execModeLabel(d.execMode)) + '</strong><span style="margin-top:2px;">' + esc(savedNote) + '</span></div>' +
           '<div class="kv-item"><span>' + esc(tr('首包 TTFT / 总耗时 & Tokens', 'TTFT / Total & Tokens')) + '</span><strong class="mono">' + ttft + ' / ' + dur + '</strong><span class="mono" style="margin-top:2px;">' + esc(tr('新发入 ', 'In ')) + fmtTok(m.inputTokens) + esc(tr(' · 缓存读 ', ' · Cache ')) + fmtTok(m.cacheReadTokens) + esc(tr(' · 输出 ', ' · Out ')) + fmtTok(m.outputTokens) + '</span></div>' +
           ctxRowHtml +
+          row(esc(tr('调用 Key / 账号分组', 'Client Key / Account Group')), esc(d.clientKeyName || '—') + ' / ' + esc(d.accountGroup || tr('全局号池（未分组）', 'Global Pool (Ungrouped)'))) +
           row(esc(tr('消息数 / 附图', 'Messages / Images')), fmt(d.messageCount || 0) + ' / ' + fmt(d.imageCount || 0)) +
-          row(esc(tr('输出字数 / 思考 / 工具调用', 'Output Chars / Thinking / Tool Calls')), fmt(d.outputChars || 0) + ' / ' + (d.hasThinking ? tr('有', 'Yes') : tr('无', 'No')) + ' / ' + (d.emittedToolCallsCount || 0)) +
+          row(esc(tr('输出字数 / 思考 / 工具调用', 'Output Chars / Thinking / Tool Calls')), fmt(d.outputChars || 0) + ' / ' + (d.hasThinking ? tr('有', 'Yes') : tr('无', 'No')) + (d.thinkingEffort ? ' (' + esc(d.thinkingEffort) + ')' : '') + ' / ' + (d.emittedToolCallsCount || 0)) +
           row(esc(tr('会话指纹', 'Conversation Hash')), esc(fp.conversation || '—')) +
           row(esc(tr('前缀指纹 (上轮 → 本轮)', 'Prefix Hash (Prev → Cur)')), esc(fp.priorPrefix || '—') + ' → ' + esc(fp.currentPrefix || '—')) +
           row(esc(tr('挂载工具', 'Attached Tools')), tools.length ? esc(tools.join(', ')) : tr('无', 'None')) +
@@ -3624,12 +4212,25 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       runModelBatch(enabled ? "enable" : "disable", [id], enabled ? tr("已启用模型: ", "Enabled model: ") + id : tr("已禁用模型: ", "Disabled model: ") + id);
     };
 
-    $("batchEnableBtn").onclick = () => {
+    $("batchEnableBtn").onclick = async () => {
       if (!selectedModelIds.size) return notify(tr("请先勾选要操作的模型。", "Select at least one model first."), true);
+      const ok = await uiConfirm({
+        title: tr("批量启用模型", "Enable Selected Models"),
+        desc: tr("确认批量启用已勾选的 " + selectedModelIds.size + " 个对外开放模型吗？", "Enable " + selectedModelIds.size + " selected model(s) for API clients?"),
+        okText: tr("确认启用", "Enable")
+      });
+      if (!ok) return;
       runModelBatch("enable", [...selectedModelIds], tr("已批量启用 ", "Enabled ") + selectedModelIds.size + tr(" 个模型。", " models."));
     };
-    $("batchDisableBtn").onclick = () => {
+    $("batchDisableBtn").onclick = async () => {
       if (!selectedModelIds.size) return notify(tr("请先勾选要操作的模型。", "Select at least one model first."), true);
+      const ok = await uiConfirm({
+        title: tr("批量禁用模型", "Disable Selected Models"),
+        desc: tr("确认批量禁用已勾选的 " + selectedModelIds.size + " 个模型吗？禁用后客户端调用这些模型将被拒绝。", "Disable " + selectedModelIds.size + " selected model(s)? Clients requesting them will be rejected."),
+        okText: tr("确认禁用", "Disable"),
+        danger: true
+      });
+      if (!ok) return;
       runModelBatch("disable", [...selectedModelIds], tr("已批量禁用 ", "Disabled ") + selectedModelIds.size + tr(" 个模型。", " models."));
     };
     $("batchWhitelistBtn").onclick = async () => {
@@ -3645,7 +4246,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     if ($("batchDisableApiPoolBtn")) {
       $("batchDisableApiPoolBtn").onclick = () => {};
     }
-    $("batchEnableAllBtn").onclick = () => {
+    $("batchEnableAllBtn").onclick = async () => {
+      const ok = await uiConfirm({
+        title: tr("全部恢复启用", "Enable All Models"),
+        desc: tr("确认将所有上游模型恢复为对外开放状态吗？", "Re-enable all upstream models for API clients?"),
+        okText: tr("确认恢复", "Enable All")
+      });
+      if (!ok) return;
       runModelBatch("enable_all", [], tr("已恢复启用全部模型。", "All models enabled."));
     };
 
@@ -3730,6 +4337,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       try {
         const res = await api("/v1/admin/client-keys");
         clientKeysCache = res.clientKeys || [];
+        if (Array.isArray(res.groups)) {
+          accountGroupsCache = res.groups;
+          syncGroupDropdowns();
+        }
         $("navClientKeyCount").textContent = clientKeysCache.length;
         renderClientKeysTable();
         const curExists = clientKeysCache.some((k) => k.id === selectedCkConnectId);
@@ -3799,12 +4410,24 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
     function renderClientKeysTable() {
       $("clientKeysBody").innerHTML = clientKeysCache.length ? clientKeysCache.map((k) => {
-        const scopeHtml = k.allowAllModels
+        const grpInfo = k.accountGroup ? (accountGroupsCache || []).find((g) => g.name === k.accountGroup) : null;
+        const grpDegraded = Boolean(k.accountGroup && (!grpInfo || grpInfo.defined === false || grpInfo.healthyAccounts === 0));
+        const grpSuffix = grpInfo
+          ? (grpInfo.defined === false
+            ? tr(" · 已删", " · deleted")
+            : grpInfo.healthyAccounts === 0
+              ? tr(" · 无可用号", " · 0 healthy")
+              : " (" + grpInfo.healthyAccounts + ")")
+          : tr(" · 无账号", " · empty");
+        const groupBadgeHtml = k.accountGroup
+          ? '<div style="margin-top:4px;"><span class="tag ' + (grpDegraded ? 'tag-warn' : 'tag-group') + '" title="' + esc(tr("严格号池隔离：仅调度该分组内账号，绝不跨组或回退全局池", "Strict pool isolation: only schedules accounts in this group")) + '">' + esc(tr("绑定分组: ", "Group: ") + k.accountGroup + grpSuffix) + '</span></div>'
+          : '<div style="margin-top:4px;font-size:11px;color:var(--fg-muted);">' + esc(tr("号池：全局号池", "Pool: Global")) + '</div>';
+        const scopeHtml = (k.allowAllModels
           ? '<span class="tag tag-ok">' + esc(tr("跟随全局已启用模型 (不限)", "All enabled models")) + '</span>'
           : ('<div><span class="tag tag-warn">' + esc(tr("仅限指定 " + k.allowedModels.length + " 个模型", k.allowedModels.length + " models allowed")) + '</span>' +
              '<div class="mono" style="font-size:11px;color:var(--fg-muted);margin-top:3px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + esc(k.allowedModels.join(", ")) + '">' +
                esc(k.allowedModels.join(", ")) +
-             '</div></div>');
+             '</div></div>')) + groupBadgeHtml;
 
         const st = k.stats || {};
         const reqLimitStr = k.maxRequests != null
@@ -3881,6 +4504,35 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       renderCkChecklist();
     };
 
+    function renderCkGroupWarn() {
+      const box = $("ckGroupWarnBox");
+      const sel = $("ckGroupSelect");
+      if (!box || !sel) return;
+      const gName = (sel.value || "").trim();
+      if (!gName) {
+        box.style.display = "none";
+        box.innerHTML = "";
+        return;
+      }
+      const gInfo = accountGroupsCache.find((g) => g.name === gName);
+      if (gInfo && gInfo.defined === false) {
+        box.style.display = "block";
+        box.innerHTML = '<span class="tag tag-warn">' + esc(tr("⚠ 该分组已被删除，请求将直接返回 503，请切换或解绑分组", "⚠ Group deleted — requests will fail with 503; select another group or unbind")) + '</span>';
+      } else if (!gInfo || (gInfo.enabledAccounts || 0) === 0) {
+        box.style.display = "block";
+        box.innerHTML = '<span class="tag tag-warn">' + esc(tr("⚠ 当前分组内暂无已启用账号，请求将立即返回 503", "⚠ No enabled accounts in this group — requests will fail with 503")) + '</span>';
+      } else if ((gInfo.healthyAccounts || 0) === 0) {
+        box.style.display = "block";
+        box.innerHTML = '<span class="tag tag-warn">' + esc(tr("⚠ 当前分组内暂无健康可用账号（全冷却或耗尽）", "⚠ No healthy accounts currently available in this group")) + '</span>';
+      } else {
+        box.style.display = "none";
+        box.innerHTML = "";
+      }
+    }
+    if ($("ckGroupSelect")) {
+      $("ckGroupSelect").onchange = renderCkGroupWarn;
+    }
+
     $("openCreateCkModalBtn").onclick = async () => {
       if (modelsCatalogCache.length === 0) await loadModelsCatalog();
       editingCkId = null;
@@ -3893,6 +4545,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("ckTokenFieldWrap").style.display = "block";
       $("ckScopeSelect").value = "all";
       syncSelectUi($("ckScopeSelect"));
+      if ($("ckGroupSelect")) {
+        syncGroupDropdowns("");
+        renderCkGroupWarn();
+      }
       ckPickedModels.clear();
       modelsCatalogCache.filter((m) => m.enabled).forEach((m) => ckPickedModels.add(m.id));
       $("ckModelsPickerWrap").style.display = "none";
@@ -3913,6 +4569,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("ckTokenFieldWrap").style.display = "none";
       $("ckScopeSelect").value = found.allowAllModels ? "all" : "custom";
       syncSelectUi($("ckScopeSelect"));
+      if ($("ckGroupSelect")) {
+        syncGroupDropdowns(found.accountGroup || "");
+        renderCkGroupWarn();
+      }
       ckPickedModels.clear();
       (found.allowedModels || []).forEach((m) => ckPickedModels.add(m));
       $("ckModelsPickerWrap").style.display = found.allowAllModels ? "none" : "block";
@@ -3926,6 +4586,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const name = $("ckNameInput").value.trim() || tr("网关子密钥", "Sub-Key");
       const allowAllModels = $("ckScopeSelect").value === "all";
       const allowedModels = [...ckPickedModels];
+      const accountGroup = $("ckGroupSelect") ? ($("ckGroupSelect").value.trim() || null) : null;
       const maxReqRaw = $("ckMaxReqInput").value.trim();
       const maxRequests = maxReqRaw ? Number(maxReqRaw) : null;
       const maxConcRaw = $("ckMaxConcInput").value.trim();
@@ -3941,7 +4602,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (editingCkId) {
           await api("/v1/admin/client-keys/" + editingCkId, {
             method: "PATCH",
-            body: JSON.stringify({ name, allowAllModels, allowedModels, maxRequests, maxConcurrent, expiresAt })
+            body: JSON.stringify({ name, allowAllModels, allowedModels, accountGroup, maxRequests, maxConcurrent, expiresAt })
           });
           notify(tr("已保存密钥 「" + name + "」 的权限与有效期配置。", "Saved sub-key '" + name + "'."));
         } else {
@@ -3953,6 +4614,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               customToken: customToken || undefined,
               allowAllModels,
               allowedModels,
+              accountGroup,
               maxRequests,
               maxConcurrent,
               expiresAt
@@ -4148,6 +4810,23 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         notify(enabled ? tr("已启用该凭证。", "Credential enabled.") : tr("已停用该凭证。", "Credential disabled."));
         await loadConsoleData(enabled ? "?force=1" : "");
       } catch (e) { notify(e.message, true); await loadConsoleData(""); }
+    };
+
+    window.editGroup = async (slotId, cur) => {
+      const next = await openAssignGroupPicker({
+        title: tr("设置账号分组", "Assign Account Group"),
+        desc: tr("选择目标分组、移回未分组全局池，或直接新建分组。", "Choose a target group, move back to the global pool, or create a new group."),
+        currentGroup: cur || "",
+        okText: tr("保存分组", "Save"),
+      });
+      if (next === null) return;
+      try {
+        const targetGroup = next.trim() || null;
+        const r = await api("/v1/admin/keys/" + slotId, { method: "PATCH", body: JSON.stringify({ group: targetGroup }) });
+        if (Array.isArray(r.groups)) { accountGroupsCache = r.groups; syncGroupDropdowns(); }
+        notify(targetGroup ? tr("已归入分组「" + targetGroup + "」。", "Assigned to group '" + targetGroup + "'.") : tr("已移回未分组。", "Removed from group."));
+        await loadConsoleData("");
+      } catch (e) { notify(e.message, true); }
     };
 
     window.editLabel = async (slotId, cur) => {
@@ -5140,8 +5819,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         $("editRephrasePromptBtn").style.display = rephraseOn ? "inline-flex" : "none";
       }
       if ($("cfgContentFilterRephraseModel")) {
-        $("cfgContentFilterRephraseModel").style.display = rephraseOn ? "inline-block" : "none";
-        syncSelectUi($("cfgContentFilterRephraseModel"));
+        const repSel = $("cfgContentFilterRephraseModel");
+        if (repSel._cSelWrap) repSel._cSelWrap.style.display = rephraseOn ? "inline-flex" : "none";
+        else repSel.style.display = rephraseOn ? "inline-block" : "none";
+        syncSelectUi(repSel);
       }
     };
 
@@ -5219,6 +5900,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             incognitoMode: $("cfgIncognitoMode") ? $("cfgIncognitoMode").checked : true,
             autoEnsureCodingAgent: $("cfgAutoEnsureCodingAgent") ? $("cfgAutoEnsureCodingAgent").checked : true,
             customAgentPrompt: isBuiltInDefault ? "" : promptVal,
+            showRoutedModelInThinking: $("cfgShowRoutedModel")
+              ? $("cfgShowRoutedModel").value
+              : "true",
             sanitizeClientSystemPrompt: $("cfgSanitizeClientSystemPrompt")
               ? $("cfgSanitizeClientSystemPrompt").checked
               : false,
@@ -5237,6 +5921,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     };
 
     $("clearAffinityBtn").onclick = async () => {
+      const ok = await uiConfirm({
+        title: tr("清空粘性会话映射", "Clear Sticky Session Bindings"),
+        desc: tr("确认清空当前所有活跃会话的账号亲和绑定表吗？清空后进行中的多轮对话将在下一轮重新分配上游账号。", "Clear all active sticky session bindings? Ongoing multi-turn chats will be reassigned to a fresh account on their next turn."),
+        okText: tr("确认清空", "Clear Bindings"),
+        danger: true
+      });
+      if (!ok) return;
       try {
         await api("/v1/admin/affinity/clear", { method: "POST", body: "{}" });
         notify(tr("已清空活跃会话亲和绑定表。", "Active sticky session bindings cleared."));
@@ -5279,8 +5970,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       else if ($("syncAgentModal") && $("syncAgentModal").classList.contains("open")) closeSyncAgentModal();
       else if ($("promptEditorModal") && $("promptEditorModal").classList.contains("open")) closePromptEditor();
       else if ($("updateModal") && $("updateModal").classList.contains("open")) window.closeUpdateModal();
+      else if ($("assignGroupModal") && $("assignGroupModal").classList.contains("open")) window.closeAssignGroupModal(null);
+      else if ($("groupsModal") && $("groupsModal").classList.contains("open")) window.closeGroupsModal();
       else if ($("addModal").classList.contains("open")) window.closeAddModal();
       else if ($("clientKeyModal").classList.contains("open")) window.closeCkModal();
+      else { document.querySelectorAll(".act-dd.open").forEach((x) => x.classList.remove("open")); }
     });
 
     // CSP-safe event delegation (replaces inline onclick/onchange attributes).
@@ -5357,7 +6051,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           out.push('<div class="upd-md-h2">' + formatUpdateInlineMd(esc(h2[1])) + '</div>');
           continue;
         }
-        const h3 = /^###\\s+(.+)$/.exec(trimmed);
+        const h3 = /^#{3,4}\\s+(.+)$/.exec(trimmed);
         if (h3) {
           closeList();
           out.push('<div class="upd-md-h3">' + formatUpdateInlineMd(esc(h3[1])) + '</div>');
@@ -5427,6 +6121,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       }
       if (checkedStr) {
         heroHtml += '<span class="mono">' + esc(tr("检查于 ", "Checked ") + checkedStr) + '</span>';
+      }
+      if (!hasUpd && v.selfUpdate && v.selfUpdate.canApply && !v.selfUpdate.canRollback) {
+        heroHtml += '<span style="color:var(--ok);">' + esc(tr("· 已启用网页一键热更新", "· Web self-update ready")) + '</span>';
       }
       heroHtml += '</div></div>';
       parts.push(heroHtml);
@@ -5498,7 +6195,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           '<div class="upd-cmd-row"><span class="upd-cmd-tag">' + esc(tr("源码", "Source")) + '</span><code class="upd-cmd-code mono">' + esc(sourceCmd) + '</code>' +
             '<button type="button" class="btn-xs" id="copySourceUpgradeBtn">' + esc(tr("复制", "Copy")) + '</button></div>' +
         '</div>' +
-        '<div style="margin-top:8px;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--bg-soft);font-size:12px;line-height:1.55;color:var(--fg-muted);">' +
+        '<div style="margin-top:8px;padding:9px 11px;border-radius:8px;border:1px solid var(--border);background:var(--subtle);font-size:12px;line-height:1.55;color:var(--fg-muted);">' +
           '<strong style="color:var(--ok);">' + esc(tr("无损升级说明：", "Lossless Upgrade: ")) + '</strong>' +
           esc(tr("只要保留部署目录中的 ", "Keep ")) + '<code class="mono">.env</code>' + esc(tr(" 和 ", " and ")) + '<code class="mono">data/</code>' +
           esc(tr("，已导入账号、子密钥、用量账本和后台设置均会自动保留，无需重新配置（源码升级完成后重启服务即可）。从 v0.1.15 及更早 Docker 版本升级时，首次前执行一次 ", " intact—all imported accounts, sub-keys, usage ledger, and settings are preserved automatically (restart the service after a source build). Upgrading from Docker <= v0.1.15? Run ")) +
@@ -5619,20 +6316,29 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
 
       if ($("applySelfUpdateBtn")) {
-        $("applySelfUpdateBtn").onclick = () => {
-          const msg = tr(
-            "确认立即下载并更新至 v" + v.latestVersion + "？服务将在数据落盘后平滑重启（约 2–5 秒）。",
-            "Download and apply v" + v.latestVersion + " now? The gateway will flush state and restart (~2–5s)."
-          );
-          if (!window.confirm(msg)) return;
+        $("applySelfUpdateBtn").onclick = async () => {
+          const ok = await uiConfirm({
+            title: tr("确认一键热更新至 v" + v.latestVersion, "Apply Self-Update to v" + v.latestVersion),
+            desc: tr(
+              "确认立即下载并更新至 v" + v.latestVersion + " 吗？服务将在数据落盘后平滑重启（约 2–5 秒）。",
+              "Download and apply v" + v.latestVersion + " now? The gateway will flush state and restart (~2–5s)."
+            ),
+            okText: tr("立即更新", "Update Now")
+          });
+          if (!ok) return;
           void runSelfUpdateAction("/v1/admin/update/apply", v.latestVersion, $("applySelfUpdateBtn"), tr("正在下载并校验更新包...", "Downloading & verifying bundle..."));
         };
       }
       if ($("rollbackSelfUpdateBtn")) {
-        $("rollbackSelfUpdateBtn").onclick = () => {
+        $("rollbackSelfUpdateBtn").onclick = async () => {
           const rbTgt = (v.selfUpdate && (v.selfUpdate.previousVersion || v.selfUpdate.builtinVersion)) || "";
-          const msg = tr("确认回滚至 v" + rbTgt + " 并立即重启服务？", "Rollback to v" + rbTgt + " and restart now?");
-          if (!window.confirm(msg)) return;
+          const ok = await uiConfirm({
+            title: tr("回滚至 v" + rbTgt, "Rollback to v" + rbTgt),
+            desc: tr("确认回滚至 v" + rbTgt + " 并立即重启服务吗？", "Rollback to v" + rbTgt + " and restart the gateway now?"),
+            okText: tr("确认回滚", "Rollback"),
+            danger: true
+          });
+          if (!ok) return;
           void runSelfUpdateAction("/v1/admin/update/rollback", rbTgt, $("rollbackSelfUpdateBtn"), tr("正在准备回滚并重启...", "Preparing rollback & restart..."));
         };
       }

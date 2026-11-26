@@ -15,6 +15,23 @@ export interface CollectedTurnResult {
   metrics: TurnTokenMetrics;
 }
 
+function upgradeRoutedHeaderExact(thinking: string, actualModel: string): string {
+  const exactTag = `routed=${actualModel}`;
+  if (/^\[AWS Quick\] [^\n]*routed≈[^\s·\n]+/.test(thinking)) {
+    return thinking.replace(/^(\[AWS Quick\] [^\n]*)routed≈[^\s·\n]+/, (_, prefix: string) => `${prefix}${exactTag}`);
+  }
+  if (thinking.startsWith("[AWS Quick] ") && !/^\[AWS Quick\] [^\n]*routed=/.test(thinking)) {
+    const nlIdx = thinking.indexOf("\n");
+    const firstLine = nlIdx >= 0 ? thinking.slice(0, nlIdx) : thinking;
+    const rest = nlIdx >= 0 ? thinking.slice(nlIdx) : "";
+    const updatedFirst = firstLine.includes(" · rephrased")
+      ? firstLine.replace(" · rephrased", ` · ${exactTag} · rephrased`)
+      : `${firstLine} · ${exactTag}`;
+    return `${updatedFirst}${rest}`;
+  }
+  return thinking;
+}
+
 /**
  * Shared non-streaming event accumulator used across OpenAI Chat, OpenAI Responses, and Anthropic Messages.
  */
@@ -36,11 +53,21 @@ export async function collectTurnEvents(events: AsyncIterable<GatewayStreamEvent
       text = "";
       toolCalls = [];
       stopReason = "stop";
-    } else if (ev.type === "thinking") thinking += ev.text;
-    else if (ev.type === "text") text += ev.text;
+    } else if (ev.type === "thinking") {
+      if (ev.lateRoutingCorrection && ev.actualRoutedModel) {
+        const upgraded = upgradeRoutedHeaderExact(thinking, ev.actualRoutedModel);
+        thinking = upgraded !== thinking ? upgraded : `${thinking}${ev.text}`;
+      } else {
+        thinking += ev.text;
+      }
+    } else if (ev.type === "text") text += ev.text;
     else if (ev.type === "tool_calls") toolCalls = ev.calls;
-    else if (ev.type === "usage") metrics = ev.metrics;
-    else if (ev.type === "done") stopReason = ev.stopReason;
+    else if (ev.type === "usage") {
+      metrics = ev.metrics;
+      if (ev.metrics.resolvedModel) {
+        thinking = upgradeRoutedHeaderExact(thinking, ev.metrics.resolvedModel);
+      }
+    } else if (ev.type === "done") stopReason = ev.stopReason;
   }
 
   return { thinking, text, toolCalls, stopReason, metrics };

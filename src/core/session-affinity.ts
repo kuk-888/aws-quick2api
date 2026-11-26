@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { normalizeSystemPromptForHash } from "../utils/hash.js";
+import { normalizeSystemPromptForHash, normalizeUserTurnForHash } from "../utils/hash.js";
 
 export interface AffinityBindingView {
   conversationKey: string;
@@ -20,29 +20,6 @@ interface InternalAffinityRecord {
   boundAtMs: number;
   lastHitAtMs: number;
   expiresAtMs: number;
-}
-
-function stripSystemReminderTagsLinear(input: string): string {
-  const lower = input.toLowerCase();
-  const openTag = "<system-reminder>";
-  const closeTag = "</system-reminder>";
-  let out = "";
-  let pos = 0;
-  while (pos < input.length) {
-    const start = lower.indexOf(openTag, pos);
-    if (start < 0) {
-      out += input.slice(pos);
-      break;
-    }
-    out += input.slice(pos, start);
-    const end = lower.indexOf(closeTag, start + openTag.length);
-    if (end < 0) {
-      out += input.slice(start);
-      break;
-    }
-    pos = end + closeTag.length;
-  }
-  return out;
 }
 
 function shortHash(prefix: string, raw: string): string {
@@ -92,12 +69,11 @@ export function deriveConversationAffinityKey(params: {
       }
     }
     if (typeof meta.user_id === "string" && meta.user_id.trim()) {
-      // Combine `metadata.user_id` with the first user turn anchor (stripping Claude Code
-      // `<system-reminder>` wrappers and omitting volatile systemPrompt) so multi-turn chats
-      // keep 100% warm_incremental stickiness while separate windows and parallel subagents rotate.
+      // Combine `metadata.user_id` with the first user turn anchor (stripping volatile IDE metadata
+      // envelopes and timestamps) so multi-turn chats keep 100% warm_incremental stickiness while
+      // separate windows and parallel subagents rotate cleanly.
       const rawFirst = (firstUserText || "").trim();
-      const strippedFirst = stripSystemReminderTagsLinear(rawFirst).trim();
-      const effectiveFirst = strippedFirst || rawFirst;
+      const effectiveFirst = normalizeUserTurnForHash(rawFirst) || rawFirst;
       if (effectiveFirst) {
         return shortHash("meta", `${meta.user_id.trim()}\0${effectiveFirst.slice(0, 1024)}`);
       }
@@ -107,17 +83,16 @@ export function deriveConversationAffinityKey(params: {
 
   if (typeof rawBody.user === "string" && rawBody.user.trim()) {
     // Combine `user` + first message anchor so one user's separate chat windows don't collide unnecessarily,
-    // while keeping the same chat window 100% sticky even when clients mutate dynamic system prompts or `<system-reminder>` blocks.
+    // while keeping the same chat window 100% sticky even when clients mutate dynamic system prompts or IDE metadata.
     const rawFirst = (firstUserText || "").trim();
-    const strippedFirst = stripSystemReminderTagsLinear(rawFirst).trim();
-    const trimmedFirst = strippedFirst || rawFirst;
+    const trimmedFirst = normalizeUserTurnForHash(rawFirst) || rawFirst;
     const sysAnchor = trimmedFirst.length >= 16 ? "" : normalizeSystemPromptForHash(systemPrompt || "").slice(0, 512);
     const anchor = `${rawBody.user.trim()}\0${sysAnchor}\0${trimmedFirst.slice(0, 1024)}`;
     return shortHash("usr", anchor);
   }
 
   const rawFirstImplicit = (firstUserText || "").trim();
-  const strippedFirstImplicit = stripSystemReminderTagsLinear(rawFirstImplicit).trim();
+  const strippedFirstImplicit = normalizeUserTurnForHash(rawFirstImplicit);
   const trimmedFirst = strippedFirstImplicit || rawFirstImplicit;
   if (trimmedFirst) {
     // When the first user message is substantive (>= 16 chars), anchor on it alone so dynamic

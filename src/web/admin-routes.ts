@@ -18,8 +18,13 @@ import {
   DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
   type QuickExecutionEngine,
 } from "../core/engine.js";
-import type { PoolRoutingSettings, UpstreamKeyPool } from "../core/key-pool.js";
-import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "../core/types.js";
+import { normalizeAccountGroup, type PoolRoutingSettings, type UpstreamKeyPool } from "../core/key-pool.js";
+import {
+  GatewayError,
+  parseRoutedModelThinkingMode,
+  type GatewayConfig,
+  type GatewayStreamEvent,
+} from "../core/types.js";
 import { isRecord } from "../protocols/common.js";
 import { openAiChatAdapter } from "../protocols/openai.js";
 import type { ClientGatewayKeyManager } from "../services/client-keys.js";
@@ -242,6 +247,7 @@ export async function tryHandleWebAdminRoute(
       ...ctx.usageLedger.overview(range),
       ipRecorded: config.recordClientIp !== false,
       ...(persistenceError ? { storageWarning: persistenceError } : {}),
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
       keyPool: keyPool.statusSnapshot()
     });
     return true;
@@ -260,6 +266,7 @@ export async function tryHandleWebAdminRoute(
         defaultContentFilterRephraseModel: DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
       },
       runtime: engine.runtimeStats(),
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
       keyPool: keyPool.statusSnapshot(),
       affinities: keyPool.affinitySnapshot()
     });
@@ -284,8 +291,14 @@ export async function tryHandleWebAdminRoute(
     sendJson(res, 200, {
       object: "aws_quick.quota",
       accounts,
-      settings: keyPool.getSettings(),
+      settings: {
+        ...keyPool.getSettings(),
+        defaultCustomAgentPrompt: DEFAULT_CODING_AGENT_INSTRUCTIONS,
+        defaultContentFilterRephrasePrompt: DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+        defaultContentFilterRephraseModel: DEFAULT_CONTENT_FILTER_REPHRASE_MODEL,
+      },
       runtime: engine.runtimeStats(),
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
       keyPool: keyPool.statusSnapshot(),
       affinities: keyPool.affinitySnapshot(),
       gatewaySessionUsage: usageTracker.snapshot()
@@ -313,29 +326,51 @@ export async function tryHandleWebAdminRoute(
     if (typeof body.autoDisableExhaustedKeys === "boolean") patch.autoDisableExhaustedKeys = body.autoDisableExhaustedKeys;
     if (typeof body.incognitoMode === "boolean") {
       patch.incognitoMode = body.incognitoMode;
-      config.incognitoMode = body.incognitoMode;
     }
     if (typeof body.autoEnsureCodingAgent === "boolean") {
       patch.autoEnsureCodingAgent = body.autoEnsureCodingAgent;
-      config.autoEnsureCodingAgent = body.autoEnsureCodingAgent;
     }
     if (typeof body.customAgentPrompt === "string") {
       patch.customAgentPrompt = body.customAgentPrompt;
     }
     if (typeof body.sanitizeClientSystemPrompt === "boolean") {
       patch.sanitizeClientSystemPrompt = body.sanitizeClientSystemPrompt;
-      config.sanitizeClientSystemPrompt = body.sanitizeClientSystemPrompt;
+    }
+    if (body.showRoutedModelInThinking !== undefined) {
+      if (typeof body.showRoutedModelInThinking === "boolean") {
+        patch.showRoutedModelInThinking = parseRoutedModelThinkingMode(body.showRoutedModelInThinking);
+      } else if (typeof body.showRoutedModelInThinking === "string") {
+        const rawMode = body.showRoutedModelInThinking.trim().toLowerCase();
+        if (
+          rawMode !== "true" &&
+          rawMode !== "auto" &&
+          rawMode !== "always" &&
+          rawMode !== "false" &&
+          rawMode !== "off"
+        ) {
+          throw new GatewayError(
+            "Invalid `showRoutedModelInThinking` value (expected 'true', 'always', or 'false').",
+            400,
+            "invalid_request_error",
+          );
+        }
+        patch.showRoutedModelInThinking = parseRoutedModelThinkingMode(rawMode);
+      } else {
+        throw new GatewayError(
+          "Invalid `showRoutedModelInThinking` value (expected 'true', 'always', or 'false').",
+          400,
+          "invalid_request_error",
+        );
+      }
     }
     if (typeof body.autoRephraseOnContentFilter === "boolean") {
       patch.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
-      config.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
     }
     if (typeof body.contentFilterRephrasePrompt === "string") {
       patch.contentFilterRephrasePrompt = body.contentFilterRephrasePrompt;
     }
     if (body.contentFilterRephraseModel === "quick-fast" || body.contentFilterRephraseModel === "quick-balanced") {
       patch.contentFilterRephraseModel = body.contentFilterRephraseModel;
-      config.contentFilterRephraseModel = body.contentFilterRephraseModel;
     }
     if (typeof body.chatAgentId === "string") {
       patch.chatAgentId = body.chatAgentId;
@@ -343,9 +378,12 @@ export async function tryHandleWebAdminRoute(
     const prevSettings = keyPool.getSettings();
     keyPool.updateSettings(patch);
     const nextSettings = keyPool.getSettings();
+    config.incognitoMode = nextSettings.incognitoMode;
+    config.autoEnsureCodingAgent = nextSettings.autoEnsureCodingAgent;
     config.chatAgentId = nextSettings.chatAgentId;
     config.customAgentPrompt = nextSettings.customAgentPrompt;
     config.sanitizeClientSystemPrompt = nextSettings.sanitizeClientSystemPrompt;
+    config.showRoutedModelInThinking = nextSettings.showRoutedModelInThinking;
     config.autoRephraseOnContentFilter = nextSettings.autoRephraseOnContentFilter;
     config.contentFilterRephrasePrompt = nextSettings.contentFilterRephrasePrompt;
     config.contentFilterRephraseModel = nextSettings.contentFilterRephraseModel;
@@ -435,9 +473,82 @@ export async function tryHandleWebAdminRoute(
     return true;
   }
 
+  // 7.5 Account Groups (Issue #9: single-instance pool isolation)
+  if (route === "/v1/admin/groups" && req.method === "GET") {
+    sendJson(res, 200, { ok: true, groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()) });
+    return true;
+  }
+
+  if (route === "/v1/admin/groups" && req.method === "POST") {
+    const body = await readJsonBody(req, config.maxBodyBytes);
+    if (!isRecord(body) || typeof body.name !== "string") {
+      throw new GatewayError("`name` string required.", 400, "invalid_request_error");
+    }
+    const name = keyPool.createGroup(body.name);
+    sendJson(res, 200, {
+      ok: true,
+      name,
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+    });
+    return true;
+  }
+
+  const adminGroupMatch = /^\/v1\/admin\/groups\/([^/]+)$/.exec(route);
+  if (adminGroupMatch) {
+    let rawGroupName: string;
+    try {
+      rawGroupName = decodeURIComponent(adminGroupMatch[1]!);
+    } catch {
+      throw new GatewayError("Invalid URL-encoded group name.", 400, "invalid_account_group");
+    }
+    if (req.method === "PATCH") {
+      const body = await readJsonBody(req, config.maxBodyBytes);
+      if (!isRecord(body) || typeof body.name !== "string") {
+        throw new GatewayError("`name` string required.", 400, "invalid_request_error");
+      }
+      const boundGroups = new Set(clientKeys.countByAccountGroup().keys());
+      const renamed = keyPool.renameGroup(rawGroupName, body.name, boundGroups);
+      let updatedKeys = 0;
+      try {
+        updatedKeys = clientKeys.renameAccountGroup(renamed.oldName, renamed.newName);
+      } catch (err) {
+        if (renamed.oldName !== renamed.newName) {
+          try {
+            keyPool.renameGroup(renamed.newName, renamed.oldName);
+          } catch {
+            // Best-effort rollback if pool state cannot be reverted
+          }
+        }
+        throw err;
+      }
+      sendJson(res, 200, {
+        ok: true,
+        ...renamed,
+        updatedKeys,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+        clientKeys: clientKeys.listKeys(),
+      });
+      return true;
+    }
+    if (req.method === "DELETE") {
+      const deleted = keyPool.deleteGroup(rawGroupName);
+      sendJson(res, 200, {
+        ok: true,
+        ...deleted,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+      });
+      return true;
+    }
+  }
+
   // 8. Client Gateway Sub-Keys
   if (route === "/v1/admin/client-keys" && req.method === "GET") {
-    sendJson(res, 200, { clientKeys: clientKeys.listKeys() });
+    sendJson(res, 200, {
+      clientKeys: clientKeys.listKeys(),
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+    });
     return true;
   }
 
@@ -453,11 +564,26 @@ export async function tryHandleWebAdminRoute(
       allowedModels: Array.isArray(body.allowedModels)
         ? body.allowedModels.filter((x): x is string => typeof x === "string")
         : [],
+      accountGroup:
+        body.accountGroup === null
+          ? null
+          : typeof body.accountGroup === "string"
+            ? body.accountGroup
+            : undefined,
       maxRequests: body.maxRequests,
       maxConcurrent: body.maxConcurrent,
       expiresAt: body.expiresAt
     });
-    sendJson(res, 200, { ok: true, key: view, rawToken, clientKeys: clientKeys.listKeys() });
+    if (view.accountGroup) {
+      keyPool.createGroup(view.accountGroup);
+    }
+    sendJson(res, 200, {
+      ok: true,
+      key: view,
+      rawToken,
+      clientKeys: clientKeys.listKeys(),
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+    });
     return true;
   }
 
@@ -473,12 +599,18 @@ export async function tryHandleWebAdminRoute(
     const keyId = clientKeyMatch[1]!;
     if (req.method === "DELETE") {
       const { source } = clientKeys.deleteKey(keyId);
-      sendJson(res, 200, { ok: true, source, clientKeys: clientKeys.listKeys() });
+      sendJson(res, 200, {
+        ok: true,
+        source,
+        clientKeys: clientKeys.listKeys(),
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      });
       return true;
     }
     if (req.method === "PATCH") {
       const body = await readJsonBody(req, config.maxBodyBytes);
       if (!isRecord(body)) throw new GatewayError("JSON object expected.", 400, "invalid_request_error");
+      const prevGroup = clientKeys.listKeys().find((k) => k.id === keyId)?.accountGroup ?? null;
       const updated = clientKeys.updateKey(keyId, {
         ...(typeof body.name === "string" ? { name: body.name } : {}),
         ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
@@ -486,12 +618,23 @@ export async function tryHandleWebAdminRoute(
         ...(Array.isArray(body.allowedModels)
           ? { allowedModels: body.allowedModels.filter((x): x is string => typeof x === "string") }
           : {}),
+        ...(body.accountGroup === null || typeof body.accountGroup === "string"
+          ? { accountGroup: body.accountGroup }
+          : {}),
         ...(body.maxRequests !== undefined ? { maxRequests: body.maxRequests } : {}),
         ...(body.maxConcurrent !== undefined ? { maxConcurrent: body.maxConcurrent } : {}),
         ...(body.expiresAt !== undefined ? { expiresAt: body.expiresAt } : {}),
         ...(body.resetRequests === true ? { resetRequests: true } : {})
       });
-      sendJson(res, 200, { ok: true, key: updated, clientKeys: clientKeys.listKeys() });
+      if (typeof body.accountGroup === "string" && updated.accountGroup && updated.accountGroup !== prevGroup) {
+        keyPool.createGroup(updated.accountGroup);
+      }
+      sendJson(res, 200, {
+        ok: true,
+        key: updated,
+        clientKeys: clientKeys.listKeys(),
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      });
       return true;
     }
   }
@@ -554,12 +697,18 @@ export async function tryHandleWebAdminRoute(
     const label = typeof body.label === "string" ? body.label : undefined;
     const proxyUrl = typeof body.proxyUrl === "string" ? body.proxyUrl : undefined;
     const chatAgentId = typeof body.chatAgentId === "string" ? body.chatAgentId : undefined;
-    const slot = keyPool.addKey(body.apiKey, enabled, label, proxyUrl, chatAgentId);
+    const group = body.group === null ? null : typeof body.group === "string" ? body.group : undefined;
+    const slot = keyPool.addKey(body.apiKey, enabled, label, proxyUrl, chatAgentId, group);
     if (enabled) {
       await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
       scheduleEagerEnsureAgents([slot.slotId]);
     }
-    sendJson(res, 200, { ok: true, slot, keyPool: keyPool.statusSnapshot() });
+    sendJson(res, 200, {
+      ok: true,
+      slot,
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -579,6 +728,7 @@ export async function tryHandleWebAdminRoute(
         apiKey: k.rawKey,
         enabled: k.enabled,
         ...(k.label ? { label: k.label } : {}),
+        ...(k.group ? { group: k.group } : {}),
         ...(k.proxyUrl ? { proxyUrl: k.proxyUrl } : {}),
         ...(k.chatAgentId ? { chatAgentId: k.chatAgentId } : {}),
       })),
@@ -606,6 +756,7 @@ export async function tryHandleWebAdminRoute(
         typeof item.label === "string" ? item.label : undefined,
         typeof item.proxyUrl === "string" ? item.proxyUrl : undefined,
         typeof item.chatAgentId === "string" ? item.chatAgentId : undefined,
+        typeof item.group === "string" ? item.group : undefined,
       );
       if (added.enabled && !added.chatAgentId) importedSlotIds.push(added.slotId);
       imported += 1;
@@ -615,7 +766,12 @@ export async function tryHandleWebAdminRoute(
     }
     await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
     scheduleEagerEnsureAgents(importedSlotIds);
-    sendJson(res, 200, { ok: true, imported, keyPool: keyPool.statusSnapshot() });
+    sendJson(res, 200, {
+      ok: true,
+      imported,
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -625,10 +781,33 @@ export async function tryHandleWebAdminRoute(
       throw new GatewayError("`action` and `slotIds` array required.", 400, "invalid_request_error");
     }
     const action = body.action;
-    if (action !== "enable" && action !== "disable" && action !== "delete" && action !== "recheck") {
+    if (action !== "enable" && action !== "disable" && action !== "delete" && action !== "recheck" && action !== "set-group") {
       throw new GatewayError("Unsupported batch action.", 400, "invalid_request_error");
     }
     const ids = body.slotIds.filter((x): x is string => typeof x === "string");
+    if (action === "set-group") {
+      if (body.group !== null && typeof body.group !== "string") {
+        throw new GatewayError("`group` must be a string or null.", 400, "invalid_account_group");
+      }
+      const normalizedTarget = normalizeAccountGroup(body.group) ?? null;
+      let affected = 0;
+      for (const id of ids) {
+        try {
+          keyPool.updateSlotMeta(id, { group: normalizedTarget });
+          affected += 1;
+        } catch (err) {
+          if (err instanceof GatewayError && err.code === "invalid_account_group") throw err;
+          // skip missing slotId
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        affected,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+      });
+      return true;
+    }
     if (action === "recheck") {
       const validIds: string[] = [];
       for (const id of ids) {
@@ -659,7 +838,15 @@ export async function tryHandleWebAdminRoute(
       const checked = snap.filter((s) => validIds.includes(s.slotId));
       const okCount = checked.filter((s) => s.enabled && !s.lastSyncError).length;
       const failedCount = checked.length - okCount;
-      sendJson(res, 200, { ok: true, affected: validIds.length, okCount, failedCount, reports, keyPool: snap });
+      sendJson(res, 200, {
+        ok: true,
+        affected: validIds.length,
+        okCount,
+        failedCount,
+        reports,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: snap,
+      });
       return true;
     }
     let affected = 0;
@@ -680,7 +867,12 @@ export async function tryHandleWebAdminRoute(
     if (action === "enable" && affected > 0) {
       await ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
     }
-    sendJson(res, 200, { ok: true, affected, keyPool: keyPool.statusSnapshot() });
+    sendJson(res, 200, {
+      ok: true,
+      affected,
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -897,7 +1089,13 @@ export async function tryHandleWebAdminRoute(
       );
     }
     const status = keyPool.statusSnapshot().find((s) => s.slotId === slotId);
-    sendJson(res, 200, { ok: true, recovered: Boolean(status?.enabled), slot: status, keyPool: keyPool.statusSnapshot() });
+    sendJson(res, 200, {
+      ok: true,
+      recovered: Boolean(status?.enabled),
+      slot: status,
+      groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -1153,7 +1351,11 @@ export async function tryHandleWebAdminRoute(
     if (req.method === "DELETE") {
       keyPool.removeKey(slotId);
       engine.invalidateWarmSessionsForSlot(slotId);
-      sendJson(res, 200, { ok: true, keyPool: keyPool.statusSnapshot() });
+      sendJson(res, 200, {
+        ok: true,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+      });
       return true;
     }
     if (req.method === "PATCH") {
@@ -1163,6 +1365,7 @@ export async function tryHandleWebAdminRoute(
       keyPool.updateSlotMeta(slotId, {
         ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
         ...(typeof body.label === "string" ? { label: body.label } : {}),
+        ...(body.group === null || typeof body.group === "string" ? { group: body.group } : {}),
         ...(typeof body.proxyUrl === "string" ? { proxyUrl: body.proxyUrl } : {}),
         ...(typeof body.chatAgentId === "string" ? { chatAgentId: body.chatAgentId } : {}),
         ...(body.clearCooldown === true ? { clearCooldown: true } : {})
@@ -1173,11 +1376,16 @@ export async function tryHandleWebAdminRoute(
         !after ||
         (before.chatAgentId || "") !== (after.chatAgentId || "") ||
         (before.proxyUrl || "") !== (after.proxyUrl || "") ||
+        (before.group || "") !== (after.group || "") ||
         (before.enabled && !after.enabled)
       ) {
         engine.invalidateWarmSessionsForSlot(slotId);
       }
-      sendJson(res, 200, { ok: true, keyPool: keyPool.statusSnapshot() });
+      sendJson(res, 200, {
+        ok: true,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+      });
       return true;
     }
   }

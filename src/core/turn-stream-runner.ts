@@ -18,8 +18,10 @@ import { buildOutboundChatFrame, type OutboundEditBranch } from "./turn-frame-bu
 import { TurnProtocolTracker } from "./turn-protocol-state.js";
 import {
   GatewayError,
+  parseRoutedModelThinkingMode,
   type GatewayStreamEvent,
   type ParsedProtocolTurn,
+  type RoutedModelThinkingMode,
 } from "./types.js";
 import type { StreamingUiTagSanitizer } from "./ui-tag-sanitizer.js";
 import {
@@ -43,6 +45,8 @@ export interface ContentFilterCaptureContext {
   activePromptText: string;
   preserveContextPrefix?: string;
 }
+
+export { parseRoutedModelThinkingMode, type RoutedModelThinkingMode };
 
 export interface RunTurnStreamParams {
   ws: WebSocket;
@@ -89,7 +93,10 @@ export interface RunTurnStreamParams {
   onContentFilterCapture?: (ctx: ContentFilterCaptureContext) => void;
   runMaxTimeoutMs: number;
   runIdleTimeoutMs: number;
-  showRoutedModelInThinking: boolean;
+  showRoutedModelInThinking: boolean | RoutedModelThinkingMode;
+  /** Most recently observed upstream resolved model for this slot/agentMode (real `turn_usage` telemetry). */
+  observedModelHint?: string;
+  onResolvedModel?: (modelId: string) => void;
   webSearchEnabled: boolean;
   usageTracker: UsageTracker;
   warmPool: WarmSessionPool;
@@ -143,6 +150,8 @@ export async function* runTurnStream(
     runMaxTimeoutMs,
     runIdleTimeoutMs,
     showRoutedModelInThinking,
+    observedModelHint,
+    onResolvedModel,
     webSearchEnabled,
     usageTracker,
     warmPool,
@@ -183,11 +192,10 @@ export async function* runTurnStream(
 
   const timer = setTimeout(() => {
     if (!ended) {
+      clearAllStreamTimers();
       ended = true;
       push({ type: "__error", error: new GatewayError("AWS Quick stream timed out", 504, "timeout_error") });
-      try {
-        ws.close();
-      } catch { }
+      safeCloseWs();
     }
   }, (runMaxTimeoutMs || 120_000) + Math.max(0, totalChunks - 1) * 50_000);
 
@@ -250,7 +258,7 @@ export async function* runTurnStream(
 
   let deferredGraceClose = false;
   const safeCloseWs = () => {
-    ws.on("error", () => {});
+    ws.on("error", () => { });
     try {
       ws.close();
     } catch { }
@@ -277,7 +285,7 @@ export async function* runTurnStream(
         ws.off("message", onWsMessage);
         ws.off("error", onWsError);
         ws.off("close", onWsClose);
-        ws.on("error", () => {});
+        ws.on("error", () => { });
         const graceClose = setTimeout(() => {
           try {
             ws.close();
@@ -298,6 +306,9 @@ export async function* runTurnStream(
 
   let recvBuf = Buffer.alloc(0);
   let emittedRoutedModel = false;
+  let emittedRoutedThinkingToClient = false;
+  let emittedRoutedModelName: string | undefined;
+  let emittedRoutedExact = false;
   let hasEmittedText = false;
   let assistantOutputText = "";
   let usageLimitPrefixBuf = "";
@@ -307,8 +318,10 @@ export async function* runTurnStream(
   let wsHandedOff = false;
   let lastSentMessageId: string | undefined;
   let pendingRoutedThinking: string | null = null;
+  let pendingLateRoutingCorrection: string | null = null;
   let sawRealThinking = false;
   let usageRecordedForTurn = false;
+  const routedThinkingMode: RoutedModelThinkingMode = parseRoutedModelThinkingMode(showRoutedModelInThinking);
 
   const abortPseudo200QuotaLimit = () => {
     clearAllStreamTimers();
@@ -326,6 +339,7 @@ export async function* runTurnStream(
     if (pendingRoutedThinking) {
       const text = pendingRoutedThinking;
       pendingRoutedThinking = null;
+      emittedRoutedThinkingToClient = true;
       push({ type: "thinking", text });
     }
   };
@@ -399,6 +413,7 @@ export async function* runTurnStream(
     let stopReason: "stop" | "tool_calls" = "stop";
     let emittedToolCalls: Array<{ id: string; name: string }> = [];
     let pendingToolCalls: import("./types.js").NormalizedToolCall[] = [];
+    let trimmedParallelToolCalls = false;
     if (toolFilter) {
       const { remainingText, toolCalls } = toolFilter.flush();
       const cleanRem = remainingText ? uiTagSanitizer.feed(remainingText) : remainingText;
@@ -415,7 +430,10 @@ export async function* runTurnStream(
         const singleToolOnly =
           turn.rawBody?.parallel_tool_calls === false ||
           rawToolChoiceObj?.disable_parallel_tool_use === true;
-        const effectiveCalls = singleToolOnly && toolCalls.length > 1 ? toolCalls.slice(0, 1) : toolCalls;
+        if (singleToolOnly && toolCalls.length > 1) {
+          trimmedParallelToolCalls = true;
+        }
+        const effectiveCalls = trimmedParallelToolCalls ? toolCalls.slice(0, 1) : toolCalls;
         pendingToolCalls = effectiveCalls;
         emittedToolCalls = effectiveCalls.map((tc) => {
           const matchedTool = turn.tools.find((t) => t.name === tc.name || t.wireName === tc.name);
@@ -430,6 +448,16 @@ export async function* runTurnStream(
       assistantOutputText += tailText;
       push({ type: "text", text: tailText });
     }
+    if (pendingLateRoutingCorrection) {
+      const corrected = pendingLateRoutingCorrection;
+      pendingLateRoutingCorrection = null;
+      push({
+        type: "thinking",
+        text: `\n[AWS Quick] actual_routed=${corrected}\n`,
+        lateRoutingCorrection: true,
+        actualRoutedModel: corrected,
+      });
+    }
     if (pendingToolCalls.length > 0) {
       push({ type: "tool_calls", calls: pendingToolCalls });
     }
@@ -440,7 +468,15 @@ export async function* runTurnStream(
     const nearUpstreamContextLimit =
       proto.getMaxContextPercent() >= 80 ||
       proto.getMaxTotalTokens() >= Math.floor(effectiveContextWindow * 0.8);
-    if (turn.currentInputPrefixHash && !isLikelySoftRefusal(assistantOutputText) && !nearUpstreamContextLimit) {
+    // When `parallel_tool_calls: false` / `disable_parallel_tool_use: true` trimmed extra tool calls,
+    // skip parking this thread so Turn 2 replays the exact single-tool history instead of diverging
+    // from the upstream thread (which still remembers attempting the dropped parallel tool call).
+    if (
+      turn.currentInputPrefixHash &&
+      !trimmedParallelToolCalls &&
+      !isLikelySoftRefusal(assistantOutputText) &&
+      !nearUpstreamContextLimit
+    ) {
       const nextHashes: string[] = [];
       if (stopReason === "stop" && assistantOutputText.trim().length > 0) {
         nextHashes.push(extendHashWithAssistantTurn(turn.currentInputPrefixHash, assistantOutputText));
@@ -520,7 +556,11 @@ export async function* runTurnStream(
       isIncognito,
       ...(editBranch && totalChunks === 1 && isFinal ? { editBranch } : {}),
     });
-    ws.send(encodeFrame(frame));
+    try {
+      ws.send(encodeFrame(frame));
+    } catch (sendErr) {
+      onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+    }
   };
 
   const triggerInitialSend = () => {
@@ -535,7 +575,10 @@ export async function* runTurnStream(
 
   let missedPongs = 0;
   let thinkingOnlyStartedAt = 0;
-  const maxThinkingOnlyMs = runIdleTimeoutMs > 0 ? Math.min(runIdleTimeoutMs, 300_000) : 300_000;
+  // Cap single-segment continuous thinking-only loops at `runIdleTimeoutMs` (default 10 min;
+  // reset on every thinking_complete / tool_progress / tool_arguments / tool_result / text_delta),
+  // giving `effort=max` deep reasoning full headroom while still bounding infinite thinking loops.
+  const maxThinkingOnlyMs = runIdleTimeoutMs > 0 ? runIdleTimeoutMs : 600_000;
   const onWsPong = () => {
     missedPongs = 0;
   };
@@ -581,6 +624,7 @@ export async function* runTurnStream(
   };
 
   const onWsMessage = (data: Buffer) => {
+    if (ended) return;
     missedPongs = 0;
     let drainedMessages;
     try {
@@ -599,6 +643,7 @@ export async function* runTurnStream(
     }
 
     for (const esMsg of drainedMessages) {
+      if (ended) break;
       let decoded;
       try {
         decoded = decodeFrame(esMsg);
@@ -712,29 +757,48 @@ export async function* runTurnStream(
         turn.rawBody?.output_config && typeof turn.rawBody.output_config === "object"
           ? (turn.rawBody.output_config as { effort?: unknown })
           : undefined;
+      const isOffToken = (v: unknown): boolean => {
+        if (typeof v !== "string") return false;
+        const k = v.trim().toLowerCase();
+        return k === "none" || k === "off" || k === "disabled" || k === "false";
+      };
       const explicitThinkingDisabled =
-        rawThinkingObj?.type === "disabled" ||
+        isOffToken(rawThinkingObj?.type) ||
         turn.rawBody?.enable_thinking === false ||
-        turn.rawBody?.reasoning_effort === "none" ||
-        turn.rawBody?.reasoning_effort === "off" ||
-        turn.rawBody?.effort === "none" ||
-        turn.rawBody?.effort === "off" ||
-        rawReasoningObj?.effort === "none" ||
-        rawReasoningObj?.effort === "off" ||
-        rawOutputCfgObj?.effort === "none" ||
-        rawOutputCfgObj?.effort === "off";
-      const canEmitRoutedThinking = () =>
-        showRoutedModelInThinking && !explicitThinkingDisabled && !emittedRoutedModel && !hasEmittedText;
-      const emitOrDeferRoutedThinking = (modelName: string) => {
-        emittedRoutedModel = true;
+        isOffToken(turn.rawBody?.reasoning_effort) ||
+        isOffToken(turn.rawBody?.effort) ||
+        isOffToken(rawReasoningObj?.effort) ||
+        isOffToken(rawOutputCfgObj?.effort);
+      const canEmitRoutedThinking = (hasRealThinkingDelta = false) =>
+        !isInternalHelperCall &&
+        routedThinkingMode !== "false" &&
+        (routedThinkingMode === "always" ||
+          (!explicitThinkingDisabled &&
+            (selection.thinkingEffort !== "off" || hasRealThinkingDelta || isRephraseRetry))) &&
+        !emittedRoutedModel &&
+        !hasEmittedText;
+      const formatRoutedHeaderLine = (modelName?: string, isExact = true) => {
         const rephraseTag = isRephraseRetry ? " · rephrased" : "";
-        const line = `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort} · routed=${modelName}${rephraseTag}\n`;
+        const routedPart = modelName
+          ? (isExact ? ` · routed=${modelName}` : ` · routed≈${modelName}`)
+          : "";
+        return `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort}${routedPart}${rephraseTag}\n`;
+      };
+      const emitOrDeferRoutedThinking = (modelName?: string, isExact = true) => {
+        emittedRoutedModel = true;
+        emittedRoutedModelName = modelName || undefined;
+        emittedRoutedExact = Boolean(modelName && isExact);
+        const line = formatRoutedHeaderLine(modelName, isExact);
         if (!usageLimitChecked) pendingRoutedThinking = line;
-        else push({ type: "thinking", text: line });
+        else {
+          emittedRoutedThinkingToClient = true;
+          push({ type: "thinking", text: line });
+        }
       };
 
       const rearmPostUsageIfNeeded = () => {
         if (proto.hasUsage() && !proto.hasActiveCloudTools()) {
+          clearPostUsageTimer();
           const usageThreadId = String(ev.thread_id || threadId);
           postUsageTimer = setTimeout(() => finalizeTurn(usageThreadId, false), 20_000);
           postUsageTimer.unref?.();
@@ -758,6 +822,7 @@ export async function* runTurnStream(
       }
       if (evType === "thinking_complete") {
         clearPostUsageTimer();
+        thinkingOnlyStartedAt = 0;
         touchIdleTimer();
         proto.onThinkingComplete();
         rearmPostUsageIfNeeded();
@@ -775,11 +840,13 @@ export async function* runTurnStream(
       }
       if (evType === "tool_progress" || evType === "tool_arguments") {
         clearPostUsageTimer();
+        thinkingOnlyStartedAt = 0;
         touchIdleTimer();
         continue;
       }
       if (evType === "tool_result") {
         clearPostUsageTimer();
+        thinkingOnlyStartedAt = 0;
         touchIdleTimer();
         proto.onCloudToolResult(
           typeof payload.tool_id === "string" ? payload.tool_id : undefined,
@@ -795,45 +862,65 @@ export async function* runTurnStream(
         if (routed) {
           resolvedModelId = routed;
           proto.setResolvedModel(routed);
-          if (canEmitRoutedThinking()) emitOrDeferRoutedThinking(routed);
+          onResolvedModel?.(routed);
+          if (canEmitRoutedThinking()) emitOrDeferRoutedThinking(routed, true);
         }
       } else if (evType === "text_delta") {
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
-        touchIdleTimer();
         const delta = String(payload.delta || "");
         if (delta) {
+          touchIdleTimer();
           const afterTools = toolFilter ? toolFilter.feed(delta) : delta;
           const emitText = afterTools ? uiTagSanitizer.feed(afterTools) : afterTools;
-          if (emitText) emitGuardedText(emitText);
+          if (emitText) {
+            if (canEmitRoutedThinking()) {
+              if (resolvedModelId) emitOrDeferRoutedThinking(resolvedModelId, true);
+              else if (observedModelHint) emitOrDeferRoutedThinking(observedModelHint, false);
+              else emitOrDeferRoutedThinking(undefined, false);
+            }
+            emitGuardedText(emitText);
+          }
         }
         rearmPostUsageIfNeeded();
       } else if (evType === "thinking_delta") {
         clearPostUsageTimer();
-        if (!thinkingOnlyStartedAt) thinkingOnlyStartedAt = Date.now();
-        if (Date.now() - thinkingOnlyStartedAt > maxThinkingOnlyMs) {
-          clearAllStreamTimers();
-          ended = true;
-          push({ type: "__error", error: new GatewayError("AWS Quick thinking stream stalled without producing output.", 504, "timeout_error") });
-          try {
-            ws.terminate();
-          } catch { }
-          return;
-        }
-        touchIdleTimer();
         const delta = String(payload.delta || "");
         if (delta) {
+          touchIdleTimer();
+          if (!thinkingOnlyStartedAt) thinkingOnlyStartedAt = Date.now();
+          if (Date.now() - thinkingOnlyStartedAt > maxThinkingOnlyMs) {
+            clearAllStreamTimers();
+            ended = true;
+            push({ type: "__error", error: new GatewayError("AWS Quick thinking stream stalled without producing output.", 504, "timeout_error") });
+            try {
+              ws.terminate();
+            } catch { }
+            return;
+          }
           usageLimitChecked = true;
+          if (canEmitRoutedThinking(true)) {
+            if (resolvedModelId) emitOrDeferRoutedThinking(resolvedModelId, true);
+            else if (observedModelHint) emitOrDeferRoutedThinking(observedModelHint, false);
+            else emitOrDeferRoutedThinking(undefined, false);
+          }
+          const isFirstRealThinking = !sawRealThinking;
           sawRealThinking = true;
           flushPendingRoutedThinking();
           if (usageLimitPrefixBuf) {
             const flushed = usageLimitPrefixBuf;
             usageLimitPrefixBuf = "";
-            hasEmittedText = true;
-            assistantOutputText += flushed;
-            push({ type: "text", text: flushed });
+            if (flushed.trim()) {
+              hasEmittedText = true;
+              assistantOutputText += flushed;
+              push({ type: "text", text: flushed });
+            }
           }
-          push({ type: "thinking", text: delta });
+          const prefixedDelta =
+            isFirstRealThinking && emittedRoutedThinkingToClient && !delta.startsWith("\n")
+              ? `\n${delta}`
+              : delta;
+          push({ type: "thinking", text: prefixedDelta });
         }
         rearmPostUsageIfNeeded();
       } else if (evType === "turn_usage") {
@@ -848,7 +935,20 @@ export async function* runTurnStream(
         const served = String(payload.resolved_model_id || payload.served_model_id || "");
         if (served) {
           resolvedModelId = served;
-          if (canEmitRoutedThinking()) emitOrDeferRoutedThinking(served);
+          onResolvedModel?.(served);
+          if (canEmitRoutedThinking()) {
+            emitOrDeferRoutedThinking(served, true);
+          } else if (pendingRoutedThinking && !emittedRoutedThinkingToClient && !emittedRoutedExact) {
+            pendingRoutedThinking = formatRoutedHeaderLine(served, true);
+            emittedRoutedModelName = served;
+            emittedRoutedExact = true;
+          } else if (emittedRoutedThinkingToClient && !emittedRoutedExact && emittedRoutedModelName !== served) {
+            emittedRoutedModelName = served;
+            emittedRoutedExact = true;
+            // Defer trailing correction until finalizeTurn() after toolFilter/uiTagSanitizer flush
+            // so buffered tail text (e.g. closing ``` fence) or multi-step cloud tool text is never split.
+            pendingLateRoutingCorrection = served;
+          }
         }
         proto.recordTurnUsage({
           inputTokens,
@@ -970,51 +1070,24 @@ export async function* runTurnStream(
     }
   };
 
+  let onWsOpen: (() => void) | null = null;
   ws.on("message", onWsMessage);
   ws.once("error", onWsError);
   ws.once("close", onWsClose);
 
   try {
-    if (preBufferedFrames && preBufferedFrames.length > 0) {
+    if (!ended && preBufferedFrames && preBufferedFrames.length > 0) {
       for (const frameBuf of preBufferedFrames) {
         if (!ended) onWsMessage(frameBuf);
       }
     }
-    if (isReusedOpenWs && ws.readyState === WebSocket.OPEN) {
-      startTurnPing();
-      if (!initialChunkSent) triggerInitialSend();
-    } else if (preSessionConnectSent && ws.readyState === WebSocket.OPEN) {
-      startTurnPing();
-      if (!initialChunkSent) {
-        handshakeTimer = setTimeout(() => {
-          try {
-            triggerInitialSend();
-          } catch (sendErr) {
-            onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
-          }
-        }, 200);
-        handshakeTimer.unref?.();
-      }
-    } else {
-      const sendConnectAndSchedule = () => {
-        try {
-          ws.send(
-            encodeFrame({
-              type: "session_connect",
-              payload: {
-                ...(actorArn ? { actor_id: actorArn } : {}),
-                surfaceType,
-                outpostId,
-                appVersion,
-                ...DESKTOP_CAPABILITIES,
-                ...(isIncognito ? { incognito: true } : {}),
-              },
-            }),
-          );
-          if (!isWeb) {
-            ws.send(encodeFrame({ type: "federate_status", payload: {} }));
-          }
-          startTurnPing();
+    if (!ended) {
+      if (isReusedOpenWs && ws.readyState === WebSocket.OPEN) {
+        startTurnPing();
+        if (!initialChunkSent) triggerInitialSend();
+      } else if (preSessionConnectSent && ws.readyState === WebSocket.OPEN) {
+        startTurnPing();
+        if (!initialChunkSent) {
           handshakeTimer = setTimeout(() => {
             try {
               triggerInitialSend();
@@ -1023,14 +1096,47 @@ export async function* runTurnStream(
             }
           }, 200);
           handshakeTimer.unref?.();
-        } catch (openSendErr) {
-          onWsError(openSendErr instanceof Error ? openSendErr : new Error(String(openSendErr)));
         }
-      };
-      if (ws.readyState === WebSocket.OPEN) {
-        sendConnectAndSchedule();
       } else {
-        ws.once("open", sendConnectAndSchedule);
+        const sendConnectAndSchedule = () => {
+          onWsOpen = null;
+          if (ended) return;
+          try {
+            ws.send(
+              encodeFrame({
+                type: "session_connect",
+                payload: {
+                  ...(actorArn ? { actor_id: actorArn } : {}),
+                  surfaceType,
+                  outpostId,
+                  appVersion,
+                  ...DESKTOP_CAPABILITIES,
+                  ...(isIncognito ? { incognito: true } : {}),
+                },
+              }),
+            );
+            if (!isWeb) {
+              ws.send(encodeFrame({ type: "federate_status", payload: {} }));
+            }
+            startTurnPing();
+            handshakeTimer = setTimeout(() => {
+              try {
+                triggerInitialSend();
+              } catch (sendErr) {
+                onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+              }
+            }, 200);
+            handshakeTimer.unref?.();
+          } catch (openSendErr) {
+            onWsError(openSendErr instanceof Error ? openSendErr : new Error(String(openSendErr)));
+          }
+        };
+        if (ws.readyState === WebSocket.OPEN) {
+          sendConnectAndSchedule();
+        } else {
+          onWsOpen = sendConnectAndSchedule;
+          ws.once("open", sendConnectAndSchedule);
+        }
       }
     }
 
@@ -1050,6 +1156,10 @@ export async function* runTurnStream(
     clearTimeout(timer);
     chunkedAssembler.clear();
     turn.signal?.removeEventListener("abort", onAbort);
+    if (onWsOpen) {
+      ws.off("open", onWsOpen);
+      onWsOpen = null;
+    }
     ws.off("pong", onWsPong);
     if (!wsParked && !wsHandedOff && !deferredGraceClose) {
       ws.off("message", onWsMessage);

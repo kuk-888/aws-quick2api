@@ -1,6 +1,6 @@
 {
   "name": "aws-quick2api",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "private": true,
   "description": "Headless OpenAI & Anthropic compatible API gateway for AWS Quick (Amazon Quick) with OAuth PKCE, Web Cookie, and Local Outpost support.",
   "license": "MIT",
@@ -9,7 +9,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "start": "node dist/src/bootstrap.js",
     "start:direct": "node dist/src/server.js",
     "dev": "npm run build && node dist/src/bootstrap.js",

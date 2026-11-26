@@ -176,6 +176,7 @@ async function callWebQbsProxy(
       headers: {
         "Content-Type": "application/json",
         Origin: "https://quick.aws.com",
+        Referer: "https://quick.aws.com/",
         Cookie: cred.cookie,
         "User-Agent": WEB_UA,
         "x-amzn-csrf-token": mbtcEnc,
@@ -187,7 +188,13 @@ async function callWebQbsProxy(
   );
 
   if (!resp.ok) {
-    throw new Error(`AWS Quick Web qbsproxy ${invocationPath} failed (${resp.status})`);
+    let summary = "";
+    try {
+      summary = (await resp.text()).replace(/\s+/g, " ").trim().slice(0, 220);
+    } catch {
+      summary = "";
+    }
+    throw new Error(`AWS Quick Web qbsproxy ${invocationPath} failed (${resp.status})${summary ? `: ${summary}` : ""}`);
   }
 
   const rawText = await resp.text();
@@ -204,13 +211,40 @@ async function callWebQbsProxy(
   if (!outer || typeof outer !== "object" || Array.isArray(outer)) {
     throw new Error(`AWS Quick Web qbsproxy ${invocationPath} returned non-JSON response (session may be expired)`);
   }
-  const parsed = outer as { body?: string };
+  const parsed = outer as { status?: number; statusCode?: number; body?: unknown; errorMessage?: unknown; error?: unknown };
+  const formatField = (val: unknown): string => {
+    if (typeof val === "string") return val.replace(/\s+/g, " ").trim();
+    if (val && typeof val === "object") {
+      if (Array.isArray(val) ? val.length === 0 : Object.keys(val).length === 0) return "";
+      try {
+        return JSON.stringify(val).replace(/\s+/g, " ").trim();
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  };
+  const innerStatus = typeof parsed.status === "number" ? parsed.status : parsed.statusCode;
+  const innerErr = formatField(parsed.errorMessage) || formatField(parsed.error);
+  if (innerErr) {
+    throw new Error(`AWS Quick Web qbsproxy ${invocationPath} error: ${innerErr.slice(0, 220)}`);
+  }
+  if (typeof innerStatus === "number" && innerStatus >= 400) {
+    const bodySnippet = formatField(parsed.body).slice(0, 220);
+    throw new Error(
+      `AWS Quick Web qbsproxy ${invocationPath} failed (inner ${innerStatus})${bodySnippet ? `: ${bodySnippet}` : ""}`,
+    );
+  }
   if (typeof parsed?.body === "string") {
+    if (!parsed.body.trim()) return {};
     try {
       return JSON.parse(parsed.body);
     } catch {
       throw new Error(`AWS Quick Web qbsproxy ${invocationPath} returned malformed body payload`);
     }
+  }
+  if (parsed?.body && typeof parsed.body === "object") {
+    return parsed.body;
   }
   return parsed;
 }

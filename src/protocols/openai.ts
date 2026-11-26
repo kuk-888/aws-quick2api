@@ -9,7 +9,7 @@ import {
   type ToolChoiceMode,
   type TurnTokenMetrics
 } from "../core/types.js";
-import { computeDialogPrefixHashes, type HashableDialogItem } from "../utils/hash.js";
+import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
 import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
@@ -454,12 +454,11 @@ export function parseChatCompletionsRequest(
     idx -= 1;
   }
 
-  const firstUserItem = items.find((it) => it.role === "user");
   const conversationKey = deriveConversationAffinityKey({
     headers,
     rawBody: body,
     systemPrompt: systemJoined,
-    firstUserText: firstUserItem?.text
+    firstUserText: extractFirstUserTurnText(items)
   });
 
   return {
@@ -723,12 +722,11 @@ export function parseResponsesRequest(
     toolNamesSignature: toolSig,
     items
   });
-  const firstUserItem = items.find((it) => it.role === "user");
   const conversationKey = deriveConversationAffinityKey({
     headers,
     rawBody: body,
     systemPrompt: systemJoined,
-    firstUserText: firstUserItem?.text
+    firstUserText: extractFirstUserTurnText(items)
   });
   return {
     requestedModel,

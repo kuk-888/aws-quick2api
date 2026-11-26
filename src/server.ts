@@ -28,7 +28,12 @@ import {
 } from "./protocols/openai.js";
 import { ClientGatewayKeyManager } from "./services/client-keys.js";
 import { ModelAccessController } from "./services/model-access.js";
-import { formatOpenAiModelList, listLiveModels, resolveKnownModelId } from "./services/model-catalog.js";
+import {
+  formatOpenAiModelList,
+  listLiveModels,
+  resolveKnownModelId,
+  resolveModelSelection,
+} from "./services/model-catalog.js";
 import { fetchAllAccountQuotas } from "./services/quota-service.js";
 import { RequestTraceLogger, type RequestProtocolTag } from "./services/request-logger.js";
 import { EXIT_CODE_SELF_UPDATE_RESTART } from "./services/self-updater.js";
@@ -199,7 +204,7 @@ function sendJson(
     ...(opts.allowCors
       ? {
         "access-control-allow-origin": "*",
-        "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
+        "access-control-expose-headers": "x-gateway-ignored-params, retry-after, x-quick-mode, x-quick-effort, x-quick-routed-model",
       }
       : {}),
     ...opts.extraHeaders
@@ -243,7 +248,7 @@ async function pipeSseStream(
   res: http.ServerResponse,
   chunks: AsyncIterable<string>,
   onErrorChunk: (err: GatewayError) => string,
-  extraHeaders: Record<string, string> = {},
+  extraHeaders: Record<string, string> | (() => Record<string, string>) = {},
   opts: {
     flushEarly?: boolean;
     flushEarlyDelayMs?: number;
@@ -258,15 +263,17 @@ async function pipeSseStream(
   const commitHeaders = () => {
     if (headersCommitted) return;
     headersCommitted = true;
+    res.socket?.setNoDelay(true);
+    const resolvedExtra = typeof extraHeaders === "function" ? extraHeaders() : extraHeaders;
     res.writeHead(200, {
       "content-type": "text/event-stream; charset=utf-8",
       "cache-control": "no-cache, no-transform",
       connection: "keep-alive",
       "x-accel-buffering": "no",
       "access-control-allow-origin": "*",
-      "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
+      "access-control-expose-headers": "x-gateway-ignored-params, retry-after, x-quick-mode, x-quick-effort, x-quick-routed-model",
       ...SECURITY_HEADERS,
-      ...extraHeaders
+      ...resolvedExtra
     });
     res.flushHeaders();
   };
@@ -432,6 +439,27 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     agentFactory: options.agentFactory,
     modelListFetcher: options.modelListFetcher
   });
+  engine.seedObservedModels(
+    traceLogger
+      .listSummaries(100)
+      .reverse()
+      .filter((r) => typeof r.metrics?.resolvedModel === "string" && r.metrics.resolvedModel.trim().length > 0)
+      .map((r) => {
+        let agentMode: string | undefined;
+        if (r.requestedModel && resolveKnownModelId(r.requestedModel)) {
+          try {
+            agentMode = resolveModelSelection(r.requestedModel, {}).selection.agentMode;
+          } catch {
+            agentMode = undefined;
+          }
+        }
+        return {
+          slotId: r.slotId,
+          agentMode,
+          resolvedModel: r.metrics?.resolvedModel,
+        };
+      }),
+  );
   keyPool.setOnSlotInvalidated((slotId) => {
     engine.invalidateWarmSessionsForSlot(slotId);
   });
@@ -626,7 +654,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       } else {
         res.writeHead(204, {
           "access-control-allow-origin": "*",
-          "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
+          "access-control-expose-headers": "x-gateway-ignored-params, retry-after, x-quick-mode, x-quick-effort, x-quick-routed-model",
           "access-control-allow-methods": "GET, POST, OPTIONS",
           "access-control-allow-headers":
             "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, openai-project, x-session-id, session-id, x-conversation-id, openai-conversation-id, x-session-affinity, x-stainless-lang, x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method",
@@ -813,7 +841,13 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         const ua = sanitizeUserAgent(req.headers["user-agent"]);
         const recordedIp = config.recordClientIp !== false ? clientIpOf(req, config.trustProxy) : "";
         const traceId = config.enableDashboard
-          ? traceLogger.startTrace(protocolEntry.tag, turn, { keyId: clientKeyId, keyName: clientAuth.keyName, clientIp: recordedIp, userAgent: ua })
+          ? traceLogger.startTrace(protocolEntry.tag, turn, {
+            keyId: clientKeyId,
+            keyName: clientAuth.keyName,
+            ...(clientAuth.accountGroup ? { accountGroup: clientAuth.accountGroup } : {}),
+            clientIp: recordedIp,
+            userAgent: ua,
+          })
           : null;
         try {
           const canonicalModelId = resolveKnownModelId(turn.requestedModel) ?? turn.requestedModel;
@@ -827,6 +861,23 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           throw gwErr;
         }
         const ledgerMeta = { account: "", execMode: "", usedProxy: false, startedAt: Date.now() };
+        const sanitizeHeaderVal = (v?: string): string | undefined => {
+          if (!v) return undefined;
+          const clean = v.replace(/[^\x21-\x7e]/g, "").slice(0, 128);
+          return clean || undefined;
+        };
+        const routingHeadersState: { mode?: string; effort?: string; routedModel?: string } = {};
+        const buildProtocolResponseHeaders = (): Record<string, string> => {
+          const mode = sanitizeHeaderVal(routingHeadersState.mode);
+          const effort = sanitizeHeaderVal(routingHeadersState.effort);
+          const routedModel = sanitizeHeaderVal(routingHeadersState.routedModel);
+          return {
+            ...ignoredParamsHeader(turn.rawBody),
+            ...(mode ? { "x-quick-mode": mode } : {}),
+            ...(effort ? { "x-quick-effort": effort } : {}),
+            ...(routedModel ? { "x-quick-routed-model": routedModel } : {}),
+          };
+        };
         let flushEarlyArmed = false;
         let flushEarlyListener: ((armed: boolean) => void) | null = null;
         const setFlushEarlyArmed = (armed: boolean) => {
@@ -842,13 +893,26 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             };
           },
         };
-        const rawEvents = engine.executeTurnWithPool(turn, keyPool, (meta) => {
-          traceLogger.bindExecutionMeta(traceId, meta);
-          ledgerMeta.account = meta.accountLabel || meta.maskedKey;
-          ledgerMeta.execMode = meta.execMode;
-          ledgerMeta.usedProxy = Boolean(meta.usedProxy);
-          setFlushEarlyArmed(meta.flushEarlyReady !== false);
-        });
+        const rawEvents = engine.executeTurnWithPool(
+          turn,
+          keyPool,
+          (meta) => {
+            traceLogger.bindExecutionMeta(traceId, meta);
+            ledgerMeta.account = meta.accountLabel || meta.maskedKey;
+            ledgerMeta.execMode = meta.execMode;
+            ledgerMeta.usedProxy = Boolean(meta.usedProxy);
+            if (meta.agentMode) routingHeadersState.mode = meta.agentMode;
+            if (meta.thinkingEffort) routingHeadersState.effort = meta.thinkingEffort;
+            if (meta.flushEarlyReady === false) {
+              routingHeadersState.routedModel = undefined;
+            }
+            if (meta.resolvedModel) routingHeadersState.routedModel = meta.resolvedModel;
+            if (meta.flushEarlyReady !== undefined) {
+              setFlushEarlyArmed(meta.flushEarlyReady !== false);
+            }
+          },
+          { accountGroup: clientAuth.accountGroup },
+        );
         const events = tapStreamWithLedger(
           tapStreamWithTrace(rawEvents, traceId, clientKeyId),
           {
@@ -868,14 +932,14 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             Buffer.byteLength(turn.systemPrompt || "", "utf8") +
             (turn.tools.length > 0 ? Buffer.byteLength(JSON.stringify(turn.tools), "utf8") : 0);
           const flushEarly =
-            keyPool.enabledKeyCount() > 0 &&
+            keyPool.enabledKeyCount(clientAuth.accountGroup) > 0 &&
             (approxPayloadBytes > SSE_EARLY_FLUSH_BYTES ||
               (protocolEntry.tag === "anthropic-messages" && turn.tools.length > 0));
           await pipeSseStream(
             res,
             protocolAdapter.streamSse(events, turn),
             (err) => protocolAdapter.formatSseErrorFrame(err),
-            ignoredParamsHeader(turn.rawBody),
+            buildProtocolResponseHeaders,
             {
               flushEarly,
               ...(flushEarly
@@ -891,7 +955,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           );
         } else {
           const json = await protocolAdapter.collectJson(events, turn);
-          sendJson(res, 200, json, { allowCors: true, extraHeaders: ignoredParamsHeader(turn.rawBody) });
+          sendJson(res, 200, json, { allowCors: true, extraHeaders: buildProtocolResponseHeaders() });
         }
         return;
       }
@@ -951,12 +1015,12 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       await engine.disposeAll();
       server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await keyPool.flushStateAsync().catch(() => {});
-      await keyPool.flushEnvMirrorAsync().catch(() => {});
+      await keyPool.flushStateAsync().catch(() => { });
+      await keyPool.flushEnvMirrorAsync().catch(() => { });
       keyPool.dispose();
       clientKeys.flushStatsToDisk();
       usageLedger.flush();
-      await traceLogger.flushAsync().catch(() => {});
+      await traceLogger.flushAsync().catch(() => { });
       traceLogger.flush();
     }
   };
@@ -985,7 +1049,9 @@ if (isMain) {
         reason: err instanceof Error ? err.message : String(err),
         ...(code === "EACCES"
           ? { hint: "Permission denied reading/writing .env or data directory. If upgrading Docker to v0.1.16+ (non-root uid 1000), run: chown -R 1000:1000 data .env" }
-          : {}),
+          : code === "EROFS"
+            ? { hint: "Data directory is mounted read-only (EROFS). Remove ':ro' from the /app/data volume mount in Docker or docker-compose.yml." }
+            : {}),
       }),
     );
     process.exit(1);

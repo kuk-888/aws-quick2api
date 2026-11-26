@@ -5,6 +5,7 @@ import path from "node:path";
 import type { ParsedProtocolTurn, TurnTokenMetrics } from "../core/types.js";
 import type { ExecutionModeTag } from "./usage-tracker.js";
 import { classifyClient } from "../utils/user-agent.js";
+import { redactSecrets } from "../utils/hash.js";
 
 /**
  * Metadata-only request log (bounded ring buffer with optional debounced atomic persistence to `${DATA_DIR}/request-traces.json`).
@@ -35,6 +36,7 @@ export interface RequestTraceSummary {
   client?: string;
   slotId?: string;
   accountLabel?: string;
+  accountGroup?: string;
   maskedKey?: string;
   execMode?: ExecutionModeTag;
   usedProxy?: boolean;
@@ -46,6 +48,8 @@ export interface RequestTraceSummary {
   accountFailoverCount?: number;
   /** Metadata-only boolean: true when the account had no custom Agent bound and ran on AWS Quick's default SYSTEM assistant. */
   usedDefaultSystemAgent?: boolean;
+  /** Resolved upstream thinking effort sent to AWS Quick (e.g. `off`, `low`, `medium`, `high`, `max`). */
+  thinkingEffort?: string;
   ttftMs: number | null;
   durationMs: number | null;
   toolCount: number;
@@ -116,7 +120,7 @@ export class RequestTraceLogger {
   startTrace(
     protocol: RequestProtocolTag,
     turn: ParsedProtocolTurn,
-    clientKeyMeta?: { keyId?: string; keyName?: string; clientIp?: string; userAgent?: string }
+    clientKeyMeta?: { keyId?: string; keyName?: string; accountGroup?: string; clientIp?: string; userAgent?: string }
   ): string {
     while (this.records.size >= this.maxEntries) {
       const oldestId = this.records.keys().next().value;
@@ -144,6 +148,7 @@ export class RequestTraceLogger {
       requestedModel: turn.requestedModel,
       ...(clientKeyMeta?.keyId ? { clientKeyId: clientKeyMeta.keyId } : {}),
       ...(clientKeyMeta?.keyName ? { clientKeyName: clientKeyMeta.keyName } : {}),
+      ...(clientKeyMeta?.accountGroup ? { accountGroup: clientKeyMeta.accountGroup } : {}),
       ...(clientKeyMeta?.clientIp ? { clientIp: clientKeyMeta.clientIp } : {}),
       ...(clientKeyMeta?.userAgent ? { userAgent: clientKeyMeta.userAgent, client: classifyClient(clientKeyMeta.userAgent) } : {}),
       ttftMs: null,
@@ -175,12 +180,15 @@ export class RequestTraceLogger {
       slotId?: string;
       maskedKey: string;
       accountLabel?: string;
+      accountGroup?: string;
       execMode: ExecutionModeTag;
       usedProxy?: boolean;
       contentFilterRecovered?: boolean;
       warmFallbackToCold?: boolean;
       accountFailoverCount?: number;
       usedDefaultSystemAgent?: boolean;
+      thinkingEffort?: string;
+      effectiveSystemPromptChars?: number;
     }
   ): void {
     if (!traceId) return;
@@ -191,6 +199,8 @@ export class RequestTraceLogger {
     rec.maskedKey = meta.maskedKey;
     if (meta.accountLabel) rec.accountLabel = meta.accountLabel;
     else delete rec.accountLabel;
+    if (meta.accountGroup) rec.accountGroup = meta.accountGroup;
+    else delete rec.accountGroup;
     rec.execMode = meta.execMode;
     if (meta.usedProxy) rec.usedProxy = true;
     else delete rec.usedProxy;
@@ -201,6 +211,12 @@ export class RequestTraceLogger {
     }
     if (meta.usedDefaultSystemAgent) rec.usedDefaultSystemAgent = true;
     else delete rec.usedDefaultSystemAgent;
+    if (typeof meta.thinkingEffort === "string" && meta.thinkingEffort.trim()) {
+      rec.thinkingEffort = meta.thinkingEffort.trim();
+    }
+    if (typeof meta.effectiveSystemPromptChars === "number" && Number.isFinite(meta.effectiveSystemPromptChars) && meta.effectiveSystemPromptChars >= 0) {
+      rec.fullPromptChars = rec.transcriptTotalChars + meta.effectiveSystemPromptChars;
+    }
     if (meta.execMode === "parked_tool_resume") {
       rec.upstreamSentChars = Math.max(4, rec.toolResumeDeltaChars);
     } else if (meta.execMode === "warm_incremental") {
@@ -262,7 +278,7 @@ export class RequestTraceLogger {
     rec.status = "error";
     rec.httpStatus = httpStatus;
     rec.durationMs = Date.now() - rec.startedAtMs;
-    rec.errorMessage = errorMessage.slice(0, 300);
+    rec.errorMessage = redactSecrets(errorMessage).slice(0, 300);
     this.schedulePersist();
   }
 
@@ -412,6 +428,7 @@ export class RequestTraceLogger {
           ...(typeof r.client === "string" ? { client: r.client } : {}),
           ...(typeof r.slotId === "string" ? { slotId: r.slotId } : {}),
           ...(typeof r.accountLabel === "string" ? { accountLabel: r.accountLabel } : {}),
+          ...(typeof r.accountGroup === "string" && r.accountGroup ? { accountGroup: r.accountGroup } : {}),
           ...(typeof r.maskedKey === "string" ? { maskedKey: r.maskedKey } : {}),
           ...(typeof r.execMode === "string" ? { execMode: r.execMode } : {}),
           ...(r.usedProxy ? { usedProxy: true } : {}),
@@ -421,6 +438,7 @@ export class RequestTraceLogger {
             ? { accountFailoverCount: r.accountFailoverCount }
             : {}),
           ...(r.usedDefaultSystemAgent ? { usedDefaultSystemAgent: true } : {}),
+          ...(typeof r.thinkingEffort === "string" && r.thinkingEffort ? { thinkingEffort: r.thinkingEffort } : {}),
           ttftMs: typeof r.ttftMs === "number" ? r.ttftMs : null,
           durationMs: typeof r.durationMs === "number" ? r.durationMs : null,
           toolCount: typeof r.toolCount === "number" ? r.toolCount : 0,
@@ -429,7 +447,7 @@ export class RequestTraceLogger {
           upstreamSentChars: typeof r.upstreamSentChars === "number" ? r.upstreamSentChars : 0,
           transcriptTotalChars: typeof r.transcriptTotalChars === "number" ? r.transcriptTotalChars : 0,
           outputChars: typeof r.outputChars === "number" ? r.outputChars : 0,
-          ...(r.metrics && typeof r.metrics === "object" ? { metrics: r.metrics } : {}),
+          ...(r.metrics && typeof r.metrics === "object" && !Array.isArray(r.metrics) ? { metrics: r.metrics } : {}),
           messageCount: typeof r.messageCount === "number" ? r.messageCount : 0,
           imageCount: typeof r.imageCount === "number" ? r.imageCount : 0,
           toolNames: Array.isArray(r.toolNames) ? r.toolNames.filter((x): x is string => typeof x === "string") : [],

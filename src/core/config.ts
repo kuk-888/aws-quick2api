@@ -12,7 +12,13 @@ import {
 } from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
-import type { AutoDisabledState, GatewayConfig, LbStrategy } from "./types.js";
+import {
+  parseRoutedModelThinkingMode,
+  type AutoDisabledState,
+  type GatewayConfig,
+  type LbStrategy,
+  type RoutedModelThinkingMode,
+} from "./types.js";
 
 export function readDotEnvRaw(explicitPath?: string): {
   envFilePath?: string;
@@ -215,6 +221,7 @@ export function loadConfigFromEnv(
       ? env.CUSTOM_AGENT_PROMPT.replace(/\\n/g, "\n").trim() || undefined
       : undefined,
     sanitizeClientSystemPrompt: parseBoolEnv(env.SANITIZE_CLIENT_SYSTEM_PROMPT, false),
+    showRoutedModelInThinking: parseRoutedModelThinkingMode(env.SHOW_ROUTED_MODEL_IN_THINKING),
     autoRephraseOnContentFilter: parseBoolEnv(env.AUTO_REPHRASE_ON_CONTENT_FILTER, false),
     contentFilterRephrasePrompt: env.CONTENT_FILTER_REPHRASE_PROMPT
       ? env.CONTENT_FILTER_REPHRASE_PROMPT.replace(/\\n/g, "\n").trim() || undefined
@@ -324,6 +331,7 @@ export function buildUpdatedPoolEnvContent(
     autoEnsureCodingAgent?: boolean;
     customAgentPrompt?: string;
     sanitizeClientSystemPrompt?: boolean;
+    showRoutedModelInThinking?: RoutedModelThinkingMode;
     autoRephraseOnContentFilter?: boolean;
     contentFilterRephrasePrompt?: string;
     contentFilterRephraseModel?: string;
@@ -353,6 +361,9 @@ export function buildUpdatedPoolEnvContent(
       : {}),
     ...(typeof state.sanitizeClientSystemPrompt === "boolean"
       ? { SANITIZE_CLIENT_SYSTEM_PROMPT: String(state.sanitizeClientSystemPrompt) }
+      : {}),
+    ...(typeof state.showRoutedModelInThinking === "string"
+      ? { SHOW_ROUTED_MODEL_IN_THINKING: state.showRoutedModelInThinking }
       : {}),
     ...(typeof state.autoRephraseOnContentFilter === "boolean"
       ? { AUTO_REPHRASE_ON_CONTENT_FILTER: String(state.autoRephraseOnContentFilter) }

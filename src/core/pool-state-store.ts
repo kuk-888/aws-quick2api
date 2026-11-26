@@ -3,7 +3,12 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync,
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import { mirrorPoolConfigToEnvFileAsync, mirrorPoolConfigToEnvFileSyncBestEffort } from "./config.js";
-import type { AutoDisabledState, LbStrategy } from "./types.js";
+import {
+  parseRoutedModelThinkingMode,
+  type AutoDisabledState,
+  type LbStrategy,
+  type RoutedModelThinkingMode,
+} from "./types.js";
 
 export const POOL_STATE_FILENAME = "pool-state.json";
 export const POOL_STATE_VERSION = 1;
@@ -27,6 +32,8 @@ export interface PersistedPoolState {
   disabledKeys: string[];
   keyLabels: Record<string, string>;
   keyProxies: Record<string, string>;
+  accountGroups?: string[];
+  keyGroups?: Record<string, string>;
   chatAgentId: string;
   keyChatAgentIds: Record<string, string>;
   keyAddedAt: Record<string, number>;
@@ -39,6 +46,7 @@ export interface PersistedPoolState {
   autoEnsureCodingAgent: boolean;
   customAgentPrompt: string;
   sanitizeClientSystemPrompt?: boolean;
+  showRoutedModelInThinking?: RoutedModelThinkingMode;
   autoRephraseOnContentFilter: boolean;
   contentFilterRephrasePrompt: string;
   contentFilterRephraseModel: string;
@@ -130,6 +138,8 @@ export function loadPoolStateFromDisk(stateFilePath: string): PersistedPoolState
       disabledKeys: sanitizeStringArray(parsed.disabledKeys),
       keyLabels: sanitizeStringRecord(parsed.keyLabels),
       keyProxies: sanitizeStringRecord(parsed.keyProxies),
+      accountGroups: sanitizeStringArray(parsed.accountGroups),
+      keyGroups: sanitizeStringRecord(parsed.keyGroups),
       chatAgentId: typeof parsed.chatAgentId === "string" ? parsed.chatAgentId : "",
       keyChatAgentIds: sanitizeStringRecord(parsed.keyChatAgentIds),
       keyAddedAt: sanitizeNumberRecord(parsed.keyAddedAt),
@@ -147,6 +157,9 @@ export function loadPoolStateFromDisk(stateFilePath: string): PersistedPoolState
       customAgentPrompt: typeof parsed.customAgentPrompt === "string" ? parsed.customAgentPrompt : "",
       sanitizeClientSystemPrompt:
         typeof parsed.sanitizeClientSystemPrompt === "boolean" ? parsed.sanitizeClientSystemPrompt : false,
+      ...(parsed.showRoutedModelInThinking !== undefined
+        ? { showRoutedModelInThinking: parseRoutedModelThinkingMode(parsed.showRoutedModelInThinking) }
+        : {}),
       autoRephraseOnContentFilter:
         typeof parsed.autoRephraseOnContentFilter === "boolean" ? parsed.autoRephraseOnContentFilter : false,
       contentFilterRephrasePrompt:
@@ -180,6 +193,8 @@ export class PoolStateWriter {
   private envMirrorTimer: NodeJS.Timeout | null = null;
   private envMirrorChain: Promise<void> = Promise.resolve();
   private tmpSeq = 0;
+  private writeEpoch = 0;
+  private envMirrorEpoch = 0;
   private writeCount = 0;
   private envMirrorWriteCount = 0;
   private lastError: string | null = null;
@@ -239,16 +254,26 @@ export class PoolStateWriter {
   private enqueueAsyncWrite(state: PersistedPoolState): void {
     const json = `${JSON.stringify(state, null, 2)}\n`;
     const seq = ++this.tmpSeq;
+    const epoch = ++this.writeEpoch;
     const dir = path.dirname(this.filePath);
     const tmpPath = `${this.filePath}.${process.pid}.${seq}.tmp`;
     this.writeChain = this.writeChain
       .then(async () => {
+        if (epoch !== this.writeEpoch) return;
         await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
         await fsPromises.writeFile(tmpPath, json, { encoding: "utf8", mode: 0o600 });
         try {
           await fsPromises.chmod(tmpPath, 0o600);
         } catch {
           // Non-POSIX filesystems
+        }
+        if (epoch !== this.writeEpoch) {
+          try {
+            await fsPromises.unlink(tmpPath);
+          } catch {
+            // Ignore cleanup errors
+          }
+          return;
         }
         await fsPromises.rename(tmpPath, this.filePath);
         this.writeCount += 1;
@@ -275,8 +300,10 @@ export class PoolStateWriter {
   private enqueueAsyncEnvMirror(state: PersistedPoolState): void {
     if (!this.envFilePath) return;
     const envPath = this.envFilePath;
+    const epoch = ++this.envMirrorEpoch;
     this.envMirrorChain = this.envMirrorChain
       .then(async () => {
+        if (epoch !== this.envMirrorEpoch) return;
         const ok = await mirrorPoolConfigToEnvFileAsync(envPath, state);
         if (ok) this.envMirrorWriteCount += 1;
       })
@@ -334,6 +361,7 @@ export class PoolStateWriter {
     const state = explicitState ?? this.pendingState;
     this.pendingState = null;
     if (state) {
+      this.writeEpoch += 1;
       const dir = path.dirname(this.filePath);
       const tmpPath = `${this.filePath}.${process.pid}.${++this.tmpSeq}.sync.tmp`;
       const json = `${JSON.stringify(state, null, 2)}\n`;
@@ -368,8 +396,11 @@ export class PoolStateWriter {
 
     if (hadPendingEnvMirror && this.envFilePath) {
       const mirrorState = explicitState ?? pendingMirror;
-      if (mirrorState && mirrorPoolConfigToEnvFileSyncBestEffort(this.envFilePath, mirrorState)) {
-        this.envMirrorWriteCount += 1;
+      if (mirrorState) {
+        this.envMirrorEpoch += 1;
+        if (mirrorPoolConfigToEnvFileSyncBestEffort(this.envFilePath, mirrorState)) {
+          this.envMirrorWriteCount += 1;
+        }
       }
     }
   }

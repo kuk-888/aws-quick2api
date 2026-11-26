@@ -143,6 +143,10 @@ class HttpConnectTunnelAgent extends https.Agent {
         done(new Error(`Proxy CONNECT failed (${res.statusCode} ${res.statusMessage || ""})`), socket);
         return;
       }
+      if (options.protocol === "http:") {
+        done(null, socket);
+        return;
+      }
       const tlsSocket = tls.connect({
         socket,
         servername: options.servername || targetHost,
@@ -329,9 +333,13 @@ class Socks5TunnelAgent extends https.Agent {
     callback?: (err: Error | null, stream: Duplex) => void,
   ): Duplex | null | undefined {
     const targetHost = String(options.host || options.hostname || "");
-    const targetPort = Number(options.port || 443);
+    const targetPort = Number(options.port || (options.protocol === "http:" ? 80 : 443));
     establishSocks5Tunnel(this.proxyUrl, targetHost, targetPort)
       .then((socket) => {
+        if (options.protocol === "http:") {
+          callback?.(null, socket);
+          return;
+        }
         const tlsSocket = tls.connect({
           socket,
           servername: options.servername || targetHost,
@@ -410,10 +418,13 @@ function doProxiedHttpsRequest(
       const len = typeof init.body === "string" ? Buffer.byteLength(init.body, "utf8") : init.body.byteLength;
       headers["Content-Length"] = String(len);
     }
-    const req = https.request(
+    const isHttp = u.protocol === "http:";
+    const requester = isHttp ? http.request : https.request;
+    const req = requester(
       {
+        protocol: u.protocol,
         hostname: u.hostname,
-        port: u.port ? Number(u.port) : 443,
+        port: u.port ? Number(u.port) : isHttp ? 80 : 443,
         path: `${u.pathname}${u.search}`,
         method: init.method || "GET",
         headers,
@@ -458,9 +469,114 @@ function doProxiedHttpsRequest(
   });
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h.endsWith(".localhost");
+}
+
+function matchesNoProxy(hostname: string, targetPort = "", env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.NO_PROXY || env.no_proxy || "").trim();
+  if (!raw) return false;
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  for (const part of raw.split(",")) {
+    const entry = part.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry === "*") return true;
+
+    let ruleHost = entry;
+    let rulePort = "";
+    if (entry.startsWith("[")) {
+      // Bracketed IPv6: [::1] or [::1]:8080
+      const closeBracket = entry.indexOf("]");
+      if (closeBracket > 1) {
+        ruleHost = entry.slice(1, closeBracket);
+        const rest = entry.slice(closeBracket + 1);
+        const pm = /^:(\d+)$/.exec(rest);
+        if (pm) rulePort = pm[1]!;
+      }
+    } else {
+      const colonCount = (entry.match(/:/g) || []).length;
+      if (colonCount === 1) {
+        // host:port or IPv4:port
+        const idx = entry.indexOf(":");
+        const maybePort = entry.slice(idx + 1);
+        if (/^\d+$/.test(maybePort)) {
+          ruleHost = entry.slice(0, idx);
+          rulePort = maybePort;
+        }
+      }
+      // colonCount >= 2 -> unbracketed IPv6 literal (e.g. ::1, 2001:db8::1), keep intact
+    }
+
+    if (rulePort && targetPort && rulePort !== targetPort) continue;
+    if (rulePort && !targetPort) continue;
+
+    ruleHost = ruleHost.replace(/^\*\./, "").replace(/^\./, "");
+    if (!ruleHost) continue;
+    if (host === ruleHost || host.endsWith(`.${ruleHost}`)) return true;
+  }
+  return false;
+}
+
 /**
- * Perform an HTTPS fetch optionally routed through a per-credential HTTP/HTTPS/SOCKS5 proxy.
- * Falls back to native global `fetch` when no per-credential proxy is configured.
+ * Resolves the effective proxy URL: prefers an explicit per-credential `proxyUrl`,
+ * otherwise falls back to standard environment variables (`HTTPS_PROXY`, `https_proxy`,
+ * `HTTP_PROXY`, `http_proxy`, `ALL_PROXY`, `all_proxy`), honoring `NO_PROXY`/`no_proxy`,
+ * target scheme (`http:`/`ws:` vs `https:`/`wss:`), and bypassing env fallback for loopback
+ * targets or unsupported proxy schemes (e.g. `ALL_PROXY=socks4://...`).
+ */
+export function resolveEffectiveProxyUrl(
+  explicitProxy?: string,
+  targetUrl?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const direct = (explicitProxy || "").trim();
+  if (direct) return direct;
+
+  let protocol = "";
+  if (targetUrl) {
+    try {
+      const parsed = new URL(targetUrl);
+      protocol = parsed.protocol.toLowerCase();
+      const effectivePort =
+        parsed.port ||
+        (protocol === "http:" || protocol === "ws:"
+          ? "80"
+          : protocol === "https:" || protocol === "wss:"
+            ? "443"
+            : "");
+      if (isLoopbackHost(parsed.hostname) || matchesNoProxy(parsed.hostname, effectivePort, env)) {
+        return undefined;
+      }
+    } catch {
+      // Fall through if targetUrl is not a full URL
+    }
+  }
+
+  const candidates =
+    protocol === "http:" || protocol === "ws:"
+      ? [env.HTTP_PROXY, env.http_proxy, env.ALL_PROXY, env.all_proxy]
+      : [env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy, env.ALL_PROXY, env.all_proxy];
+
+  for (const raw of candidates) {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) continue;
+    try {
+      const validated = validateProxyUrl(trimmed);
+      if (validated) return validated;
+    } catch {
+      // Skip unsupported/malformed ambient env proxy (e.g. ALL_PROXY=socks4://...) instead of crashing all calls.
+    }
+  }
+  return undefined;
+}
+
+// Track native fetch so test harnesses stubbing `globalThis.fetch` bypass ambient host proxies (e.g. local Clash).
+const NATIVE_FETCH = globalThis.fetch;
+
+/**
+ * Perform an HTTPS fetch optionally routed through a per-credential or environment HTTP/HTTPS/SOCKS5 proxy.
+ * Falls back to native global `fetch` when no proxy is configured.
  * Automatically retries up to 1 time by default on transient residential-proxy TCP/handshake resets
  * (`ECONNRESET`, `EPIPE`, `socket hang up`, SOCKS5 handshake close).
  */
@@ -470,7 +586,9 @@ export async function fetchViaOptionalProxy(
   proxyUrl?: string,
   options?: { maxRetries?: number; retryDelayMs?: number },
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<unknown> }> {
-  const effectiveProxy = (proxyUrl || "").trim();
+  const directProxy = (proxyUrl || "").trim();
+  const effectiveProxy =
+    directProxy || (globalThis.fetch === NATIVE_FETCH ? resolveEffectiveProxyUrl(undefined, url) || "" : "");
   if (!effectiveProxy) {
     const fetchInit: RequestInit = {
       ...(init.method ? { method: init.method } : {}),

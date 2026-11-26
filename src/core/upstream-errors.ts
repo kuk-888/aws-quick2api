@@ -28,23 +28,30 @@ export function classifyUpstreamError(finalErr: GatewayError): {
   // and `SOCKS5 username/password authentication failed` never permanently disable a healthy AWS account.
   const isExplicitProxyOrNetErr =
     /proxy connect failed|socks5.*(?:authentication|handshake|connect)|econnrefused|econnreset|etimedout|socket hang up|unexpected server response|websocket closed \(1006\)/i.test(lower);
+  const isExplicitOverloadErr =
+    finalErr.status === 529 ||
+    finalErr.code === "overloaded" ||
+    /service\s+is\s+busy|temporarily\s+unavailable|model\s+(?:is\s+)?overloaded|overloaded_error|server\s+is\s+overloaded|too\s+busy|capacity\s+(?:exceeded|unavailable)/i.test(lower);
   // Check explicit quota exhaustion BEFORE generic HTTP 429 so `QuotaExceededException`, `monthly limit exceeded`,
   // and 429 responses carrying explicit quota text trip quota circuit-breaking instead of 3s transient backoff.
   const isQuotaErr =
     !isPayloadOrContextSizeErr &&
     !isConnLimitErr &&
     !isExplicitProxyOrNetErr &&
+    !isExplicitOverloadErr &&
     (finalErr.code === "quota_exhausted" ||
       finalErr.status === 402 ||
       /usage.?limit|credits?.?(?:exhausted|insufficient|exceeded)|insufficient.?(?:quota|credits?|balance)|quota.?exceeded|exceeded\s+(?:your\s+)?(?:current\s+)?quota|quota\s+(?:has\s+been\s+)?(?:exhausted|exceeded|insufficient)|monthly\s+limit\s+exceeded|reached (?:your|its) (?:usage|session|monthly) limit/i.test(lower));
   const isRateLimitErr =
     !isExplicitProxyOrNetErr &&
+    !isExplicitOverloadErr &&
     !isQuotaErr &&
     (isConnLimitErr ||
       finalErr.status === 429 ||
       /rate.?limit|too many requests|toomanyrequestsexception|throttl/i.test(lower));
   const isAuthErr =
     !isExplicitProxyOrNetErr &&
+    !isExplicitOverloadErr &&
     !isRateLimitErr &&
     !isQuotaErr &&
     finalErr.code !== "model_not_available" &&
@@ -54,6 +61,7 @@ export function classifyUpstreamError(finalErr: GatewayError): {
       /unauthorized|invalid.?grant|invalid.?client|unauthorized.?client|expired.?token|invalid refresh token|(?:token|oauth|cookie|credential).?expired|access.?denied|authentication|oauth token refresh failed|session cookie/i.test(lower));
   const isProxyOrConnErr =
     isExplicitProxyOrNetErr ||
+    isExplicitOverloadErr ||
     (!isQuotaErr &&
       !isRateLimitErr &&
       !isAuthErr &&
