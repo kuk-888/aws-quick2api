@@ -653,7 +653,7 @@ export function parseResponsesRequest(
 }
 
 function formatOpenAiUsageObject(m: TurnTokenMetrics): Record<string, unknown> {
-  const promptTotal = m.inputTokens + m.cacheReadTokens;
+  const promptTotal = m.inputTokens + m.cacheReadTokens + m.cacheWriteTokens;
   return {
     prompt_tokens: promptTotal,
     completion_tokens: m.outputTokens,
@@ -776,7 +776,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
     const respId = `resp_${crypto.randomUUID().replace(/-/g, "")}`;
     const msgId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
     const created = Math.floor(Date.now() / 1000);
-    const { thinking, text, toolCalls, metrics } = await collectTurnEvents(events);
+    const { thinking, text, toolCalls, metrics, stopReason } = await collectTurnEvents(events);
 
     const output: Array<Record<string, unknown>> = [];
     if (thinking) {
@@ -850,12 +850,14 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
       }
     }
 
-    const totalInput = metrics.inputTokens + metrics.cacheReadTokens;
+    const totalInput = metrics.inputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens;
+    const isIncomplete = stopReason === "length";
     return {
       id: respId,
       object: "response",
       created_at: created,
-      status: "completed",
+      status: isIncomplete ? "incomplete" : "completed",
+      ...(isIncomplete ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
       model: turn.requestedModel,
       output,
       output_text: text,
@@ -895,6 +897,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
     let fullText = "";
     let sawMessage = false;
     let sawToolCalls = false;
+    let finalStopReason: "stop" | "tool_calls" | "length" = "stop";
     let metrics: TurnTokenMetrics = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 };
 
     const closeOpen = function* (): Generator<string> {
@@ -1025,6 +1028,8 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
           }
         } else if (ev.type === "usage") {
           metrics = ev.metrics;
+        } else if (ev.type === "done") {
+          finalStopReason = ev.stopReason;
         }
         step = await iter.next();
       }
@@ -1039,9 +1044,11 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
       yield* closeOpen();
     }
 
-    const totalInput = metrics.inputTokens + metrics.cacheReadTokens;
-    yield sse("response.completed", {
-      response: baseResponse("completed", output, {
+    const totalInput = metrics.inputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens;
+    const isIncomplete = finalStopReason === "length";
+    yield sse(isIncomplete ? "response.incomplete" : "response.completed", {
+      response: baseResponse(isIncomplete ? "incomplete" : "completed", output, {
+        ...(isIncomplete ? { incomplete_details: { reason: "max_output_tokens" } } : {}),
         output_text: fullText,
         usage: {
           input_tokens: totalInput,

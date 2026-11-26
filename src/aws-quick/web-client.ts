@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { fetchViaOptionalProxy } from "../utils/proxy-agent.js";
+import type { QuickFileAttachment } from "./oauth-client.js";
 import type { CloudSessionMeta, QuickQuotaUsage } from "./types.js";
 
 export interface WebCookieCredential {
@@ -157,6 +158,7 @@ async function callWebQbsProxy(
   method: "GET" | "POST",
   bodyObj: Record<string, unknown> = {},
   proxyUrl?: string,
+  signal?: AbortSignal,
 ): Promise<unknown> {
   const mbtcEnc = encodeURIComponent(cred.mbtc);
   const workingSessionId = crypto.randomUUID();
@@ -179,6 +181,7 @@ async function callWebQbsProxy(
         "x-amzn-csrf-token": mbtcEnc,
       },
       body: JSON.stringify(bodyObj),
+      ...(signal ? { signal } : {}),
     },
     proxyUrl,
   );
@@ -243,4 +246,81 @@ export async function listWebCloudSessions(
     updated_at: Number(s.updated_at || 0),
     message_count: Number(s.message_count || 0),
   }));
+}
+
+/**
+ * Native Web Cookie out-of-band attachment upload (matches official quick.aws.com web capture):
+ * 1. POST `/qbsproxy/qs-file-proxy/accounts/{acct}/attachments/presigned-url` with raw binary bytes → `attachmentId`
+ * 2. POST `/qbsproxy/quicksight/accounts/{acct}/invocations/files/upload/{threadId}` with `{ attachmentId }` → `path`
+ */
+export async function uploadWebBinaryAttachment(
+  cred: WebCookieCredential,
+  bytes: Uint8Array,
+  filename: string,
+  mimeType: string,
+  threadId: string,
+  proxyUrl?: string,
+  signal?: AbortSignal,
+): Promise<QuickFileAttachment> {
+  const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const contentSha256 = crypto.createHash("sha256").update(buf).digest("hex");
+  const normalizedMime = mimeType.trim().toLowerCase() || "application/octet-stream";
+  const mbtcEnc = encodeURIComponent(cred.mbtc);
+
+  const uploadUrl =
+    `https://quick.aws.com/sn/account/${encodeURIComponent(cred.accountId)}` +
+    `/qbsproxy/qs-file-proxy/accounts/${encodeURIComponent(cred.accountId)}` +
+    `/attachments/presigned-url?Operation=ConversationSendMessage` +
+    `&filename=${encodeURIComponent(filename)}&mbtc=${mbtcEnc}`;
+
+  const upResp = await fetchViaOptionalProxy(
+    uploadUrl,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": normalizedMime,
+        Origin: "https://quick.aws.com",
+        Cookie: cred.cookie,
+        "User-Agent": WEB_UA,
+        "x-amzn-csrf-token": mbtcEnc,
+        "X-Quick-File-Name": encodeURIComponent(filename),
+      },
+      body: buf,
+      ...(signal ? { signal } : {}),
+    },
+    proxyUrl,
+  );
+  if (!upResp.ok) {
+    const errText = await upResp.text().catch(() => "");
+    throw new Error(`AWS Quick Web attachment upload failed (${upResp.status}): ${errText.slice(0, 200)}`);
+  }
+  const upData = (await upResp.json()) as { attachmentId?: string; id?: string };
+  const attachmentId = upData?.attachmentId || upData?.id;
+  if (!attachmentId) {
+    throw new Error("AWS Quick Web attachment upload response missing attachmentId.");
+  }
+
+  const bindData = (await callWebQbsProxy(
+    cred,
+    `files/upload/${encodeURIComponent(threadId)}`,
+    "POST",
+    { attachmentId },
+    proxyUrl,
+    signal,
+  )) as { path?: string; workspace_path?: string; name?: string; files?: Array<{ path?: string }> };
+
+  const serverPath = bindData?.path || bindData?.files?.[0]?.path;
+  if (!serverPath) {
+    throw new Error("AWS Quick Web files/upload response missing workspace file path.");
+  }
+
+  return {
+    type: normalizedMime.startsWith("image/") ? "image" : "file",
+    name: bindData?.name || filename,
+    size: buf.byteLength,
+    mimeType: normalizedMime,
+    path: serverPath,
+    attachmentId,
+    contentSha256,
+  };
 }

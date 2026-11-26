@@ -448,3 +448,119 @@ export function decodeCloudOutputFrame(msg: EventStreamMessage): DecodedGatewayF
   const innerJson = Buffer.from(wrapper.payload, 'base64').toString('utf8');
   return { type: 'event', data: JSON.parse(innerJson) as Record<string, unknown> };
 }
+
+const MAX_CHUNKED_FRAME_TOTAL_BYTES = 16 * 1024 * 1024;
+const MAX_CHUNKED_FRAME_PARTS = 512;
+const MAX_INFLIGHT_CHUNK_GROUPS = 16;
+const CHUNK_GROUP_TTL_MS = 60_000;
+
+interface ChunkGroup {
+  totalChunks: number;
+  parts: Map<number, string>;
+  totalBytes: number;
+  createdAt: number;
+  transport?: unknown;
+}
+
+/**
+ * Reassembles AWS Quick S2C `_chunked_frame` fragments into the complete JSON event object.
+ * Passes through all non-chunked events with zero overhead.
+ */
+export class ChunkedFrameAssembler {
+  private readonly groups = new Map<string, ChunkGroup>();
+
+  push(ev: Record<string, unknown>): Record<string, unknown> | null {
+    if (ev.type !== '_chunked_frame') return ev;
+
+    const chunkId = typeof ev.chunk_id === 'string' ? ev.chunk_id : '';
+    const chunkIndex = typeof ev.chunk_index === 'number' ? ev.chunk_index : -1;
+    const totalChunks = typeof ev.total_chunks === 'number' ? ev.total_chunks : -1;
+    const data = typeof ev.data === 'string' ? ev.data : '';
+
+    if (
+      !chunkId ||
+      !Number.isInteger(chunkIndex) ||
+      !Number.isInteger(totalChunks) ||
+      totalChunks <= 0 ||
+      totalChunks > MAX_CHUNKED_FRAME_PARTS ||
+      chunkIndex < 0 ||
+      chunkIndex >= totalChunks
+    ) {
+      return null;
+    }
+
+    const now = Date.now();
+    for (const [id, grp] of this.groups) {
+      if (now - grp.createdAt > CHUNK_GROUP_TTL_MS) {
+        this.groups.delete(id);
+      }
+    }
+
+    let group = this.groups.get(chunkId);
+    if (!group) {
+      if (this.groups.size >= MAX_INFLIGHT_CHUNK_GROUPS) {
+        const oldestKey = this.groups.keys().next().value;
+        if (oldestKey) this.groups.delete(oldestKey);
+      }
+      group = {
+        totalChunks,
+        parts: new Map(),
+        totalBytes: 0,
+        createdAt: now,
+        transport: ev._transport,
+      };
+      this.groups.set(chunkId, group);
+    }
+
+    if (group.totalChunks !== totalChunks) {
+      this.groups.delete(chunkId);
+      return null;
+    }
+
+    if (!group.parts.has(chunkIndex)) {
+      const partBytes = Buffer.byteLength(data, 'utf8');
+      if (group.totalBytes + partBytes > MAX_CHUNKED_FRAME_TOTAL_BYTES) {
+        this.groups.delete(chunkId);
+        return null;
+      }
+      group.parts.set(chunkIndex, data);
+      group.totalBytes += partBytes;
+    }
+    if (ev._transport !== undefined) {
+      group.transport = ev._transport;
+    }
+
+    if (group.parts.size < group.totalChunks) {
+      return null;
+    }
+
+    const ordered: string[] = [];
+    for (let i = 0; i < group.totalChunks; i++) {
+      const part = group.parts.get(i);
+      if (part === undefined) {
+        this.groups.delete(chunkId);
+        return null;
+      }
+      ordered.push(part);
+    }
+    const transport = group.transport;
+    this.groups.delete(chunkId);
+
+    try {
+      const parsed = JSON.parse(ordered.join('')) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        if (parsed._transport === undefined && transport !== undefined) {
+          parsed._transport = transport;
+        }
+        return parsed;
+      }
+    } catch {
+      // Malformed chunked payload — drop safely
+    }
+    return null;
+  }
+
+  clear(): void {
+    this.groups.clear();
+  }
+}

@@ -9,6 +9,7 @@ import vm from "node:vm";
 import {
   cborDecode,
   cborEncode,
+  ChunkedFrameAssembler,
   decodeCloudOutputFrame,
   decodeGatewayFrame,
   drainEventStream,
@@ -290,21 +291,21 @@ describe("Credential parser & ClientKeyStore", () => {
     const makeEl = (id = ""): Record<string, unknown> => ({
       id,
       style: {},
-      classList: { add() {}, remove() {}, contains() { return false; }, toggle() {} },
-      setAttribute() {},
+      classList: { add() { }, remove() { }, contains() { return false; }, toggle() { } },
+      setAttribute() { },
       getAttribute() { return null; },
       hasAttribute() { return false; },
-      addEventListener() {},
-      removeEventListener() {},
-      focus() {},
+      addEventListener() { },
+      removeEventListener() { },
+      focus() { },
       querySelector() { return makeEl(); },
       querySelectorAll() { return []; },
-      appendChild() {},
-      insertBefore() {},
+      appendChild() { },
+      insertBefore() { },
       children: [],
       options: [{ textContent: "all", value: "all" }],
       selectedIndex: 0,
-      parentNode: { insertBefore() {}, removeChild() {} },
+      parentNode: { insertBefore() { }, removeChild() { } },
       textContent: "",
       value: id === "credStatusFilter" ? "all" : "",
       innerHTML: "",
@@ -312,28 +313,28 @@ describe("Credential parser & ClientKeyStore", () => {
     });
     const ctx: Record<string, unknown> = {
       location: { pathname: "/dashboard", origin: "http://localhost:3456", search: "" },
-      navigator: { language: "zh-CN", clipboard: { writeText: async () => {} } },
-      localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
-      sessionStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+      navigator: { language: "zh-CN", clipboard: { writeText: async () => { } } },
+      localStorage: { getItem() { return null; }, setItem() { }, removeItem() { } },
+      sessionStorage: { getItem() { return null; }, setItem() { }, removeItem() { } },
       document: {
-        documentElement: { lang: "zh-CN", setAttribute() {}, getAttribute() { return "light"; } },
+        documentElement: { lang: "zh-CN", setAttribute() { }, getAttribute() { return "light"; } },
         getElementById(id: string) { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); },
         querySelector() { return makeEl(); },
         querySelectorAll() { return []; },
         createElement(tag: string) { return makeEl(tag); },
         createElementNS() { return makeEl(); },
         createTreeWalker() { return { nextNode() { return null; } }; },
-        addEventListener() {},
+        addEventListener() { },
         body: makeEl("body"),
       },
-      addEventListener() {},
-      removeEventListener() {},
+      addEventListener() { },
+      removeEventListener() { },
       fetch: async () => ({ ok: false, status: 401, json: async () => ({}) }),
       setTimeout: () => 0,
-      clearTimeout() {},
+      clearTimeout() { },
       setInterval: () => 0,
-      clearInterval() {},
-      Event: class {},
+      clearInterval() { },
+      Event: class { },
       NodeFilter: { SHOW_TEXT: 4 },
       console, Date, Math, JSON, Number, String, Boolean, Array, Object, Set, Map, Promise, RegExp, encodeURI, encodeURIComponent,
     };
@@ -2784,7 +2785,7 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       });
       await assert.rejects(
         async () => {
-          for await (const _ of engine.executeTurnWithPool(turn11Imgs, emptyPool)) {}
+          for await (const _ of engine.executeTurnWithPool(turn11Imgs, emptyPool)) { }
         },
         (err: unknown) => (err as { status?: number })?.status === 400,
       );
@@ -2807,7 +2808,7 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       });
       await assert.rejects(
         async () => {
-          for await (const _ of engine.executeTurnWithPool(turn6Files, emptyPool)) {}
+          for await (const _ of engine.executeTurnWithPool(turn6Files, emptyPool)) { }
         },
         (err: unknown) => (err as { status?: number })?.status === 400,
       );
@@ -3186,5 +3187,553 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       mkTurn(6_000),
     );
     assert.equal(u4.input_tokens + u4.cache_read_input_tokens + u4.cache_creation_input_tokens, 15_200);
+  });
+
+  it("reassembles S2C _chunked_frame, aggregates multi-step cloud tool turn_usage, sends native stop_generation on abort, and aligns wire fields", async () => {
+    // 1) ChunkedFrameAssembler: out-of-order reassembly + _transport preservation
+    const assembler = new ChunkedFrameAssembler();
+    const bigPayload = JSON.stringify({ type: "tree_sync", payload: { active_branch_id: "branch-abc123", root_session_id: "root-xyz" } });
+    const mid = Math.floor(bigPayload.length / 2);
+    assert.equal(
+      assembler.push({ type: "_chunked_frame", chunk_id: "c1", chunk_index: 1, total_chunks: 2, data: bigPayload.slice(mid), _transport: { sequence: "42" } }),
+      null,
+    );
+    const reassembled = assembler.push({ type: "_chunked_frame", chunk_id: "c1", chunk_index: 0, total_chunks: 2, data: bigPayload.slice(0, mid) });
+    assert.deepEqual(reassembled, {
+      type: "tree_sync",
+      payload: { active_branch_id: "branch-abc123", root_session_id: "root-xyz" },
+      _transport: { sequence: "42" },
+    });
+
+    // 2) Mock WS replay: multi-step cloud tool (`file_read_image`) with 2x turn_usage, thinking_start/complete, tree_sync,
+    //    and wire verification (traceparent, thinking_effort="off" on fast, web_search_enabled=false with client tools)
+    const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+    const { QuickExecutionEngine } = await import("../src/core/engine.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+
+    const seenFrames: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    let stopGenerationSeen: Record<string, unknown> | null = null;
+    let scenario: "multistep" | "abort" = "multistep";
+
+    const sendCloud = (ws: import("ws").WebSocket, obj: Record<string, unknown>) => {
+      const esPayload = new TextEncoder().encode(
+        JSON.stringify({ payload: Buffer.from(JSON.stringify(obj), "utf8").toString("base64") }),
+      );
+      ws.send(encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, esPayload));
+    };
+
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    const addr = wss.address();
+    const wsPort = typeof addr === "object" && addr ? addr.port : 0;
+
+    wss.on("connection", (ws) => {
+      ws.on("message", (raw) => {
+        const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+        const inner = JSON.parse(Buffer.from(outer.payload?.payload || "", "base64").toString("utf8")) as {
+          type: string;
+          payload?: Record<string, unknown>;
+        };
+        seenFrames.push({ type: inner.type, payload: inner.payload || {} });
+        if (inner.type === "session_connect") {
+          sendCloud(ws, { type: "session_established", workingSessionId: "ws-proto-1" });
+          sendCloud(ws, { type: "connected", payload: { user: { email: "proto@example.com" } }, _transport: { version: 1, sequence: "1" } });
+          return;
+        }
+        if (inner.type === "stop_generation") {
+          stopGenerationSeen = inner.payload || {};
+          sendCloud(ws, { type: "message_complete", payload: { text: "", initiator: "user" }, message_id: String(inner.payload?.message_id || ""), thread_id: String(inner.payload?.thread_id || "") });
+          return;
+        }
+        if (inner.type !== "user_message") return;
+        const tid = String(inner.payload?.thread_id || "t-proto");
+        if (scenario === "multistep") {
+          sendCloud(ws, { type: "message_start", message_id: "msg-asst-01", thread_id: tid, payload: { role: "assistant" }, _transport: { sequence: "2" } });
+          sendCloud(ws, { type: "thinking_start", turn_message_id: "msg-asst-01", thread_id: tid, payload: {}, _transport: { sequence: "3" } });
+          sendCloud(ws, { type: "thinking_delta", turn_message_id: "msg-asst-01", thread_id: tid, payload: { delta: "checking image" }, _transport: { sequence: "4" } });
+          sendCloud(ws, { type: "thinking_complete", turn_message_id: "msg-asst-01", thread_id: tid, payload: { thinking: "checking image" }, _transport: { sequence: "5" } });
+          sendCloud(ws, { type: "tool_start", turn_message_id: "msg-asst-01", thread_id: tid, payload: { tool_id: "tu_1", tool_name: "file_read_image" }, _transport: { sequence: "6" } });
+          sendCloud(ws, {
+            type: "turn_usage",
+            turn_message_id: "msg-asst-01",
+            thread_id: tid,
+            payload: { input_tokens: 4, output_tokens: 200, cache_read_tokens: 35_000, cache_write_tokens: 40_000, total_tokens: 75_204, context_window: 1_000_000, resolved_model_id: "us.anthropic.claude-haiku-5-5" },
+            _transport: { sequence: "7" },
+          });
+          sendCloud(ws, { type: "tool_result", turn_message_id: "msg-asst-01", thread_id: tid, payload: { tool_id: "tu_1", tool_name: "file_read_image", status: "complete" }, _transport: { sequence: "8" } });
+          sendCloud(ws, { type: "text_delta", turn_message_id: "msg-asst-01", thread_id: tid, payload: { delta: "Done reading." }, _transport: { sequence: "9" } });
+          sendCloud(ws, {
+            type: "turn_usage",
+            turn_message_id: "msg-asst-01",
+            thread_id: tid,
+            payload: { input_tokens: 2, output_tokens: 300, cache_read_tokens: 75_000, cache_write_tokens: 1_000, total_tokens: 76_302, context_window: 1_000_000, resolved_model_id: "us.anthropic.claude-haiku-5-5" },
+            _transport: { sequence: "10" },
+          });
+          sendCloud(ws, { type: "message_complete", turn_message_id: "msg-asst-01", thread_id: tid, payload: { text: "Done reading." }, _transport: { sequence: "11" } });
+        } else if (scenario === "abort") {
+          sendCloud(ws, { type: "message_start", message_id: "msg-abort-99", thread_id: tid, payload: { role: "assistant" }, _transport: { sequence: "20" } });
+          sendCloud(ws, { type: "thinking_delta", turn_message_id: "msg-abort-99", thread_id: tid, payload: { delta: "long thinking..." }, _transport: { sequence: "21" } });
+        }
+      });
+    });
+
+    const oauthKey = serializeOAuthCredential({
+      region: "us-east-1",
+      issuerUrl: "https://identitycenter.amazonaws.com/ssoins-proto",
+      wsHost: "qbs-cell-proto.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+      clientId: "cid_proto_test",
+      clientSecret: "csec_proto_test",
+      refreshToken: "aor_proto_v1",
+      accessToken: "aoa_proto_valid",
+      expiresAt: Date.now() + 3_600_000,
+    });
+    const cfg = loadConfigFromEnv({ QUICK_TOKENS: oauthKey, AUTO_ENSURE_CODING_AGENT: "false" });
+    const pool = new UpstreamKeyPool(cfg);
+    const usageTracker = new UsageTracker();
+    const engine = new QuickExecutionEngine({
+      config: cfg,
+      usageTracker,
+      webSocketFactory: () => new WsClient(`ws://127.0.0.1:${wsPort}`),
+    });
+
+    try {
+      // Scenario A: multi-step cloud tool turn with client tools on quick-fast
+      const turnFast = parseAnthropicMessagesRequest({
+        model: "quick-fast",
+        max_tokens: 256,
+        tools: [{ name: "Read", description: "Read file", input_schema: { type: "object", properties: { path: { type: "string" } } } }],
+        messages: [{ role: "user", content: "Inspect image" }],
+      });
+      const eventsA: Array<import("../src/core/types.js").GatewayStreamEvent> = [];
+      for await (const ev of engine.executeTurnWithPool(turnFast, pool)) {
+        eventsA.push(ev);
+      }
+      const usageEvents = eventsA.filter((e) => e.type === "usage");
+      assert.equal(usageEvents.length, 1, "multi-step turn_usage must be aggregated and emitted ONCE");
+      if (usageEvents[0]?.type === "usage") {
+        assert.equal(usageEvents[0].metrics.outputTokens, 500, "outputTokens must sum across internal cloud tool steps (200+300)");
+        assert.equal(usageEvents[0].metrics.totalTokens, 76_302);
+      }
+      assert.equal(usageTracker.snapshot().totals.outputTokens, 500, "UsageTracker must not double-count multi-step turns");
+
+      const userMsgFrame = seenFrames.find((f) => f.type === "user_message");
+      assert.ok(userMsgFrame);
+      assert.match(String(userMsgFrame.payload.traceparent || ""), /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+      assert.equal(userMsgFrame.payload.thinking_effort, "off", "fast mode must explicitly send thinking_effort='off'");
+      assert.equal(userMsgFrame.payload.web_search_enabled, false, "web_search_enabled must default false when client tools are present");
+
+      // Scenario B: client abort sends native `stop_generation` with assistant message_id and throws 499
+      scenario = "abort";
+      const abortCtrl = new AbortController();
+      const turnAbort = parseAnthropicMessagesRequest(
+        { model: "quick-smart", max_tokens: 256, messages: [{ role: "user", content: "Abort test" }] },
+        {},
+        abortCtrl.signal,
+      );
+      let caughtAbort: unknown;
+      try {
+        for await (const ev of engine.executeTurnWithPool(turnAbort, pool)) {
+          if (ev.type === "thinking") {
+            abortCtrl.abort();
+          }
+        }
+      } catch (e) {
+        caughtAbort = e;
+      }
+      assert.equal((caughtAbort as { status?: number })?.status, 499, "mid-stream abort must throw 499 client_aborted");
+      await new Promise((r) => setTimeout(r, 80));
+      assert.ok(stopGenerationSeen, "upstream must receive native stop_generation frame on client abort");
+      assert.equal((stopGenerationSeen as Record<string, unknown>).message_id, "msg-abort-99");
+    } finally {
+      pool.dispose();
+      await engine.disposeAll();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it("persists rotated OAuth refresh_token and preserves metadata/affinity across restart, hardens tool-bridge lexer, and fixes OpenAI usage/incomplete status", async () => {
+    // 1) OAuth refresh_token rotation persistence + Web in-place renewal slotId stability
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-rot-"));
+    try {
+      const envPath = path.join(tmpDir, ".env");
+      const origOAuth = serializeOAuthCredential({
+        region: "us-east-1",
+        issuerUrl: "https://identitycenter.amazonaws.com/ssoins-rot",
+        wsHost: "qbs-cell-rot.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+        clientId: "cid_rotate_1",
+        clientSecret: "csec_rotate_1",
+        refreshToken: "aor_rot_v1",
+        accessToken: "aoa_rot_v1",
+        expiresAt: Date.now() + 3_600_000,
+      });
+      writeFileSync(envPath, `QUICK_TOKENS=${origOAuth}\n`, "utf8");
+      const cfg1 = loadConfigFromEnv({ QUICK_TOKENS: origOAuth }, envPath);
+      const pool1 = new UpstreamKeyPool(cfg1);
+      const slotBefore = pool1.statusSnapshot()[0]!;
+      pool1.updateSlotMeta(slotBefore.slotId, { label: "Prod-US", chatAgentId: "agent-custom-1" });
+      const lease = pool1.leaseKey("quick-smart", undefined, "conv-sticky-1");
+      lease.release();
+
+      const rotated = pool1.rotateOAuthRefreshToken("cid_rotate_1", "aor_rot_v2", "aoa_rot_v2", Date.now() + 7_200_000);
+      assert.equal(rotated, true);
+      pool1.dispose();
+
+      // Reload from disk `.env` simulating process restart
+      const envText = readFileSync(envPath, "utf8");
+      const parsedEnv: Record<string, string> = {};
+      for (const line of envText.split(/\r?\n/)) {
+        const eq = line.indexOf("=");
+        if (eq > 0) parsedEnv[line.slice(0, eq)] = line.slice(eq + 1);
+      }
+      const cfg2 = loadConfigFromEnv(parsedEnv, envPath);
+      const pool2 = new UpstreamKeyPool(cfg2);
+      const slotAfter = pool2.statusSnapshot()[0]!;
+      const reloadedCred = parseOAuthCredential(pool2.allManagedKeys()[0]!.rawKey);
+      assert.equal(reloadedCred?.refreshToken, "aor_rot_v2", "rotated refreshToken must survive restart");
+      assert.equal(slotAfter.label, "Prod-US", "slot label must survive refreshToken rotation");
+      assert.equal(slotAfter.chatAgentId, "agent-custom-1", "slot chatAgentId must survive refreshToken rotation");
+      pool2.dispose();
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // 2) Tool-bridge: literal `</tool_call>` inside JSON string arg + fenced code block after real call
+    const allowed = new Set(["Edit", "Read"]);
+    const tricky = [
+      "Updating file:",
+      '<tool_call>{"name":"Edit","arguments":{"file":"tool-bridge.ts","content":"const close = \\"</tool_call>\\";"}}</tool_call>',
+      "\nExample in docs:\n```xml\n<tool_call>{\"name\":\"Read\",\"arguments\":{\"path\":\"/etc/hosts\"}}</tool_call>\n```",
+    ].join("\n");
+    const filter = new StreamingToolCallFilter(allowed);
+    let streamed = "";
+    for (let i = 0; i < tricky.length; i += 7) {
+      streamed += filter.feed(tricky.slice(i, i + 7));
+    }
+    const flushed = filter.flush();
+    assert.equal(flushed.toolCalls.length, 1, "fenced code block after real tool_call must NOT execute as a second tool call");
+    assert.equal(flushed.toolCalls[0]!.name, "Edit");
+    assert.equal(flushed.toolCalls[0]!.argsObject.content, 'const close = "</tool_call>";');
+    assert.ok((streamed + flushed.remainingText).includes("```xml"));
+
+    // 3) OpenAI usage includes cacheWriteTokens & Responses API honors stopReason="length" -> status="incomplete"
+    const { openAiChatAdapter } = await import("../src/protocols/openai.js");
+    const oaiTurn = parseChatCompletionsRequest({ model: "quick-balanced", messages: [{ role: "user", content: "hi" }] });
+    async function* mockLengthStream(): AsyncGenerator<import("../src/core/types.js").GatewayStreamEvent> {
+      yield { type: "text", text: "partial output" };
+      yield { type: "usage", metrics: { inputTokens: 4, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 74_000 } };
+      yield { type: "done", stopReason: "length" };
+    }
+    const chatJson = (await openAiChatAdapter.collectJson(mockLengthStream(), oaiTurn)) as {
+      usage: { prompt_tokens: number; total_tokens: number };
+    };
+    assert.equal(chatJson.usage.prompt_tokens, 74_004, "OpenAI prompt_tokens must include cacheWriteTokens");
+    assert.equal(chatJson.usage.total_tokens, 74_104);
+
+    const respTurn = parseResponsesRequest({ model: "quick-balanced", input: "hi" });
+    const respJson = (await openAiResponsesAdapter.collectJson(mockLengthStream(), respTurn)) as {
+      status: string;
+      incomplete_details?: { reason: string };
+      usage: { input_tokens: number };
+    };
+    assert.equal(respJson.status, "incomplete");
+    assert.equal(respJson.incomplete_details?.reason, "max_output_tokens");
+    assert.equal(respJson.usage.input_tokens, 74_004);
+
+    // 4) RequestAttachmentCache dedup + 504 failover classification
+    const { RequestAttachmentCache } = await import("../src/core/request-attachment-cache.js");
+    const attCache = new RequestAttachmentCache();
+    let uploadCalls = 0;
+    const buf = Buffer.from("same-bytes");
+    const up = async () => {
+      uploadCalls += 1;
+      return { type: "file" as const, name: "a.txt", size: buf.length, mimeType: "text/plain", path: "/p/a.txt", attachmentId: "att-1", contentSha256: "abc" };
+    };
+    await attCache.getOrUploadAttachment("slot1", "th1", buf, up);
+    await attCache.getOrUploadAttachment("slot1", "th1", buf, up);
+    assert.equal(uploadCalls, 1, "RequestAttachmentCache must deduplicate identical uploads on same slot+thread");
+
+    const cls504 = classifyUpstreamError(new GatewayError("AWS Quick stream timed out", 504, "timeout_error"));
+    assert.equal(cls504.isProxyOrConnErr, true, "504 timeout_error must be eligible for cross-account failover");
+  });
+
+  it("extracted WarmSessionPool & buildOutboundChatFrame preserve park/lookup/evict and wire parity", async () => {
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { buildOutboundChatFrame } = await import("../src/core/turn-frame-builder.js");
+    const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+
+    // 1) WarmSessionPool park -> lookup -> evict -> dispose lifecycle
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((resolve) => wss.once("listening", resolve));
+    const port = (wss.address() as { port: number }).port;
+    const pool = new WarmSessionPool({ maxWarmSessions: 10, warmSessionTtlMs: 60_000 });
+    try {
+      const ws1 = new WsClient(`ws://127.0.0.1:${port}`);
+      const ws2 = new WsClient(`ws://127.0.0.1:${port}`);
+      await Promise.all([
+        new Promise<void>((resolve) => ws1.once("open", resolve)),
+        new Promise<void>((resolve) => ws2.once("open", resolve)),
+      ]);
+      assert.equal(
+        pool.park({
+          scope: "anthropic",
+          conversationKey: "conv-1",
+          slotId: "slot-a",
+          isIncognito: true,
+          chatAgentId: "agent-1",
+          prefixHashes: ["hash-1", "hash-1-alt"],
+          threadId: "th-1",
+          rootThreadId: "root-1",
+          ws: ws1,
+          outpostId: "op-1",
+          encodeFrame: (f) => JSON.stringify(f),
+          apiKey: "dummy-key",
+          lastAckSeq: "7",
+        }),
+        true,
+      );
+      assert.equal(pool.countParkedWsForSlot("slot-a"), 1);
+      assert.equal(pool.stats().warmIdleSessions, 1);
+
+      // Lookup hits by alternate hash and hands back the live WS
+      const hit = pool.lookup("anthropic", "conv-1", "slot-a", true, "hash-1-alt", "agent-1");
+      assert.ok(hit, "WarmSessionPool.lookup should hit alternate prefix hash");
+      assert.equal(hit.threadId, "th-1");
+      assert.equal(hit.rootThreadId, "root-1");
+      assert.equal(hit.reusedOutpostId, "op-1");
+      assert.equal(hit.reusedWs, ws1);
+      assert.equal(pool.countParkedWsForSlot("slot-a"), 0);
+
+      // Park ws2 and verify explicit eviction closes it cleanly
+      pool.park({
+        scope: "anthropic",
+        conversationKey: "conv-2",
+        slotId: "slot-a",
+        isIncognito: false,
+        prefixHashes: ["hash-2"],
+        threadId: "th-2",
+        rootThreadId: "th-2",
+        ws: ws2,
+        outpostId: "op-1",
+        encodeFrame: (f) => JSON.stringify(f),
+        apiKey: "dummy-key",
+      });
+      assert.equal(pool.evictParkedWsForSlot("slot-a", 1), 1);
+      assert.equal(pool.countParkedWsForSlot("slot-a"), 0);
+      ws1.close();
+    } finally {
+      pool.disposeAll();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+
+    // 2) buildOutboundChatFrame parity: user_message vs edit_message
+    const sampleTurn = parseChatCompletionsRequest({
+      model: "quick-fast",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [{ type: "function", function: { name: "Read", parameters: { type: "object", properties: {} } } }],
+    });
+    const fastUserFrame = buildOutboundChatFrame({
+      chunkText: "hello",
+      msgId: "msg-12345678",
+      isFinal: true,
+      isInternalRephraseCall: false,
+      webSearchEnabled: true,
+      turn: sampleTurn,
+      agentMode: "fast",
+      thinkingEffort: "off",
+      chatAgentId: "agent-xyz",
+      effectiveCustomPrompt: "Use tools",
+      attachments: [],
+      surfaceType: "QUICK_WORK_DESKTOP_MAC",
+      outpostId: "op-1",
+      appVersion: "1.2.4757",
+      surfaceName: "desktop",
+      threadId: "th-a",
+      isIncognito: true,
+    });
+    assert.equal(fastUserFrame.type, "user_message");
+    const uPayload = fastUserFrame.payload as Record<string, unknown>;
+    assert.equal(uPayload.thinking_effort, "off", "fast mode must explicitly send thinking_effort=off");
+    assert.equal(uPayload.web_search_enabled, false, "client tools present must suppress cloud web_search_enabled");
+    assert.equal(uPayload.acp_first_text, 1, "user_message should include DESKTOP_CAPABILITIES");
+    assert.equal(uPayload.incognito, true);
+    assert.match(String(uPayload.traceparent), /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+
+    const editFrame = buildOutboundChatFrame({
+      chunkText: "rephrased hello",
+      msgId: "msg-87654321",
+      isFinal: true,
+      isInternalRephraseCall: false,
+      webSearchEnabled: true,
+      turn: sampleTurn,
+      agentMode: "smart",
+      thinkingEffort: "high",
+      chatAgentId: "agent-xyz",
+      effectiveCustomPrompt: "Use tools",
+      attachments: [],
+      surfaceType: "QUICK_WORK_DESKTOP_MAC",
+      outpostId: "op-1",
+      appVersion: "1.2.4757",
+      surfaceName: "desktop",
+      threadId: "th-a",
+      isIncognito: true,
+      editBranch: {
+        originalMessageId: "msg-12345678",
+        rootSessionId: "root-a",
+        threadId: "th-a",
+      },
+    });
+    assert.equal(editFrame.type, "edit_message");
+    const ePayload = editFrame.payload as Record<string, unknown>;
+    assert.equal(ePayload.original_message_id, "msg-12345678");
+    assert.equal(ePayload.root_session_id, "root-a");
+    assert.equal("incognito" in ePayload, false, "edit_message must NOT leak incognito");
+    assert.equal("acp_first_text" in ePayload, false, "edit_message must NOT leak session capabilities");
+    assert.equal(ePayload.coding_agent_setup_card, 0, "edit_message in incognito carries coding_agent_setup_card=0");
+  });
+
+  it("turn-stream-runner handles runIdleTimeoutMs, mid-chunk disconnect, and turn_aborted partial finalization", async () => {
+    const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { StreamingUiTagSanitizer } = await import("../src/core/ui-tag-sanitizer.js");
+    const { decodeCloudOutputFrame, encodeCloudInputFrame } = await import("../src/aws-quick/event-stream-cbor.js");
+    const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+
+    const sendCloudOut = (sock: import("ws").WebSocket, ev: Record<string, unknown>) => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      sock.send(
+        encodeEventStream(
+          { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+          Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+        ),
+      );
+    };
+
+    type Scenario = "idle_timeout" | "mid_chunk_disconnect" | "turn_aborted_partial";
+    let activeScenario: Scenario = "idle_timeout";
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((resolve) => wss.once("listening", resolve));
+    const port = (wss.address() as { port: number }).port;
+
+    wss.on("connection", (sock) => {
+      sock.on("message", (raw) => {
+        let inner: { type?: string; payload?: Record<string, unknown> } | undefined;
+        try {
+          const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+          if (outer.payload?.payload) {
+            inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"));
+          }
+        } catch {
+          return;
+        }
+        if (!inner) return;
+        if (inner.type === "session_connect") {
+          sendCloudOut(sock, { type: "session_established", payload: {} });
+          return;
+        }
+        if (inner.type === "user_message") {
+          const tid = String(inner.payload?.thread_id || "th-edge");
+          if (activeScenario === "idle_timeout") {
+            // Emit one delta then go completely silent to trigger runIdleTimeoutMs
+            sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "Hello" } });
+          } else if (activeScenario === "mid_chunk_disconnect") {
+            // Upstream terminates during chunk 1/2 before chunk 2 is sent
+            sendCloudOut(sock, { type: "stream_ended", thread_id: tid, payload: {} });
+          } else if (activeScenario === "turn_aborted_partial") {
+            // Emit partial text + usage, then upstream sends turn_aborted
+            sendCloudOut(sock, { type: "text_delta", thread_id: tid, payload: { delta: "Partial answer..." } });
+            sendCloudOut(sock, {
+              type: "turn_usage",
+              thread_id: tid,
+              payload: { input_tokens: 120, output_tokens: 18, total_tokens: 138, context_window: 200_000 },
+            });
+            sendCloudOut(sock, { type: "turn_aborted", thread_id: tid, payload: {} });
+          }
+        }
+      });
+    });
+
+    const baseTurn = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      messages: [{ role: "user", content: "edge case test" }],
+    });
+
+    const runScenario = async (scenario: Scenario, overrides?: { chunks?: string[]; runIdleTimeoutMs?: number }) => {
+      activeScenario = scenario;
+      const ws = new WsClient(`ws://127.0.0.1:${port}`);
+      const warmPool = new WarmSessionPool({ maxWarmSessions: 4, warmSessionTtlMs: 60_000 });
+      const events: import("../src/core/types.js").GatewayStreamEvent[] = [];
+      let caught: unknown;
+      try {
+        for await (const ev of runTurnStream({
+          ws,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "QUICK_WORK_DESKTOP_MAC",
+          appVersion: "1.2.4757",
+          surfaceName: "desktop",
+          outpostId: "op-edge",
+          turn: { ...baseTurn, currentInputPrefixHash: "hash-edge-1" },
+          apiKey: "dummy-key",
+          slotId: "slot-edge",
+          execMode: "incognito",
+          selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "medium" },
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          threadId: `th-${scenario}`,
+          effectiveRootThreadId: `th-${scenario}`,
+          chunks: overrides?.chunks || ["edge case test"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "edge case test",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          runMaxTimeoutMs: 5_000,
+          runIdleTimeoutMs: overrides?.runIdleTimeoutMs ?? 0,
+          showRoutedModelInThinking: false,
+          webSearchEnabled: false,
+          usageTracker: new UsageTracker(),
+          warmPool,
+        })) {
+          events.push(ev);
+        }
+      } catch (err) {
+        caught = err;
+      } finally {
+        const stats = warmPool.stats();
+        warmPool.disposeAll();
+        return { events, caught, stats };
+      }
+    };
+
+    try {
+      // 1) runIdleTimeoutMs triggers 504 timeout_error after upstream goes silent mid-stream
+      const r1 = await runScenario("idle_timeout", { runIdleTimeoutMs: 120 });
+      assert.ok(r1.caught instanceof GatewayError, "idle timeout must throw GatewayError");
+      assert.equal(r1.caught.status, 504);
+      assert.equal(r1.caught.code, "timeout_error");
+      assert.match(r1.caught.message, /idle timed out/i);
+
+      // 2) Multi-chunk mid-upload disconnect raises 502 upstream_error instead of finalizing early
+      const r2 = await runScenario("mid_chunk_disconnect", { chunks: ["chunk-1-body", "chunk-2-body"] });
+      assert.ok(r2.caught instanceof GatewayError, "mid-chunk disconnect must throw GatewayError");
+      assert.equal(r2.caught.status, 502);
+      assert.equal(r2.caught.code, "upstream_error");
+      assert.match(r2.caught.message, /mid-chunk upload/i);
+
+      // 3) turn_aborted after partial text gracefully finalizes (emits text + usage + done) and does NOT park WS
+      const r3 = await runScenario("turn_aborted_partial");
+      assert.equal(r3.caught, undefined, "turn_aborted with partial text should finalize cleanly without throwing");
+      const textOut = r3.events.filter((e) => e.type === "text").map((e) => e.text).join("");
+      assert.equal(textOut, "Partial answer...");
+      assert.ok(r3.events.some((e) => e.type === "usage" && e.metrics.outputTokens === 18));
+      assert.ok(r3.events.some((e) => e.type === "done" && e.stopReason === "stop"));
+      assert.equal(r3.stats.warmIdleSessions, 0, "turn_aborted must NEVER park the WS for reuse");
+    } finally {
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
   });
 });

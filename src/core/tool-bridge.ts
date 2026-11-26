@@ -239,7 +239,11 @@ function repairJsonOutsideStrings(input: string): string {
     if (ch === "\n") escapedOut += "\\n";
     else if (ch === "\r") escapedOut += "\\r";
     else if (ch === "\t") escapedOut += "\\t";
-    else escapedOut += ch;
+    else {
+      const code = ch.charCodeAt(0);
+      if (code < 0x20) escapedOut += `\\u${code.toString(16).padStart(4, "0")}`;
+      else escapedOut += ch;
+    }
   }
 
   // Second pass: remove trailing commas strictly outside string literals.
@@ -303,8 +307,8 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
   const fromRepaired = tryDirect(repaired);
   if (fromRepaired) return fromRepaired;
 
-  // Last resort: recover 1-2 missing closing braces on truncated tail objects.
-  let openBraces = 0;
+  // Last resort: recover 1-2 missing closing braces/brackets on truncated tail objects.
+  const openStack: string[] = [];
   let inStr = false;
   let esc = false;
   for (let i = 0; i < repaired.length; i += 1) {
@@ -315,12 +319,17 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
       else if (ch === "\"") inStr = false;
     } else {
       if (ch === "\"") inStr = true;
-      else if (ch === "{") openBraces += 1;
-      else if (ch === "}") openBraces -= 1;
+      else if (ch === "{") openStack.push("}");
+      else if (ch === "[") openStack.push("]");
+      else if (ch === "}" || ch === "]") {
+        if (openStack.length > 0 && openStack[openStack.length - 1] === ch) {
+          openStack.pop();
+        }
+      }
     }
   }
-  if (!inStr && openBraces > 0 && openBraces <= 2) {
-    return tryDirect(repaired + "}".repeat(openBraces));
+  if (!inStr && openStack.length > 0 && openStack.length <= 2) {
+    return tryDirect(repaired + openStack.reverse().join(""));
   }
   return null;
 }
@@ -359,10 +368,85 @@ function buildNormalizedToolCall(
   };
 }
 
+interface FenceState {
+  char: "`" | "~" | null;
+  len: number;
+  linePrefix: string;
+}
+
+function updateFenceStateForSegment(state: FenceState, segment: string): void {
+  if (!segment) return;
+  const combined = state.linePrefix + segment;
+  const lines = combined.split("\n");
+  state.linePrefix = lines.pop() ?? "";
+  for (const line of lines) {
+    applyFenceLine(state, line);
+  }
+}
+
+function applyFenceLine(state: FenceState, line: string): void {
+  const m = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!m) return;
+  const marker = m[1]!;
+  const rest = m[2] ?? "";
+  const ch = marker[0] as "`" | "~";
+  if (state.char === null) {
+    // Opening fence: backtick fences cannot contain backticks in info string per CommonMark
+    if (ch === "`" && rest.includes("`")) return;
+    state.char = ch;
+    state.len = marker.length;
+  } else if (state.char === ch && marker.length >= state.len && rest.trim() === "") {
+    // Closing fence: same char, >= opening length, no trailing info text
+    state.char = null;
+    state.len = 0;
+  }
+}
+
+function isInsideOpenFence(state: FenceState): boolean {
+  return state.char !== null;
+}
+
+/**
+ * Finds the matching `</tool_call>` closing tag starting from `contentStart`,
+ * skipping any `</tool_call>` that occurs inside a JSON double-quoted string literal
+ * so editing source files containing `</tool_call>` never prematurely truncates tool arguments.
+ */
+function findToolCallCloseOutsideJsonStrings(text: string, contentStart: number): number {
+  const lower = text.toLowerCase();
+  const closeLower = TOOL_CALL_CLOSE.toLowerCase();
+  const closeLen = closeLower.length;
+  let inString = false;
+  let escaped = false;
+  for (let i = contentStart; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === "<" && lower.startsWith(closeLower, i)) {
+      return i;
+    }
+  }
+  // Fallback: if JSON string was unclosed/malformed, locate the last closing tag so recovery still works.
+  const fallback = lower.indexOf(closeLower, contentStart);
+  return fallback >= 0 && fallback + closeLen <= text.length ? fallback : -1;
+}
+
 /**
  * Parse `<tool_call>{...}</tool_call>` blocks from model output text,
- * with automatic recovery for minor JSON malformations (trailing commas,
- * unescaped literal newlines in string values) and unclosed trailing `<tool_call>` tags.
+ * respecting Markdown fenced code blocks, inline backticks, and JSON string literals
+ * (so `</tool_call>` inside a tool argument string never truncates the call),
+ * with automatic recovery for minor JSON malformations and unclosed trailing `<tool_call>` tags.
  * When `allowedToolNames` is provided, undeclared tool names (e.g. documentation examples)
  * are preserved as plain text instead of being emitted as real tool calls.
  */
@@ -374,40 +458,61 @@ export function parseToolCallsFromText(
   toolCalls: NormalizedToolCall[];
 } {
   const toolCalls: NormalizedToolCall[] = [];
-  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-  let lastIdx = 0;
   const textParts: string[] = [];
+  const lower = text.toLowerCase();
+  const openLower = TOOL_CALL_OPEN.toLowerCase();
+  const closeLen = TOOL_CALL_CLOSE.length;
 
-  for (const match of text.matchAll(regex)) {
-    const start = match.index ?? 0;
-    const rawBlock = (match[1] ?? "").trim();
-    textParts.push(text.slice(lastIdx, start));
-    lastIdx = start + match[0].length;
+  const fence: FenceState = { char: null, len: 0, linePrefix: "" };
+  let cursor = 0;
+  let scanFrom = 0;
 
-    const parsed = tryParseJsonObject(rawBlock);
-    const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
-    if (tc) {
-      toolCalls.push(tc);
+  while (scanFrom < text.length) {
+    const idx = lower.indexOf(openLower, scanFrom);
+    if (idx === -1) break;
+
+    updateFenceStateForSegment(fence, text.slice(scanFrom, idx));
+    // Also check if the current incomplete line itself opens a fence right before `<tool_call>` (e.g. ```` ```xml<tool_call> ````)
+    const inlineFenceCheck = /^\s*(`{3,}|~{3,})/.test(fence.linePrefix);
+    const isInlineCode = idx > 0 && text[idx - 1] === "`";
+    if (isInsideOpenFence(fence) || inlineFenceCheck || isInlineCode) {
+      scanFrom = idx + openLower.length;
+      continue;
+    }
+
+    const contentStart = idx + openLower.length;
+    const closeIdx = findToolCallCloseOutsideJsonStrings(text, contentStart);
+    if (closeIdx !== -1) {
+      const rawBlock = text.slice(contentStart, closeIdx).trim();
+      const parsed = tryParseJsonObject(rawBlock);
+      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
+      textParts.push(text.slice(cursor, idx));
+      const blockEnd = closeIdx + closeLen;
+      if (tc) {
+        toolCalls.push(tc);
+      } else {
+        // Unrecoverable malformed JSON or undeclared tool name: preserve raw block as text.
+        textParts.push(text.slice(idx, blockEnd));
+      }
+      cursor = blockEnd;
+      scanFrom = blockEnd;
+      fence.linePrefix = "";
     } else {
-      // Unrecoverable malformed JSON or undeclared tool name: preserve raw block as text so nothing is silently lost.
-      textParts.push(match[0]);
+      // Unclosed trailing `<tool_call>...`
+      const rawTail = text.slice(contentStart);
+      const parsed = tryParseJsonObject(rawTail);
+      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
+      if (tc) {
+        textParts.push(text.slice(cursor, idx));
+        toolCalls.push(tc);
+        cursor = text.length;
+      }
+      break;
     }
   }
 
-  const tail = text.slice(lastIdx);
-  const unclosedMatch = /<tool_call>\s*([\s\S]+)$/i.exec(tail);
-  if (unclosedMatch) {
-    const beforeUnclosed = tail.slice(0, unclosedMatch.index);
-    const parsed = tryParseJsonObject(unclosedMatch[1] ?? "");
-    const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
-    if (tc) {
-      textParts.push(beforeUnclosed);
-      toolCalls.push(tc);
-    } else {
-      textParts.push(tail);
-    }
-  } else {
-    textParts.push(tail);
+  if (cursor < text.length) {
+    textParts.push(text.slice(cursor));
   }
 
   return {
@@ -418,15 +523,15 @@ export function parseToolCallsFromText(
 
 /**
  * Streaming helper that emits normal text immediately while buffering once `<tool_call` begins.
- * Zero buffering overhead when a response never emits `<tool_call`.
+ * Zero buffering overhead when a response never emits `<tool_call>`.
  */
 export class StreamingToolCallFilter {
   private readonly allowedToolNames?: ReadonlySet<string>;
   private pending = "";
   private capturing = false;
   private captured = "";
-  private inCodeFence = false;
-  private fenceLinePrefix = "";
+  private readonly fence: FenceState = { char: null, len: 0, linePrefix: "" };
+  private lastEmittedChar = "";
 
   constructor(allowedToolNames?: ReadonlySet<string>) {
     this.allowedToolNames = allowedToolNames;
@@ -442,17 +547,20 @@ export class StreamingToolCallFilter {
     const lower = combined.toLowerCase();
     const openLower = TOOL_CALL_OPEN.toLowerCase();
 
-    // Scan combined while tracking triple-backtick Markdown code fences and inline backticks
+    // Scan combined while tracking Markdown code fences (``` and ~~~) and inline backticks
     // so `<tool_call>` inside documentation/code examples is never mistaken for a real tool invocation.
     let searchFrom = 0;
     while (searchFrom < combined.length) {
       const idx = lower.indexOf(openLower, searchFrom);
       if (idx === -1) break;
       const prefix = combined.slice(searchFrom, idx);
-      this.advanceFenceState(prefix);
-      const isInlineCode = idx > 0 && combined[idx - 1] === "`";
-      if (!this.inCodeFence && !isInlineCode) {
+      updateFenceStateForSegment(this.fence, prefix);
+      const prevChar = idx > 0 ? combined[idx - 1] : this.lastEmittedChar;
+      const isInlineCode = prevChar === "`";
+      const inlineFenceLine = /^\s*(`{3,}|~{3,})/.test(this.fence.linePrefix);
+      if (!isInsideOpenFence(this.fence) && !inlineFenceLine && !isInlineCode) {
         const before = combined.slice(0, idx);
+        if (before.length > 0) this.lastEmittedChar = before[before.length - 1]!;
         this.capturing = true;
         this.captured = combined.slice(idx);
         this.pending = "";
@@ -471,19 +579,10 @@ export class StreamingToolCallFilter {
       }
     }
     const emit = holdLen > 0 ? combined.slice(0, combined.length - holdLen) : combined;
-    this.advanceFenceState(emit.slice(searchFrom));
+    updateFenceStateForSegment(this.fence, emit.slice(searchFrom));
+    if (emit.length > 0) this.lastEmittedChar = emit[emit.length - 1]!;
     this.pending = holdLen > 0 ? combined.slice(combined.length - holdLen) : "";
     return emit;
-  }
-
-  private advanceFenceState(segment: string): void {
-    if (!segment) return;
-    const combined = this.fenceLinePrefix + segment;
-    const lines = combined.split("\n");
-    this.fenceLinePrefix = lines.pop() ?? "";
-    for (const line of lines) {
-      if (/^\s*```/.test(line)) this.inCodeFence = !this.inCodeFence;
-    }
   }
 
   flush(): { remainingText: string; toolCalls: NormalizedToolCall[] } {

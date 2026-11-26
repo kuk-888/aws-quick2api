@@ -2,8 +2,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { QUICK_APP_VERSION, QUICK_DESKTOP_USER_AGENT } from './oauth-client.js';
 import { assertSafeWsHost } from './outpost-singleton.js';
 import type { CloudSessionMeta, QuickQuotaUsage } from './types.js';
+
+const OUTPOST_SURFACE_TYPE =
+  process.platform === 'win32' ? 'QUICK_WORK_DESKTOP_WINDOWS' : 'QUICK_WORK_DESKTOP_MAC';
 
 export interface SncsSession {
   jwt: string;
@@ -204,6 +208,7 @@ export class OutpostHandle {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${session.jwt}`,
+        'User-Agent': QUICK_DESKTOP_USER_AGENT,
         'x-amzn-qs-internal-trace-id': crypto.randomUUID(),
       },
       signal: AbortSignal.timeout(30_000),
@@ -213,8 +218,8 @@ export class OutpostHandle {
           invokeAgent: {
             path: 'profile/usage',
             queryParams: {
-              surfaceType: 'QUICK_WORK_DESKTOP_MAC',
-              appVersion: '1.2.4757',
+              surfaceType: OUTPOST_SURFACE_TYPE,
+              appVersion: QUICK_APP_VERSION,
               _method: 'GET',
             },
             body: {},
@@ -243,6 +248,7 @@ export class OutpostHandle {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${session.jwt}`,
+        'User-Agent': QUICK_DESKTOP_USER_AGENT,
         'x-amzn-qs-internal-trace-id': crypto.randomUUID(),
       },
       signal: AbortSignal.timeout(30_000),
@@ -252,8 +258,8 @@ export class OutpostHandle {
           invokeAgent: {
             path: 'api/ws-rpc',
             queryParams: {
-              surfaceType: 'QUICK_WORK_DESKTOP_MAC',
-              appVersion: '1.2.4757',
+              surfaceType: OUTPOST_SURFACE_TYPE,
+              appVersion: QUICK_APP_VERSION,
               _method: 'POST',
             },
             body: {

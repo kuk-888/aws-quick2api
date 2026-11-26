@@ -107,14 +107,18 @@ export function deriveConversationAffinityKey(params: {
 
   if (typeof rawBody.user === "string" && rawBody.user.trim()) {
     // Combine `user` + first message anchor so one user's separate chat windows don't collide unnecessarily,
-    // while keeping the same chat window 100% sticky even when clients mutate dynamic system prompts.
-    const trimmedFirst = (firstUserText || "").trim();
+    // while keeping the same chat window 100% sticky even when clients mutate dynamic system prompts or `<system-reminder>` blocks.
+    const rawFirst = (firstUserText || "").trim();
+    const strippedFirst = stripSystemReminderTagsLinear(rawFirst).trim();
+    const trimmedFirst = strippedFirst || rawFirst;
     const sysAnchor = trimmedFirst.length >= 16 ? "" : normalizeSystemPromptForHash(systemPrompt || "").slice(0, 512);
     const anchor = `${rawBody.user.trim()}\0${sysAnchor}\0${trimmedFirst.slice(0, 1024)}`;
     return shortHash("usr", anchor);
   }
 
-  const trimmedFirst = (firstUserText || "").trim();
+  const rawFirstImplicit = (firstUserText || "").trim();
+  const strippedFirstImplicit = stripSystemReminderTagsLinear(rawFirstImplicit).trim();
+  const trimmedFirst = strippedFirstImplicit || rawFirstImplicit;
   if (trimmedFirst) {
     // When the first user message is substantive (>= 16 chars), anchor on it alone so dynamic
     // system prompt edits (timestamps, memory lists, todo states in Witan/Agent clients)
@@ -209,6 +213,19 @@ export class SessionAffinityTable {
       }
     }
     return removed;
+  }
+
+  rekeyEntries(oldRawKey: string, newRawKey: string, newSlotId: string, newMaskedKey: string): number {
+    let updated = 0;
+    for (const rec of this.map.values()) {
+      if (rec.rawKey === oldRawKey) {
+        rec.rawKey = newRawKey;
+        rec.slotId = newSlotId;
+        rec.maskedKey = newMaskedKey;
+        updated += 1;
+      }
+    }
+    return updated;
   }
 
   clearAll(): void {

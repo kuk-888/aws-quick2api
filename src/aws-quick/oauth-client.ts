@@ -115,15 +115,18 @@ export async function fetchOAuthUserIdentity(
   try {
     const tok = await resolveOAuthAccessToken(cred, false, proxyUrl);
     const outpostId = deriveStableOutpostId(cred.clientId);
+    const workingSessionId = crypto.randomUUID();
     const surfaceType = process.platform === "win32" ? "QUICK_WORK_DESKTOP_WINDOWS" : "QUICK_WORK_DESKTOP_MAC";
+    const replayContext = `v1;setup;${crypto.randomBytes(32).toString("base64url")}`;
     const qs = new URLSearchParams({
       surfaceType,
       token: tok.accessToken,
       outpostId,
-      workingSessionId: crypto.randomUUID(),
-      channel: "quickwork",
+      workingSessionId,
+      replayContext,
+      channel: "prod",
     });
-    const wsUrl = `wss://${cred.wsHost}:443/streaming/quickwork-chat-bidirectional-stream?${qs.toString()}`;
+    const wsUrl = `wss://${cred.wsHost}/streaming/quickwork-chat-bidirectional-stream?${qs.toString()}`;
     const effectiveProxy = proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY;
     const agent = getProxyAgent(effectiveProxy);
 
@@ -134,7 +137,12 @@ export async function fetchOAuthUserIdentity(
         ...(agent ? { agent } : {}),
         headers: {
           "User-Agent": QUICK_DESKTOP_USER_AGENT,
+          Authorization: `Bearer ${tok.accessToken}`,
           "x-amzn-qs-internal-trace-id": crypto.randomUUID(),
+          "X-Surface-Type": surfaceType,
+          "X-Outpost-Id": outpostId,
+          "X-Agent-Service-Type": "UNIFIED_QUICK",
+          "X-Working-Session-Id": workingSessionId,
         },
         handshakeTimeout: 5_000,
       });
@@ -148,7 +156,22 @@ export async function fetchOAuthUserIdentity(
       const timer = setTimeout(() => finish(null), 5_500);
       ws.once("open", () => {
         try {
-          ws.send(encodeCloudInputFrame({ type: "session_connect", payload: { capabilities: [] } }));
+          ws.send(
+            encodeCloudInputFrame({
+              type: "session_connect",
+              payload: {
+                actor_id: "",
+                surfaceType,
+                outpostId,
+                appVersion: QUICK_APP_VERSION,
+                acp_first_text: 1,
+                user_notification: 1,
+                subtask_progress: 1,
+                external_agent_sign_in: 1,
+                recents_promotion: 1,
+              },
+            }),
+          );
         } catch {
           finish(null);
         }
@@ -662,6 +685,28 @@ export function getOAuthFlowStatus(flowId: string): {
   return { status: flow.status, ...(flow.error ? { error: flow.error } : {}) };
 }
 
+export interface OAuthRefreshRotationEvent {
+  clientId: string;
+  rotatedRefreshToken: string;
+  accessToken: string;
+  expiresAt: number;
+}
+
+export type OAuthRefreshRotationListener = (ev: OAuthRefreshRotationEvent) => void;
+
+const refreshRotationListeners = new Set<OAuthRefreshRotationListener>();
+
+/**
+ * Registers a listener invoked whenever AWS OIDC returns a rotated `refreshToken`.
+ * Returns an unsubscribe function.
+ */
+export function onOAuthRefreshTokenRotated(listener: OAuthRefreshRotationListener): () => void {
+  refreshRotationListeners.add(listener);
+  return () => {
+    refreshRotationListeners.delete(listener);
+  };
+}
+
 /**
  * Resolve a valid `accessToken` for an `OAuthCredential`, automatically refreshing via
  * `POST https://oidc.<region>.amazonaws.com/token` (`grantType: "refresh_token"`) whenever expired.
@@ -718,6 +763,22 @@ export async function resolveOAuthAccessToken(
       refreshToken: nextRefresh,
       expiresAt: nextExpiry,
     });
+    const rotated = Boolean(data.refreshToken && data.refreshToken !== currentRefresh);
+    if (rotated && data.refreshToken) {
+      const ev: OAuthRefreshRotationEvent = {
+        clientId: cred.clientId,
+        rotatedRefreshToken: data.refreshToken,
+        accessToken: data.accessToken,
+        expiresAt: nextExpiry,
+      };
+      for (const listener of refreshRotationListeners) {
+        try {
+          listener(ev);
+        } catch {
+          // Never fail token resolution if persistence listener errors
+        }
+      }
+    }
     return {
       accessToken: data.accessToken,
       expiresAt: nextExpiry,

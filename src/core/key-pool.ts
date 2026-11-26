@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { parseOAuthCredential } from "../aws-quick/oauth-client.js";
+import {
+  onOAuthRefreshTokenRotated,
+  parseOAuthCredential,
+  serializeOAuthCredential,
+} from "../aws-quick/oauth-client.js";
 import { parseWebCurlOrCredential, serializeWebCredential } from "../aws-quick/web-client.js";
 import type { BotQuotaView, QuickPlanQuotaView } from "../services/quota-service.js";
 import { evictQuotaCachesForKey } from "../services/quota-service.js";
@@ -217,6 +221,7 @@ export class UpstreamKeyPool {
   private contentFilterRephraseModel: string;
   private chatAgentId?: string;
   private rrIndex = 0;
+  private readonly unsubscribeOAuthRotation: () => void;
 
   constructor(config: Pick<
     GatewayConfig,
@@ -293,6 +298,68 @@ export class UpstreamKeyPool {
         }
       }
     }
+
+    this.unsubscribeOAuthRotation = onOAuthRefreshTokenRotated((ev) => {
+      this.rotateOAuthRefreshToken(ev.clientId, ev.rotatedRefreshToken, ev.accessToken, ev.expiresAt);
+    });
+  }
+
+  dispose(): void {
+    this.unsubscribeOAuthRotation();
+  }
+
+  private rekeySlotCredential(slot: InternalKeySlot, newRawKey: string): void {
+    const oldRawKey = slot.rawKey;
+    const oldSlotId = slot.slotId;
+    if (oldRawKey === newRawKey) return;
+    const newSlotId = computeKeySlotId(newRawKey);
+    const newMaskedKey = maskSecretKey(newRawKey);
+    slot.rawKey = newRawKey;
+    slot.slotId = newSlotId;
+    slot.maskedKey = newMaskedKey;
+    if (oldSlotId !== newSlotId) {
+      if (this.savedIdentities[oldSlotId]) {
+        this.savedIdentities[newSlotId] = this.savedIdentities[oldSlotId]!;
+        delete this.savedIdentities[oldSlotId];
+        this.persistSavedIdentities();
+      }
+      const prevProbeAt = this.quotaProbeCooldownBySlot.get(oldSlotId);
+      if (prevProbeAt !== undefined) {
+        this.quotaProbeCooldownBySlot.delete(oldSlotId);
+        this.quotaProbeCooldownBySlot.set(newSlotId, prevProbeAt);
+      }
+    }
+    this.affinityTable.rekeyEntries(oldRawKey, newRawKey, newSlotId, newMaskedKey);
+    evictQuotaCachesForKey(oldRawKey);
+  }
+
+  /**
+   * Persists a rotated AWS OIDC `refreshToken` back onto the matching OAuth slot and `.env`
+   * so process restarts never fall back to an invalidated single-use refresh token.
+   */
+  rotateOAuthRefreshToken(
+    clientId: string,
+    rotatedRefreshToken: string,
+    accessToken?: string,
+    expiresAt?: number,
+  ): boolean {
+    if (!clientId || !rotatedRefreshToken) return false;
+    for (const slot of this.slots) {
+      if (slot.authType !== "oauth") continue;
+      const parsed = parseOAuthCredential(slot.rawKey);
+      if (!parsed || parsed.clientId !== clientId) continue;
+      if (parsed.refreshToken === rotatedRefreshToken) return false;
+      const updatedRawKey = serializeOAuthCredential({
+        ...parsed,
+        refreshToken: rotatedRefreshToken,
+        ...(accessToken ? { accessToken } : {}),
+        ...(typeof expiresAt === "number" && Number.isFinite(expiresAt) ? { expiresAt } : {}),
+      });
+      this.rekeySlotCredential(slot, updatedRawKey);
+      this.persist();
+      return true;
+    }
+    return false;
   }
 
   private upsertInternal(rawKey: string, enabled: boolean, label?: string): InternalKeySlot {
@@ -884,8 +951,8 @@ export class UpstreamKeyPool {
       if (this.lbStrategy === "quota-aware") {
         const remA = getRemainingPercentForPool(a.quota, targetPool);
         const remB = getRemainingPercentForPool(b.quota, targetPool);
-        const bandA = remA !== null ? Math.floor(remA / 15) : 7;
-        const bandB = remB !== null ? Math.floor(remB / 15) : 7;
+        const bandA = remA !== null ? Math.floor(remA / 15) : 3;
+        const bandB = remB !== null ? Math.floor(remB / 15) : 3;
         if (bandA !== bandB) return bandB - bandA;
       }
       const idxA = (this.slots.indexOf(a) - startIdx + n) % n;
@@ -1119,8 +1186,8 @@ export class UpstreamKeyPool {
       slot.autoResetAtMs = billingEndMs;
     }
 
-    // Proactive auto-disable if either Session burst pool or Monthly 10h pool hits 0%.
-    if (this.autoDisableExhaustedKeys && slot.enabled && exhausted) {
+    // Proactive auto-disable if either Session burst pool or Monthly 10h pool hits 0% (unless on-demand spend is enabled).
+    if (this.autoDisableExhaustedKeys && slot.enabled && exhausted && !quota.onDemandSpend.enabled) {
       slot.enabled = false;
       slot.autoDisabledKind = "quota";
       slot.autoDisabledReason = slot.apiPoolExhausted
@@ -1185,12 +1252,12 @@ export class UpstreamKeyPool {
     const webCred = parseWebCurlOrCredential(normalized);
     if (webCred) {
       normalized = serializeWebCredential(webCred);
-      // Manual renewal: if a web credential for the same AWS account already exists, refresh it in place.
+      // Manual renewal: if a web credential for the same AWS account already exists, refresh it in place
+      // and migrate its slotId + metadata atomically so restarts never orphan labels/proxies/agents.
       const prefix = `web:${webCred.accountId}|`;
       const existing = this.slots.find((s) => s.rawKey.startsWith(prefix));
       if (existing) {
-        existing.rawKey = normalized;
-        existing.maskedKey = maskSecretKey(normalized);
+        this.rekeySlotCredential(existing, normalized);
         existing.enabled = enabled;
         existing.autoDisabledKind = undefined;
         existing.autoDisabledReason = undefined;
@@ -1209,6 +1276,28 @@ export class UpstreamKeyPool {
         400,
         "invalid_api_key",
       );
+    } else if (normalized.startsWith("oauth:")) {
+      const oauthCred = parseOAuthCredential(normalized);
+      if (oauthCred) {
+        // Manual renewal: if an OAuth credential with the same clientId already exists, refresh in place.
+        const existing = this.slots.find(
+          (s) => s.authType === "oauth" && parseOAuthCredential(s.rawKey)?.clientId === oauthCred.clientId,
+        );
+        if (existing) {
+          this.rekeySlotCredential(existing, normalized);
+          existing.enabled = enabled;
+          existing.autoDisabledKind = undefined;
+          existing.autoDisabledReason = undefined;
+          existing.cooldownUntil = 0;
+          existing.connLimitCooldownUntil = 0;
+          if (label?.trim()) existing.label = label.trim();
+          if (proxyUrl !== undefined) existing.proxyUrl = validProxy;
+          if (chatAgentId !== undefined) existing.chatAgentId = validChatAgentId;
+          this.persist();
+          if (enabled) this.notifySlotAvailable(existing, this.maxInflightPerSlot);
+          return this.toSlotStatus(existing, this.affinityTable.countBySlot());
+        }
+      }
     }
     const autoWebLabel = webCred ? (webCred.email || `AWS #${webCred.accountId.slice(-4)}`) : undefined;
     const slot = this.upsertInternal(normalized, enabled, label || autoWebLabel);
