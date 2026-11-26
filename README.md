@@ -12,6 +12,9 @@
 
 > **免责声明**：本项目为独立第三方开源项目，与 Amazon Web Services (AWS) 无任何官方关联或背书。仓库不包含任何 AWS 闭源二进制或专有资产，请使用本人合法账号授权。仅限个人开发与协议互通，请勿用于商业中转或转售。
 
+> [!TIP]
+> **交流群 & 问题反馈**：欢迎加入 [**Telegram 官方交流群**](https://t.me/+-2B2GA8qESpjYWZl)（版本更新通知、部署答疑、客户端接入交流），或直接提交 [**GitHub Issue**](https://github.com/kuk-888/aws-quick2api/issues)。
+
 ---
 
 ## 主要特性

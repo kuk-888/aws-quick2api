@@ -10,9 +10,10 @@ English | **[简体中文](./README.md)**
 
 Single-process **OpenAI & Anthropic API gateway** for **AWS Quick**. Runs on Linux, Docker, macOS, and Windows without installing the official desktop app, and ships with a built-in Web Console (`aws-quick-admin`).
 
-💬 Discussions & feedback: join the [Telegram Community Group](https://t.me/+-2B2GA8qESpjYWZl) or open a [GitHub Issue](https://github.com/kuk-888/aws-quick2api/issues).
-
 > **Disclaimer**: Independent third-party open-source project, not affiliated with or endorsed by Amazon Web Services (AWS). Contains no proprietary AWS binaries or assets. Authenticate with your own legitimate account. For personal development and protocol interoperability only—do not resell or run as a commercial relay.
+
+> [!TIP]
+> **Community & Feedback**: Join the [**Telegram Community Group**](https://t.me/+-2B2GA8qESpjYWZl) for release announcements, setup help, and discussions, or open a [**GitHub Issue**](https://github.com/kuk-888/aws-quick2api/issues).
 
 ---
 
