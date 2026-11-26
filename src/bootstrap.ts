@@ -2,7 +2,7 @@ import { fork, type ChildProcess } from "node:child_process";
 import { realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadDotEnv } from "./core/config.js";
+import { readDotEnvRaw, resolveGatewayDataDir } from "./core/config.js";
 import {
   ensureReleaseNodeModulesLink,
   EXIT_CODE_SELF_UPDATE_RESTART,
@@ -117,6 +117,10 @@ export interface BootstrapSupervisorOptions {
   builtinAppRoot?: string;
   /** How long a newly updated release must remain healthy after `gateway_ready` before promotion. */
   healthyGraceMs?: number;
+  /** Max time to wait for `gateway_ready` on a pending hot release before killing & auto-rolling back. */
+  startupReadyTimeoutMs?: number;
+  /** Base environment passed to spawned server children (defaults to process.env; excludes `.env` expansion to avoid Linux E2BIG). */
+  baseEnv?: NodeJS.ProcessEnv;
   /** Extra environment variables passed to spawned server children. */
   extraEnv?: Record<string, string>;
   /** Optional hook called before spawning each child (useful in tests). */
@@ -135,6 +139,9 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
   const envGrace = Number.parseInt(process.env.SELF_UPDATE_HEALTHY_MS || "", 10);
   const healthyGraceMs =
     opts.healthyGraceMs ?? (Number.isFinite(envGrace) && envGrace >= 0 ? envGrace : 5_000);
+  const startupReadyTimeoutMs =
+    opts.startupReadyTimeoutMs ?? 25_000;
+  const resolvedDataDir = path.resolve(opts.dataDir);
 
   let activeChild: ChildProcess | null = null;
   let shuttingDown = false;
@@ -160,14 +167,15 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
 
   try {
     while (!shuttingDown) {
-      const target = resolveBootTarget({ dataDir: opts.dataDir, builtinAppRoot: builtin.appRoot });
+      const target = resolveBootTarget({ dataDir: resolvedDataDir, builtinAppRoot: builtin.appRoot });
       const childEnv: NodeJS.ProcessEnv = {
-        ...process.env,
+        ...(opts.baseEnv ?? process.env),
         ...(opts.extraEnv ?? {}),
         AWS_QUICK_SUPERVISED: "1",
         AWS_QUICK_BUILTIN_ROOT: builtin.appRoot,
         AWS_QUICK_BUILTIN_VERSION: builtin.version,
         AWS_QUICK_ACTIVE_RELEASE_DIR: target.releaseDir ?? "",
+        AWS_QUICK_UPDATES_DATA_DIR: resolvedDataDir,
       };
 
       const outcome = await new Promise<{
@@ -175,10 +183,15 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
         signal: NodeJS.Signals | null;
         restartRequested: boolean;
         promoted: boolean;
+        timedOut: boolean;
       }>((resolve) => {
         let restartRequested = false;
         let promoted = !target.isPendingVerification;
+        let readyReceived = false;
+        let timedOut = false;
         let healthyTimer: NodeJS.Timeout | null = null;
+        let readyTimer: NodeJS.Timeout | null = null;
+        let forceKillTimer: NodeJS.Timeout | null = null;
 
         const child = fork(target.entryPath, process.argv.slice(2), {
           cwd: process.cwd(),
@@ -191,10 +204,10 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
         const promotePendingRelease = () => {
           if (promoted) return;
           promoted = true;
-          const st = loadSelfUpdateState(opts.dataDir);
+          const st = loadSelfUpdateState(resolvedDataDir);
           if (st.pendingVersion === target.version) {
             try {
-              saveSelfUpdateState(opts.dataDir, {
+              saveSelfUpdateState(resolvedDataDir, {
                 ...st,
                 pendingVersion: null,
                 lastRollbackReason: undefined,
@@ -212,12 +225,40 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
           }
         };
 
+        if (target.isPendingVerification && startupReadyTimeoutMs > 0) {
+          readyTimer = setTimeout(() => {
+            readyTimer = null;
+            if (readyReceived || shuttingDown) return;
+            timedOut = true;
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              // ignore
+            }
+            forceKillTimer = setTimeout(() => {
+              forceKillTimer = null;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // ignore
+              }
+            }, 2_000);
+            forceKillTimer.unref?.();
+          }, startupReadyTimeoutMs);
+          readyTimer.unref?.();
+        }
+
         child.on("message", (msg: unknown) => {
           if (!msg || typeof msg !== "object") return;
           const rec = msg as { type?: string };
           if (rec.type === "self_update_restart") {
             restartRequested = true;
           } else if (rec.type === "gateway_ready" && target.isPendingVerification && !promoted) {
+            readyReceived = true;
+            if (readyTimer) {
+              clearTimeout(readyTimer);
+              readyTimer = null;
+            }
             if (healthyTimer) clearTimeout(healthyTimer);
             if (healthyGraceMs === 0) {
               promotePendingRelease();
@@ -233,8 +274,16 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
             clearTimeout(healthyTimer);
             healthyTimer = null;
           }
+          if (readyTimer) {
+            clearTimeout(readyTimer);
+            readyTimer = null;
+          }
+          if (forceKillTimer) {
+            clearTimeout(forceKillTimer);
+            forceKillTimer = null;
+          }
           if (activeChild === child) activeChild = null;
-          resolve({ code, signal, restartRequested, promoted });
+          resolve({ code, signal, restartRequested, promoted, timedOut });
         });
       });
 
@@ -252,12 +301,14 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
         continue;
       }
 
-      // Automatic crash rollback: newly updated release exited before startup promotion!
+      // Automatic crash rollback: newly updated release exited or hung before startup promotion!
       if (target.kind === "hot" && target.isPendingVerification && !outcome.promoted) {
-        const st = loadSelfUpdateState(opts.dataDir);
+        const st = loadSelfUpdateState(resolvedDataDir);
         const rollbackTo =
           st.previousVersion && st.previousVersion !== target.version ? st.previousVersion : null;
-        const reason = `v${target.version} exited during startup verification (code=${outcome.code ?? "null"}, signal=${outcome.signal ?? "none"}); auto-rolled back to v${rollbackTo ?? builtin.version}.`;
+        const reason = outcome.timedOut
+          ? `v${target.version} did not become ready within ${Math.round(startupReadyTimeoutMs / 1000)}s; auto-rolled back to v${rollbackTo ?? builtin.version}.`
+          : `v${target.version} exited during startup verification (code=${outcome.code ?? "null"}, signal=${outcome.signal ?? "none"}); auto-rolled back to v${rollbackTo ?? builtin.version}.`;
         console.error(
           JSON.stringify({
             event: "self_update_auto_rollback",
@@ -267,7 +318,7 @@ export async function runBootstrapSupervisor(opts: BootstrapSupervisorOptions): 
           }),
         );
         try {
-          saveSelfUpdateState(opts.dataDir, {
+          saveSelfUpdateState(resolvedDataDir, {
             ...st,
             activeVersion: rollbackTo,
             previousVersion: null,
@@ -301,10 +352,23 @@ const isMain = (() => {
   }
 })();
 if (isMain) {
-  loadDotEnv();
-  const dataDir = path.resolve(process.env.DATA_DIR?.trim() || path.resolve(process.cwd(), "data"));
+  // Snapshot inherited process.env BEFORE reading `.env` hints so large vars like `QUICK_TOKENS`
+  // (>128KB with 60–100 OAuth accounts) are NEVER passed through Linux execve `fork()` (avoids E2BIG)
+  // and `.env` edits always take effect fresh on every self-update respawn.
+  const baseEnv: NodeJS.ProcessEnv = { ...process.env };
+  const { envFilePath, values: dotEnvValues } = readDotEnvRaw();
+  const mergedHints: Record<string, string | undefined> = { ...dotEnvValues, ...baseEnv };
+  const dataDir =
+    resolveGatewayDataDir(mergedHints, envFilePath) ?? path.resolve(process.cwd(), "data");
+  const hintGrace = Number.parseInt(mergedHints.SELF_UPDATE_HEALTHY_MS || "", 10);
+  const healthyGraceMs = Number.isFinite(hintGrace) && hintGrace >= 0 ? hintGrace : undefined;
   const builtinAppRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-  runBootstrapSupervisor({ dataDir, builtinAppRoot })
+  runBootstrapSupervisor({
+    dataDir,
+    builtinAppRoot,
+    baseEnv,
+    ...(healthyGraceMs !== undefined ? { healthyGraceMs } : {}),
+  })
     .then((code) => process.exit(code))
     .catch((err) => {
       console.error(

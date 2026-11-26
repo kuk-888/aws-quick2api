@@ -81,8 +81,16 @@ export async function buildPromptAndAttachmentsForTurn(
   const uploadedFileNames: string[] = [];
   const cacheScope = incremental ? "inc" : "full";
 
-  // 1) Process attached files / PDFs first
-  if (sourceFiles.length > 0) {
+  // 1 & 2) Process attached files/PDFs and images in parallel to cut multimodal cold-turn TTFT
+  const processFilesPhase = async (): Promise<{
+    fileAtts: QuickAttachment[];
+    uploadedNames: string[];
+    inlineDocs: string[];
+  }> => {
+    const fileAtts: QuickAttachment[] = [];
+    const uploadedNames: string[] = [];
+    const inlineDocs: string[] = [];
+    if (sourceFiles.length === 0) return { fileAtts, uploadedNames, inlineDocs };
     const resolvedFiles = reqAttCache
       ? await reqAttCache.getOrResolveFiles(`files:${cacheScope}`, sourceFiles, (items) =>
         resolveNormalizedFiles(items, turn.signal),
@@ -93,7 +101,7 @@ export async function buildPromptAndAttachmentsForTurn(
         ? AbortSignal.any([turn.signal, AbortSignal.timeout(90_000)])
         : AbortSignal.timeout(90_000);
       try {
-        const fileAtts = await mapWithConcurrency(resolvedFiles, 3, async (f) => {
+        const uploaded = await mapWithConcurrency(resolvedFiles, 3, async (f) => {
           const doUpload = () =>
             isOAuthAccount && oauthCred
               ? uploadOAuthBinaryAttachment(
@@ -118,8 +126,8 @@ export async function buildPromptAndAttachmentsForTurn(
             ? reqAttCache.getOrUploadAttachment(slotId, threadId, f.buf, doUpload)
             : doUpload();
         });
-        atts.push(...fileAtts);
-        for (const fa of fileAtts) uploadedFileNames.push(fa.name);
+        fileAtts.push(...uploaded);
+        for (const fa of uploaded) uploadedNames.push(fa.name);
       } catch (fileErr) {
         throw mapAttachmentUploadError(fileErr, "Failed to upload attached file(s) to AWS Quick");
       }
@@ -127,7 +135,7 @@ export async function buildPromptAndAttachmentsForTurn(
       for (const f of resolvedFiles) {
         const m = f.mimeType.split(";")[0] || "";
         if (m.startsWith("text/") || m === "application/json" || m === "application/xml" || m === "application/javascript") {
-          inlineDocTexts.push(`[DOCUMENT]\n${f.filename}\n${f.buf.toString("utf8")}`);
+          inlineDocs.push(`[DOCUMENT]\n${f.filename}\n${f.buf.toString("utf8")}`);
         } else {
           throw new GatewayError(
             `Binary document '${f.filename}' (${f.mimeType}) requires an OAuth or Web Cookie AWS Quick credential for out-of-band attachment upload.`,
@@ -137,11 +145,12 @@ export async function buildPromptAndAttachmentsForTurn(
         }
       }
     }
-  }
+    return { fileAtts, uploadedNames, inlineDocs };
+  };
 
-  // 2) Process images: OAuth & Web Cookie upload >=2 images or >20KB high-res out-of-band;
-  //    single tiny images (<=20KB) or Outpost/token use sharp inline compression.
-  if (sourceImages.length > 0) {
+  const processImagesPhase = async (): Promise<QuickAttachment[]> => {
+    const imgResults: QuickAttachment[] = [];
+    if (sourceImages.length === 0) return imgResults;
     let uploadedHighRes = false;
     const resolvedImgs = reqAttCache
       ? await reqAttCache.getOrResolveImages(`imgs:${cacheScope}`, sourceImages, (items) =>
@@ -184,7 +193,7 @@ export async function buildPromptAndAttachmentsForTurn(
               ? reqAttCache.getOrUploadAttachment(slotId, threadId, prepared.buf, doUpload)
               : doUpload();
           });
-          atts.push(...imgAtts);
+          imgResults.push(...imgAtts);
           uploadedHighRes = true;
         } catch (imgErr) {
           const errMsg = imgErr instanceof Error ? imgErr.message : String(imgErr);
@@ -197,14 +206,20 @@ export async function buildPromptAndAttachmentsForTurn(
       }
     }
     if (!uploadedHighRes) {
-      const willUseOutOfBandText = isOAuthAccount && approxTextBytes > 42_000;
+      const willUseOutOfBandText = ((isOAuthAccount && Boolean(oauthCred)) || (isWeb && Boolean(webCred))) && approxTextBytes > 42_000;
       const adaptiveImageBudget = willUseOutOfBandText
         ? 34_000
         : Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
       const inlineImgs = await compressResolvedImagesForQuickFrame(resolvedImgs, adaptiveImageBudget);
-      atts.push(...inlineImgs);
+      imgResults.push(...inlineImgs);
     }
-  }
+    return imgResults;
+  };
+
+  const [filesRes, imgsRes] = await Promise.all([processFilesPhase(), processImagesPhase()]);
+  atts.push(...filesRes.fileAtts, ...imgsRes);
+  uploadedFileNames.push(...filesRes.uploadedNames);
+  inlineDocTexts.push(...filesRes.inlineDocs);
 
   const omissionBanner =
     omittedImages > 0 || omittedFiles > 0
@@ -244,6 +259,8 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
   attachments: QuickAttachment[];
   isOAuthAccount: boolean;
   oauthCred?: OAuthCredential;
+  isWeb?: boolean;
+  webCred?: WebCookieCredential;
   effectiveProxy?: string;
   reqAttCache?: RequestAttachmentCache;
 }): Promise<{
@@ -262,6 +279,8 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
     customPrompt,
     isOAuthAccount,
     oauthCred,
+    isWeb,
+    webCred,
     effectiveProxy,
     reqAttCache,
   } = params;
@@ -272,7 +291,7 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
   let rawPromptForRephrase = preOobPrompt;
   let rephrasePreservePrefix: string | undefined;
 
-  if (isOAuthAccount && oauthCred) {
+  if ((isOAuthAccount && oauthCred) || (isWeb && webCred)) {
     const currentAttBytes = attachments.length > 0 ? Buffer.byteLength(JSON.stringify(attachments), "utf8") : 0;
     const currentFrameBudget =
       currentAttBytes > 0 ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - currentAttBytes) : MAX_WS_PAYLOAD_UTF8_BYTES;
@@ -287,7 +306,17 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
         const fileName = `conversation_context_${threadId.slice(0, 8)}${suffix}.txt`;
         const promptBytes = Buffer.from(prompt, "utf8");
         const doTextUpload = () =>
-          uploadOAuthTextAttachment(oauthCred, threadId, fileName, prompt, effectiveProxy, uploadTimeoutSignal);
+          isOAuthAccount && oauthCred
+            ? uploadOAuthTextAttachment(oauthCred, threadId, fileName, prompt, effectiveProxy, uploadTimeoutSignal)
+            : uploadWebBinaryAttachment(
+              webCred!,
+              promptBytes,
+              fileName,
+              "text/plain",
+              threadId,
+              effectiveProxy,
+              uploadTimeoutSignal,
+            );
         const fileAtt = reqAttCache
           ? await reqAttCache.getOrUploadAttachment(slotId, threadId, promptBytes, doTextUpload)
           : await doTextUpload();
@@ -303,7 +332,10 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
         }
         prompt = buildOutOfBandContextPrompt(prompt, fileName, 3_500, isWarmIncremental, openingHint);
       } catch (uploadErr) {
-        throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick");
+        const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
+        if (!(isWeb && /\(404\)|\(405\)/.test(errMsg))) {
+          throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick");
+        }
       }
     }
   }

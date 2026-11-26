@@ -134,18 +134,18 @@ function parsePaxPath(paxData: Buffer): string | null {
 }
 
 export function normalizeSafeRelPath(raw: string): string {
-  if (!raw || raw.includes("\0") || raw.includes("\\")) {
+  if (!raw || raw.includes("\0") || raw.includes("\\") || /^[A-Za-z]:/.test(raw)) {
     throw new Error(`Unsafe tar path rejected: ${raw}`);
   }
   let s = raw;
   while (s.startsWith("./")) s = s.slice(2);
   s = s.replace(/\/+$/, "");
-  if (!s || s.startsWith("/")) {
+  if (!s || s.startsWith("/") || /^[A-Za-z]:/.test(s)) {
     throw new Error(`Absolute or empty tar path rejected: ${raw}`);
   }
   const segments = s.split("/");
   for (const seg of segments) {
-    if (!seg || seg === "." || seg === "..") {
+    if (!seg || seg === "." || seg === ".." || seg.includes(":")) {
       throw new Error(`Path traversal segment rejected in tar archive: ${raw}`);
     }
   }

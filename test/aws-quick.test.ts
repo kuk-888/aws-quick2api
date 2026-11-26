@@ -46,7 +46,7 @@ import {
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
 import { GatewayError } from "../src/core/types.js";
-import { assertDataDirWritable, findInsecurePlaceholderConfig, loadConfigFromEnv } from "../src/core/config.js";
+import { assertDataDirWritable, findInsecurePlaceholderConfig, loadConfigFromEnv, readDotEnvRaw, resolveGatewayDataDir } from "../src/core/config.js";
 import { UpstreamKeyPool, validateChatAgentId } from "../src/core/key-pool.js";
 import {
   buildToolBridgePrompt,
@@ -67,11 +67,11 @@ import {
   parseAnthropicMessagesRequest,
   stabilizeAnthropicUsage,
 } from "../src/protocols/anthropic.js";
-import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
+import { computeDialogPrefixHashes, extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
 import { AWS_QUICK_MODELS, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
 import { ClientGatewayKeyManager } from "../src/services/client-keys.js";
 import { checkLatestVersion } from "../src/services/update-checker.js";
-import { createTarGzBuffer, extractTarGzSafely } from "../src/services/tar-archive.js";
+import { createTarGzBuffer, extractTarGzSafely, normalizeSafeRelPath } from "../src/services/tar-archive.js";
 import {
   applySelfUpdate,
   assertAllowedDownloadUrl,
@@ -978,7 +978,7 @@ describe("Credential parser & ClientKeyStore", () => {
     assert.equal(validateChatAgentId(undefined), undefined);
     assert.equal(validateChatAgentId("   "), undefined);
     assert.equal(validateChatAgentId("  11111111-2222-3333-4444-555555555555  "), "11111111-2222-3333-4444-555555555555");
-    assert.equal(validateChatAgentId("arn:aws:quicksight:us-east-1:123456789012:agent/abc-123"), "arn:aws:quicksight:us-east-1:123456789012:agent/abc-123");
+    assert.equal(validateChatAgentId("arn:aws:quicksight:us-east-1:123456789012:agent/abc-123"), "abc-123");
     assert.throws(() => validateChatAgentId("bad id with spaces"), /invalid_chat_agent_id|Invalid chat_agent_id/);
     assert.throws(() => validateChatAgentId("bad\nid"), /invalid_chat_agent_id|Invalid chat_agent_id/);
 
@@ -4765,12 +4765,12 @@ setInterval(() => {}, 10_000);
       assert.ok(!sanitizedCustomPrompt.includes("WITHOUT ANY EXCEPTION"));
       assert.ok(sanitizedCustomPrompt.includes("Keep functions under 60 lines and write unit tests."));
 
-      // C) Run `POST /v1/admin/keys/sync-agents`: upgrades `legacy-bridge-99` (`Quick2API Bridge` -> `Coding Assistant`)
+      // C) Run `POST /v1/admin/keys/sync-agents` in explicit `mode: "upgrade"`: upgrades `legacy-bridge-99` (`Quick2API Bridge` -> `Coding Assistant`)
       //    and NEVER modifies `personal-writer-01` (`写作改写助手`)!
       const syncRes1 = await fetch(`${base}/v1/admin/keys/sync-agents`, {
         method: "POST",
         headers: adminHeaders,
-        body: JSON.stringify({}),
+        body: JSON.stringify({ mode: "upgrade" }),
       });
       assert.equal(syncRes1.status, 200);
       const syncJson1 = (await syncRes1.json()) as {
@@ -4789,21 +4789,361 @@ setInterval(() => {}, 10_000);
       assert.equal(agentUpdates[0]!.description, DEFAULT_CODING_AGENT_DESCRIPTION);
       assert.equal(agentUpdates[0]!.instructions, DEFAULT_CODING_AGENT_INSTRUCTIONS);
 
-      // Re-running `sync-agents` immediately detects it is already up-to-date (`unchanged: 1`, 0 extra WS publishes)
+      // Re-running `sync-agents` in `mode: "upgrade"` detects it is already up-to-date (`unchanged: 1`, 0 extra WS publishes)
       const syncRes2 = await fetch(`${base}/v1/admin/keys/sync-agents`, {
         method: "POST",
         headers: adminHeaders,
-        body: JSON.stringify({}),
+        body: JSON.stringify({ mode: "upgrade" }),
       });
       const syncJson2 = (await syncRes2.json()) as { upgraded: number; unchanged: number };
       assert.equal(syncJson2.upgraded, 0);
       assert.equal(syncJson2.unchanged, 1);
       assert.equal(agentUpdates.length, 1);
 
-      // D) Dashboard HTML renders both `#cfgSanitizeClientSystemPrompt` and `#credSyncAgentsBtn`
+      // D) Dashboard HTML renders `#cfgSanitizeClientSystemPrompt`, `#credSyncAgentsBtn`, and `#syncAgentModal` fields
       const dashHtml = renderDashboardHtml("/dashboard", "nonce-123");
       assert.ok(dashHtml.includes("cfgSanitizeClientSystemPrompt"));
       assert.ok(dashHtml.includes("credSyncAgentsBtn"));
+      assert.ok(dashHtml.includes("syncAgentModal"));
+      assert.ok(dashHtml.includes("syncAgentNameInput"));
+      assert.ok(dashHtml.includes("syncAgentDescInput"));
+      assert.ok(dashHtml.includes("syncAgentModeSelect"));
+      assert.ok(dashHtml.includes("syncAgentSetDefaultCb"));
+      assert.ok(dashHtml.includes("syncAgentPromptInput"));
+    } finally {
+      await gw.close();
+      await new Promise<void>((r) => wss.close(() => r()));
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("supports batch create-and-bind cloud agents with custom name/desc/instructions and synchronizes warm-session agentId cleanly across hot-updates and in-flight races", async () => {
+    const fs = await import("node:fs");
+    const WebSocket = (await import("ws")).default;
+    const { WebSocketServer } = await import("ws");
+    const { encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+    const { createGatewayServer } = await import("../src/server.js");
+
+    const decodeMockCloudIn = (buf: Buffer): Record<string, unknown> | null => {
+      try {
+        const outer = JSON.parse(buf.toString("utf8")) as { payload?: { payload?: string } };
+        if (typeof outer?.payload?.payload === "string") {
+          return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as Record<string, unknown>;
+        }
+      } catch {
+        // ignore non-JSON frames
+      }
+      return null;
+    };
+    const encodeMockCloudOut = (ev: Record<string, unknown>): Uint8Array => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+      return encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, payload);
+    };
+
+    const mkOAuth = (suffix: string) =>
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: `cid-hot-${suffix}`,
+          clientSecret: `csec-hot-${suffix}`,
+          refreshToken: `rtok-hot-${suffix}`,
+          accessToken: `atok-hot-${suffix}`,
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        "utf8",
+      ).toString("base64url");
+
+    const keyA = mkOAuth("a");
+    const keyB = mkOAuth("b");
+    const createdConfigs: Array<Record<string, unknown>> = [];
+    const sentUserFrames: Array<Record<string, unknown>> = [];
+    let draftSeq = 0;
+    let holdNextTurnResolve: (() => void) | null = null;
+    let holdNextTurn = false;
+    let turnStartedResolve: (() => void) | null = null;
+
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((r) => wss.once("listening", r));
+    const wsPort = (wss.address() as { port: number }).port;
+
+    wss.on("connection", (sock) => {
+      sock.send(encodeMockCloudOut({ type: "session_established", payload: { session_id: "s-hot" } }));
+      sock.on("message", (raw) => {
+        const frame = decodeMockCloudIn(Buffer.from(raw as Buffer));
+        if (!frame) return;
+        const fType = String(frame.type || "");
+        const payload = (frame.payload || {}) as Record<string, unknown>;
+        if (fType === "session_connect") {
+          sock.send(encodeMockCloudOut({ type: "session_established", payload: { session_id: "s-hot" } }));
+        } else if (fType === "get_chat_agents") {
+          sock.send(
+            encodeMockCloudOut({
+              type: "chat_agents_updated",
+              payload: {
+                agents: [
+                  { agentId: "arn:aws:quicksight:us-east-1:111:agent/SYSTEM", name: "AWS Quick", isSystemDefault: true },
+                  {
+                    agentId: "arn:aws:quicksight:us-east-1:111:agent/personal-keep-01",
+                    name: "个人写作助手",
+                    description: "不可覆盖",
+                    systemPrompt: "Keep me intact.",
+                  },
+                ],
+              },
+            }),
+          );
+        } else if (fType === "create_agent_draft") {
+          const isNew = payload.new_agent === true;
+          const draftId = isNew
+            ? `created-agent-0${++draftSeq}`
+            : String(payload.agent_id || "existing-agent");
+          sock.send(
+            encodeMockCloudOut({
+              type: "agent_draft_created",
+              payload: { agent_id: draftId },
+            }),
+          );
+        } else if (fType === "update_chat_agent_config") {
+          createdConfigs.push(payload);
+          sock.send(encodeMockCloudOut({ type: "agent_draft_saved", payload: { agent_id: payload.agent_id } }));
+        } else if (fType === "publish_agent_draft") {
+          // Deliberately return full ARN to assert ARN -> shortId normalization!
+          const rawId = String(payload.agent_id || "");
+          const arn = rawId.startsWith("arn:") ? rawId : `arn:aws:quicksight:us-east-1:111:agent/${rawId}`;
+          sock.send(encodeMockCloudOut({ type: "publish_agent_draft_success", payload: { agent_id: arn } }));
+        } else if (fType === "user_message") {
+          sentUserFrames.push(payload);
+          const finish = () => {
+            if (sock.readyState !== WebSocket.OPEN) return;
+            sock.send(encodeMockCloudOut({ type: "text_delta", payload: { delta: "ACK" } }));
+            sock.send(
+              encodeMockCloudOut({
+                type: "turn_usage",
+                payload: { input_tokens: 12, output_tokens: 3, resolved_model_id: "us.anthropic.claude-opus-5-5" },
+              }),
+            );
+            sock.send(encodeMockCloudOut({ type: "message_complete", payload: { text: "ACK" } }));
+          };
+          if (holdNextTurn) {
+            holdNextTurn = false;
+            holdNextTurnResolve = finish;
+            if (turnStartedResolve) {
+              const fn = turnStartedResolve;
+              turnStartedResolve = null;
+              fn();
+            }
+          } else {
+            finish();
+          }
+        }
+      });
+    });
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aq2a-agent-hot-"));
+    const envFile = path.join(tmpDir, ".env");
+    fs.writeFileSync(envFile, `QUICK_TOKENS=${keyA},${keyB}\n`, "utf8");
+    const clientToken = "sk-aq-hot-agent-sync-token-1122334455";
+    const adminPass = "HotSyncAdminPass_2026!";
+    const cfg = loadConfigFromEnv(
+      {
+        HOST: "127.0.0.1",
+        PORT: "0",
+        GATEWAY_TOKEN: clientToken,
+        ADMIN_PASSWORD: adminPass,
+        QUICK_TOKENS: `${keyA},${keyB}`,
+        DATA_DIR: tmpDir,
+        INCOGNITO: "true",
+      },
+      envFile,
+    );
+
+    const gw = createGatewayServer({ config: cfg });
+    (gw.engine as unknown as { webSocketFactory: (url: string) => unknown }).webSocketFactory = () =>
+      new WebSocket(`ws://127.0.0.1:${wsPort}`);
+
+    const [slotA, slotB] = gw.keyPool.allManagedKeys();
+    assert.ok(slotA && slotB);
+    // Disable slotB for chat routing so all chat turns deterministically land on slotA while slotB verifies selective slotIds scoping
+    gw.keyPool.updateSlotMeta(slotA.slotId, { chatAgentId: "agent-old-00" });
+    gw.keyPool.updateSlotMeta(slotB.slotId, { enabled: false, chatAgentId: "slotb-untouched-00" });
+
+    await new Promise<void>((r) => gw.server.listen({ host: "127.0.0.1", port: 0 }, r));
+    const port = (gw.server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+
+    const sendChat = async (messages: Array<{ role: string; content: string }>) => {
+      const res = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": clientToken,
+          "anthropic-version": "2023-06-01",
+          "x-session-id": "hot-sync-conv-1",
+        },
+        body: JSON.stringify({ model: "quick-smart", max_tokens: 64, messages }),
+      });
+      assert.equal(res.status, 200);
+      return res.json();
+    };
+
+    try {
+      const loginRes = await fetch(`${base}/v1/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-console-csrf": "1" },
+        body: JSON.stringify({ password: adminPass }),
+      });
+      const loginData = (await loginRes.json()) as { token: string };
+      const adminHeaders = {
+        "content-type": "application/json",
+        "x-console-csrf": "1",
+        authorization: `Bearer ${loginData.token}`,
+      };
+
+      // 1) Turn 1 runs on slotA with `agent-old-00` and parks its live WS in WarmSessionPool
+      await sendChat([{ role: "user", content: "Turn 1" }]);
+      assert.equal(sentUserFrames[0]!.chat_agent_id, "agent-old-00");
+      assert.equal(gw.engine.runtimeStats().warmIdleSessions, 1, "Turn 1 must park 1 warm WS");
+
+      // 2) Batch sync (default mode="create", setAsDefault=true) ONLY on checked `slotIds: [slotA.slotId]`
+      //    with custom name/description/instructions -> creates `created-agent-01` (normalized from full ARN!),
+      //    binds it to slotA, leaves slotB untouched, and IMMEDIATELY invalidates slotA's parked WS!
+      const syncCreate = await fetch(`${base}/v1/admin/keys/sync-agents`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({
+          slotIds: [slotA.slotId],
+          name: "Workspace Coder",
+          description: "Custom TS & Go coding helper.",
+          instructions: "Always reply concisely with exact diffs.",
+        }),
+      });
+      assert.equal(syncCreate.status, 200);
+      const syncCreateJson = (await syncCreate.json()) as {
+        mode: string;
+        setAsDefault: boolean;
+        created: number;
+        results: Array<{ slotId: string; agentId: string; name: string; action: string; boundAsDefault: boolean }>;
+      };
+      assert.equal(syncCreateJson.mode, "create");
+      assert.equal(syncCreateJson.setAsDefault, true);
+      assert.equal(syncCreateJson.created, 1);
+      assert.equal(syncCreateJson.results[0]!.agentId, "created-agent-01", "full ARN must normalize to shortId");
+      assert.equal(createdConfigs[0]!.name, "Workspace Coder");
+      assert.equal(createdConfigs[0]!.description, "Custom TS & Go coding helper.");
+      assert.equal(createdConfigs[0]!.instructions, "Always reply concisely with exact diffs.");
+      assert.equal(
+        gw.keyPool.allManagedKeys().find((k) => k.slotId === slotA.slotId)?.chatAgentId,
+        "created-agent-01",
+      );
+      assert.equal(
+        gw.keyPool.allManagedKeys().find((k) => k.slotId === slotB.slotId)?.chatAgentId,
+        "slotb-untouched-00",
+        "unchecked slotB must remain untouched",
+      );
+      assert.equal(
+        gw.engine.runtimeStats().warmIdleSessions,
+        0,
+        "binding new agentId must immediately close & invalidate old parked WS",
+      );
+
+      // 3) Turn 2 (continuing the same conversation!) immediately uses `created-agent-01` and parks its new WS
+      await sendChat([
+        { role: "user", content: "Turn 1" },
+        { role: "assistant", content: "ACK" },
+        { role: "user", content: "Turn 2" },
+      ]);
+      assert.equal(sentUserFrames[1]!.chat_agent_id, "created-agent-01");
+      assert.equal(gw.engine.runtimeStats().warmIdleSessions, 1);
+
+      // 4) Creating another agent with `setAsDefault: false` publishes on AWS Quick WITHOUT changing slotA's binding or warm WS
+      const syncNoBind = await fetch(`${base}/v1/admin/keys/sync-agents`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({
+          slotIds: [slotA.slotId],
+          name: "Draft Side Agent",
+          description: "Secondary agent",
+          setAsDefault: false,
+        }),
+      });
+      assert.equal(syncNoBind.status, 200);
+      assert.equal(
+        gw.keyPool.allManagedKeys().find((k) => k.slotId === slotA.slotId)?.chatAgentId,
+        "created-agent-01",
+      );
+      assert.equal(gw.engine.runtimeStats().warmIdleSessions, 1, "setAsDefault=false must not disturb active warm WS");
+
+      // 5) In-place prompt hot-update (`POST /v1/admin/keys/:slotId/agents/update`) MUST invalidate warm sessions
+      //    even though the bound `agentId` string (`created-agent-01`) stayed the same!
+      const updRes = await fetch(`${base}/v1/admin/keys/${slotA.slotId}/agents/update`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({
+          agentId: "created-agent-01",
+          name: "Workspace Coder v2",
+          description: "Updated desc",
+          instructions: "Updated instructions v2.",
+        }),
+      });
+      assert.equal(updRes.status, 200);
+      assert.equal(
+        gw.engine.runtimeStats().warmIdleSessions,
+        0,
+        "in-place prompt update must invalidate warm sessions so next turn runs with updated instructions",
+      );
+
+      // 6) In-flight race guard: start Turn 3 (held mid-stream under `created-agent-01`),
+      //    hot-switch `slotA` to `hot-swapped-02` via PATCH while Turn 3 is still running,
+      //    then let Turn 3 finish -> Turn 3 succeeds HTTP 200 AND refuses to park its stale WS (`warmIdleSessions === 0`),
+      //    and Turn 4 immediately routes to `hot-swapped-02`!
+      holdNextTurn = true;
+      const turn3Started = new Promise<void>((r) => {
+        turnStartedResolve = r;
+      });
+      const turn3Promise = sendChat([{ role: "user", content: "Turn 3 in-flight" }]);
+      await turn3Started;
+
+      const patchRes = await fetch(`${base}/v1/admin/keys/${slotA.slotId}`, {
+        method: "PATCH",
+        headers: adminHeaders,
+        body: JSON.stringify({ chatAgentId: "hot-swapped-02" }),
+      });
+      assert.equal(patchRes.status, 200);
+
+      // Now complete Turn 3
+      const finishTurn3 = holdNextTurnResolve as (() => void) | null;
+      assert.ok(finishTurn3);
+      finishTurn3();
+      await turn3Promise;
+      assert.equal(sentUserFrames[2]!.chat_agent_id, "created-agent-01");
+      assert.equal(
+        gw.engine.runtimeStats().warmIdleSessions,
+        0,
+        "in-flight turn finished after hot-switch must NOT park stale-agent WS",
+      );
+
+      // Turn 4 immediately picks up `hot-swapped-02` and parks cleanly
+      await sendChat([{ role: "user", content: "Turn 4 after hot-switch" }]);
+      assert.equal(sentUserFrames[3]!.chat_agent_id, "hot-swapped-02");
+      assert.equal(gw.engine.runtimeStats().warmIdleSessions, 1);
+
+      // 7) Changing global `chatAgentId` via `/v1/admin/settings` invalidates all warm sessions
+      const globalSet = await fetch(`${base}/v1/admin/settings`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ chatAgentId: "global-agent-99" }),
+      });
+      assert.equal(globalSet.status, 200);
+      assert.equal(
+        gw.engine.runtimeStats().warmIdleSessions,
+        0,
+        "global chatAgentId update must invalidate warm sessions across all slots",
+      );
     } finally {
       await gw.close();
       await new Promise<void>((r) => wss.close(() => r()));
@@ -4886,6 +5226,184 @@ setInterval(() => {}, 10_000);
       const composeRaw = readFileSync(path.resolve(process.cwd(), "docker-compose.yml"), "utf8");
       assert.ok(/^\s*image:\s*ghcr\.io\/kuk-888\/aws-quick2api:latest\s*$/m.test(composeRaw), "docker-compose.yml must enable GHCR image by default");
       assert.ok(!/^\s*build:\s*\.\s*$/m.test(composeRaw), "docker-compose.yml should keep `build: .` commented out when GHCR image is default");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fixes Release Gatekeeper P0/P1/TTFT regressions: bootstrap DATA_DIR & E2BIG isolation, startup timeout rollback, ARN->shortId warm parity, slot invalidation on rekey/auto-disable, collectTurnEvents reset, Windows tar path, and system-reminder hash stability", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-gatekeeper-"));
+    try {
+      // 1) P0-1 & P0-2: readDotEnvRaw does not mutate process.env (prevents Linux fork E2BIG with 100+ accounts),
+      //    and resolveGatewayDataDir matches loadConfigFromEnv when DATA_DIR is unset.
+      const envPath = path.join(tmpDir, ".env");
+      writeFileSync(envPath, "GATEWAY_TEST_BIG_VAR=abc123\nHOST=127.0.0.1\n", "utf8");
+      const rawDot = readDotEnvRaw(envPath);
+      assert.equal(rawDot.envFilePath, envPath);
+      assert.equal(rawDot.values.GATEWAY_TEST_BIG_VAR, "abc123");
+      assert.equal(process.env.GATEWAY_TEST_BIG_VAR, undefined, "readDotEnvRaw must not pollute process.env");
+      const resolvedDir = resolveGatewayDataDir({}, envPath);
+      const cfg = loadConfigFromEnv({}, envPath);
+      assert.equal(resolvedDir, cfg.dataDir, "bootstrap and server must resolve the exact same dataDir when DATA_DIR is unset");
+
+      // 2) P1-10: bootstrap supervisor auto-rolls back a pending hot release that hangs without sending gateway_ready
+      const supDir = path.join(tmpDir, "sup");
+      const builtinRoot = path.join(supDir, "builtin");
+      const dataDir = path.join(supDir, "data");
+      const builtinEntry = path.join(builtinRoot, "dist", "src", "server.js");
+      const hungRelDir = releaseDirForVersion(dataDir, "0.2.0");
+      const hungEntry = path.join(hungRelDir, "dist", "src", "server.js");
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(path.dirname(builtinEntry), { recursive: true });
+      mkdirSync(path.dirname(hungEntry), { recursive: true });
+      writeFileSync(path.join(builtinRoot, "package.json"), JSON.stringify({ name: "aws-quick2api", version: "0.1.0", dependencies: { ws: "^8.18.0" } }));
+      writeFileSync(builtinEntry, 'process.send?.({ type: "gateway_ready", version: "0.1.0" }); setTimeout(() => process.exit(0), 60);');
+      const depsHash = readBuiltinRuntimeInfo(builtinRoot).depsHash;
+      writeFileSync(
+        path.join(hungRelDir, "update-manifest.json"),
+        JSON.stringify({ version: "0.2.0", depsHash, entry: "dist/src/server.js", nodeMinMajor: 20, createdAt: new Date().toISOString() }),
+      );
+      writeFileSync(path.join(hungRelDir, "package.json"), JSON.stringify({ name: "aws-quick2api", version: "0.2.0" }));
+      // Hanging release: never sends gateway_ready and never exits on its own
+      writeFileSync(hungEntry, "setInterval(() => {}, 10_000);");
+      saveSelfUpdateState(dataDir, {
+        activeVersion: "0.2.0",
+        previousVersion: null,
+        pendingVersion: "0.2.0",
+        failedVersions: [],
+      });
+      const spawnedVers: string[] = [];
+      const supCode = await runBootstrapSupervisor({
+        dataDir,
+        builtinAppRoot: builtinRoot,
+        healthyGraceMs: 0,
+        startupReadyTimeoutMs: 180,
+        onSpawn: (target) => {
+          spawnedVers.push(`${target.kind}:${target.version}`);
+        },
+      });
+      assert.equal(supCode, 0);
+      assert.deepEqual(spawnedVers, ["hot:0.2.0", "builtin:0.1.0"], "hung pending release must be killed and auto-rolled back");
+      const afterSt = loadSelfUpdateState(dataDir);
+      assert.equal(afterSt.activeVersion, null);
+      assert.ok(afterSt.failedVersions.includes("0.2.0"));
+      assert.match(afterSt.lastRollbackReason || "", /did not become ready/i);
+
+      // 3) P1-1: ARN vs shortId normalization across validateChatAgentId & WarmSessionPool
+      const fullArn = "arn:aws:quicksight:us-east-1:123456789012:agent/agent-norm-77";
+      assert.equal(validateChatAgentId(fullArn), "agent-norm-77");
+      const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+      const wp = new WarmSessionPool({ warmSessionTtlMs: 60_000, maxWarmSessions: 16 });
+      const stubWsObj = {
+        readyState: 1,
+        close() { stubWsObj.readyState = 3; },
+        on() {},
+        off() {},
+        once() {},
+        ping() {},
+        send() {},
+      };
+      const stubWs = stubWsObj as unknown as import("ws").default;
+      wp.park({
+        scope: "master",
+        conversationKey: "conv-arn",
+        slotId: "slot-arn",
+        isIncognito: true,
+        chatAgentId: fullArn,
+        prefixHashes: ["hash-1"],
+        threadId: "t-arn",
+        rootThreadId: "t-arn",
+        ws: stubWs,
+        outpostId: "web0",
+        encodeFrame: () => "",
+      });
+      const hitShort = wp.lookup("master", "conv-arn", "slot-arn", true, "hash-1", "agent-norm-77");
+      assert.ok(hitShort, "WarmSessionPool must hit when parked with full ARN and looked up by shortId");
+      wp.invalidateAll();
+
+      // 4) P1-2: UpstreamKeyPool emits onSlotInvalidated on OAuth refresh rotation rekey & auto-disable
+      const origOAuth = serializeOAuthCredential({
+        region: "us-east-1",
+        issuerUrl: "https://identitycenter.amazonaws.com/test",
+        wsHost: "chat.quick.aws.com",
+        clientId: "cid-rekey-1",
+        clientSecret: "csec-rekey-1",
+        refreshToken: "rt-old-1",
+      });
+      const pool = new UpstreamKeyPool({
+        ...loadConfigFromEnv({}),
+        quickTokens: [origOAuth],
+        disabledQuickTokens: [],
+        autoDisableExhaustedKeys: true,
+      });
+      const invalidated: string[] = [];
+      pool.setOnSlotInvalidated((sid) => invalidated.push(sid));
+      const oldSlotId = pool.allManagedKeys()[0]!.slotId;
+      assert.equal(pool.rotateOAuthRefreshToken("cid-rekey-1", "rt-new-2"), true);
+      assert.ok(invalidated.includes(oldSlotId), "OAuth refresh rotation must invalidate old slotId in WarmSessionPool");
+      const newSlot = pool.allManagedKeys()[0]!;
+      pool.reportAuthFailure(newSlot.rawKey, "401 unauthorized");
+      assert.ok(invalidated.includes(newSlot.slotId), "auto-disable on auth failure must invalidate slotId in WarmSessionPool");
+      pool.dispose();
+
+      // 5) P1-8: collectTurnEvents resets accumulated text/thinking on `{ type: "reset" }`
+      const { collectTurnEvents } = await import("../src/protocols/common.js");
+      async function* mockResetStream(): AsyncGenerator<import("../src/core/types.js").GatewayStreamEvent> {
+        yield { type: "thinking", text: "stale-thinking" };
+        yield { type: "text", text: "partial-before-filter" };
+        yield { type: "reset" };
+        yield { type: "text", text: "clean-rephrased-answer" };
+        yield { type: "done", stopReason: "stop" };
+      }
+      const collected = await collectTurnEvents(mockResetStream());
+      assert.equal(collected.thinking, "");
+      assert.equal(collected.text, "clean-rephrased-answer");
+
+      // 6) P2: normalizeSafeRelPath rejects Windows drive-letter paths
+      assert.throws(() => normalizeSafeRelPath("C:/evil.js"), /Unsafe tar path|Absolute|Path traversal/);
+      assert.throws(() => normalizeSafeRelPath("D:evil.js"), /Unsafe tar path|Absolute|Path traversal/);
+
+      // 7) TTFT #2: computeDialogPrefixHashes remains stable when ephemeral <system-reminder> changes inside earlier user message
+      const h1 = computeDialogPrefixHashes({
+        systemPrompt: "sys",
+        toolNamesSignature: "read_file",
+        items: [
+          { role: "user", text: "<system-reminder>time=10:00</system-reminder>\nInspect foo.ts", images: [], hasTools: false },
+          { role: "assistant", text: "Looks good.", images: [], hasTools: false },
+          { role: "user", text: "Next question", images: [], hasTools: false },
+        ],
+      });
+      const h2 = computeDialogPrefixHashes({
+        systemPrompt: "sys",
+        toolNamesSignature: "read_file",
+        items: [
+          { role: "user", text: "<system-reminder>time=10:05</system-reminder>\nInspect foo.ts", images: [], hasTools: false },
+          { role: "assistant", text: "Looks good.", images: [], hasTools: false },
+          { role: "user", text: "Next question", images: [], hasTools: false },
+        ],
+      });
+      assert.equal(h1.priorPrefixHash, h2.priorPrefixHash, "ephemeral <system-reminder> drift in earlier user messages must not break warm_incremental");
+
+      // 8) P2: RequestTraceLogger.clear() persists immediately without waiting for debounce
+      const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+      const tFile = path.join(tmpDir, "traces-imm.json");
+      const tl1 = new RequestTraceLogger(20, tFile);
+      const tid = tl1.startTrace("openai-chat", {
+        requestedModel: "quick-fast",
+        rawBody: { messages: [{ role: "user", content: "hi" }] },
+        fullTranscriptText: "hi",
+        images: [],
+        tools: [],
+        toolChoice: "auto",
+        trailingToolResults: [],
+        stream: false,
+        estimatedInputTokens: 2,
+      });
+      tl1.finishSuccess(tid, "stop");
+      tl1.flush();
+      assert.equal(JSON.parse(readFileSync(tFile, "utf8")).records.length, 1);
+      tl1.clear();
+      assert.equal(JSON.parse(readFileSync(tFile, "utf8")).records.length, 0, "clear() must persist empty traces immediately");
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }

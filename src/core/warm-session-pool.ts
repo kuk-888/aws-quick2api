@@ -121,7 +121,10 @@ export class WarmSessionPool {
     prefixHash: string,
     chatAgentId?: string,
   ): string {
-    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${isIncognito ? "inc" : "cld"}|${chatAgentId || "-"}|${prefixHash}`;
+    const rawAgent = (chatAgentId || "").trim();
+    const slash = rawAgent.lastIndexOf("/");
+    const normAgent = slash >= 0 && slash < rawAgent.length - 1 ? rawAgent.slice(slash + 1) : rawAgent;
+    return `${scope || "default"}|${conversationKey || "-"}|${slotId}|${isIncognito ? "inc" : "cld"}|${normAgent || "-"}|${prefixHash}`;
   }
 
   private detachParkedWs(handle: ParkedWsHandle, closeSocket: boolean): void {
@@ -133,6 +136,7 @@ export class WarmSessionPool {
     handle.ws.off("message", handle.onIdleMessage);
     handle.ws.off("pong", handle.onIdlePong);
     if (closeSocket) {
+      handle.ws.on("error", () => {});
       try {
         handle.ws.close();
       } catch { }

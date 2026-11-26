@@ -31,7 +31,12 @@ export async function collectTurnEvents(events: AsyncIterable<GatewayStreamEvent
   };
 
   for await (const ev of events) {
-    if (ev.type === "thinking") thinking += ev.text;
+    if (ev.type === "reset") {
+      thinking = "";
+      text = "";
+      toolCalls = [];
+      stopReason = "stop";
+    } else if (ev.type === "thinking") thinking += ev.text;
     else if (ev.type === "text") text += ev.text;
     else if (ev.type === "tool_calls") toolCalls = ev.calls;
     else if (ev.type === "usage") metrics = ev.metrics;

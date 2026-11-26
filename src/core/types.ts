@@ -118,6 +118,7 @@ export interface TurnTokenMetrics {
 }
 
 export type GatewayStreamEvent =
+  | { type: "reset" }
   | { type: "thinking"; text: string }
   | { type: "text"; text: string }
   | { type: "tool_calls"; calls: NormalizedToolCall[] }

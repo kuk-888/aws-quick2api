@@ -99,6 +99,7 @@ export class RequestTraceLogger {
   private flushTimer: NodeJS.Timeout | null = null;
   private writeChain: Promise<void> = Promise.resolve();
   private tmpSeq = 0;
+  private writeEpoch = 0;
 
   constructor(maxEntries = 100, storageFilePath?: string) {
     this.maxEntries = maxEntries;
@@ -108,7 +109,8 @@ export class RequestTraceLogger {
 
   clear(): void {
     this.records.clear();
-    this.schedulePersist();
+    this.dirty = true;
+    this.flush();
   }
 
   startTrace(
@@ -285,6 +287,7 @@ export class RequestTraceLogger {
     }
     if (!this.filePath || !this.dirty) return;
     this.dirty = false;
+    this.writeEpoch += 1;
     const payload = this.buildPersistJson();
     const dir = path.dirname(this.filePath);
     const tmpPath = `${this.filePath}.${process.pid}.${++this.tmpSeq}.sync.tmp`;
@@ -344,17 +347,27 @@ export class RequestTraceLogger {
   private enqueueAsyncWrite(): void {
     if (!this.filePath) return;
     const targetPath = this.filePath;
+    const epoch = ++this.writeEpoch;
     const payload = this.buildPersistJson();
     const tmpPath = `${targetPath}.${process.pid}.${++this.tmpSeq}.tmp`;
     const dir = path.dirname(targetPath);
     this.writeChain = this.writeChain
       .then(async () => {
+        if (this.writeEpoch !== epoch) return;
         await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
         await fsPromises.writeFile(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
         try {
           await fsPromises.chmod(tmpPath, 0o600);
         } catch {
           // Non-POSIX
+        }
+        if (this.writeEpoch !== epoch) {
+          try {
+            await fsPromises.unlink(tmpPath);
+          } catch {
+            // Ignore cleanup errors
+          }
+          return;
         }
         await fsPromises.rename(tmpPath, targetPath);
       })
@@ -385,9 +398,9 @@ export class RequestTraceLogger {
           httpStatus: typeof r.httpStatus === "number" ? r.httpStatus : 200,
           protocol:
             r.protocol === "openai-chat" ||
-            r.protocol === "openai-responses" ||
-            r.protocol === "anthropic-messages" ||
-            r.protocol === "playground"
+              r.protocol === "openai-responses" ||
+              r.protocol === "anthropic-messages" ||
+              r.protocol === "playground"
               ? r.protocol
               : "openai-chat",
           stream: Boolean(r.stream),
@@ -425,10 +438,10 @@ export class RequestTraceLogger {
           fingerprint:
             r.fingerprint && typeof r.fingerprint === "object"
               ? {
-                  ...(typeof r.fingerprint.conversation === "string" ? { conversation: r.fingerprint.conversation } : {}),
-                  ...(typeof r.fingerprint.priorPrefix === "string" ? { priorPrefix: r.fingerprint.priorPrefix } : {}),
-                  ...(typeof r.fingerprint.currentPrefix === "string" ? { currentPrefix: r.fingerprint.currentPrefix } : {}),
-                }
+                ...(typeof r.fingerprint.conversation === "string" ? { conversation: r.fingerprint.conversation } : {}),
+                ...(typeof r.fingerprint.priorPrefix === "string" ? { priorPrefix: r.fingerprint.priorPrefix } : {}),
+                ...(typeof r.fingerprint.currentPrefix === "string" ? { currentPrefix: r.fingerprint.currentPrefix } : {}),
+              }
               : {},
           fullPromptChars: 0,
           incrementalDeltaChars: 0,

@@ -432,6 +432,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     agentFactory: options.agentFactory,
     modelListFetcher: options.modelListFetcher
   });
+  keyPool.setOnSlotInvalidated((slotId) => {
+    engine.invalidateWarmSessionsForSlot(slotId);
+  });
 
   /** Reject unknown base model ids with 404 before any account-pool / spend-guard logic runs. Does not touch pool scheduling state. */
   async function assertModelExists(requestedModel: string): Promise<void> {
@@ -877,9 +880,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
               flushEarly,
               ...(flushEarly
                 ? {
-                    flushEarlyController,
-                    ...(options.flushEarlyDelayMs !== undefined ? { flushEarlyDelayMs: options.flushEarlyDelayMs } : {}),
-                  }
+                  flushEarlyController,
+                  ...(options.flushEarlyDelayMs !== undefined ? { flushEarlyDelayMs: options.flushEarlyDelayMs } : {}),
+                }
                 : {}),
               ...(protocolEntry.tag === "anthropic-messages"
                 ? { postStartKeepAliveFrame: 'event: ping\ndata: {"type":"ping"}\n\n' }
@@ -948,9 +951,12 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       await engine.disposeAll();
       server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      await keyPool.flushStateAsync().catch(() => {});
+      await keyPool.flushEnvMirrorAsync().catch(() => {});
       keyPool.dispose();
       clientKeys.flushStatsToDisk();
       usageLedger.flush();
+      await traceLogger.flushAsync().catch(() => {});
       traceLogger.flush();
     }
   };
@@ -1090,7 +1096,18 @@ if (isMain) {
     }
   }
 
+  const onListenError = (err: Error) => {
+    console.error(
+      JSON.stringify({
+        event: "gateway_refused_to_start",
+        reason: err.message,
+      }),
+    );
+    process.exit(1);
+  };
+  instance.server.once("error", onListenError);
   instance.server.listen({ port: config.port, host: config.host, backlog: 512 }, () => {
+    instance.server.off("error", onListenError);
     try {
       process.send?.({ type: "gateway_ready", version: readPackageVersion() });
     } catch {

@@ -945,6 +945,11 @@ export function evaluateDlpPollResponse(dlpJson: {
 
 const MAX_DLP_POLL_ATTEMPTS = 40;
 const DLP_POLL_INTERVAL_MS = 1_500;
+const DLP_POLL_BACKOFF_SCHEDULE_MS = [250, 400, 600, 1_000, DLP_POLL_INTERVAL_MS] as const;
+
+function dlpPollDelayForAttempt(pollIndex: number): number {
+  return DLP_POLL_BACKOFF_SCHEDULE_MS[Math.min(pollIndex, DLP_POLL_BACKOFF_SCHEDULE_MS.length - 1)]!;
+}
 
 /**
  * Upload any binary or UTF-8 file payload (images, PDFs, oversized `.txt` contexts) out-of-band via
@@ -1078,7 +1083,7 @@ export async function uploadOAuthBinaryAttachment(
       break;
     }
     if (poll + 1 < MAX_DLP_POLL_ATTEMPTS) {
-      await sleepWithAbort(DLP_POLL_INTERVAL_MS, signal);
+      await sleepWithAbort(dlpPollDelayForAttempt(poll), signal);
     }
   }
   if (!dlpReady) {

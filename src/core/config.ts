@@ -14,7 +14,10 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import type { AutoDisabledState, GatewayConfig, LbStrategy } from "./types.js";
 
-export function loadDotEnv(explicitPath?: string): string | undefined {
+export function readDotEnvRaw(explicitPath?: string): {
+  envFilePath?: string;
+  values: Record<string, string>;
+} {
   const candidates = [
     explicitPath,
     process.env.ENV_FILE_PATH?.trim(),
@@ -23,7 +26,8 @@ export function loadDotEnv(explicitPath?: string): string | undefined {
   ].filter((p): p is string => Boolean(p));
 
   const envPath = candidates.find((p) => existsSync(p));
-  if (!envPath) return undefined;
+  if (!envPath) return { values: Object.create(null) as Record<string, string> };
+  const values: Record<string, string> = Object.create(null);
   const content = readFileSync(envPath, "utf8");
   for (const rawLine of content.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -31,12 +35,34 @@ export function loadDotEnv(explicitPath?: string): string | undefined {
     const eq = line.indexOf("=");
     if (eq <= 0) continue;
     const key = line.slice(0, eq).trim();
+    if (!key || key === "__proto__" || key === "constructor" || key === "prototype") continue;
     const val = line.slice(eq + 1).trim().replace(/^(['"])(.*)\1$/, "$2");
-    if (key && process.env[key] === undefined) {
+    values[key] = val;
+  }
+  return { envFilePath: envPath, values };
+}
+
+export function loadDotEnv(explicitPath?: string): string | undefined {
+  const { envFilePath, values } = readDotEnvRaw(explicitPath);
+  if (!envFilePath) return undefined;
+  for (const [key, val] of Object.entries(values)) {
+    if (process.env[key] === undefined) {
       process.env[key] = val;
     }
   }
-  return envPath;
+  return envFilePath;
+}
+
+export function resolveGatewayDataDir(
+  env: Record<string, string | undefined>,
+  envFilePath?: string
+): string | undefined {
+  const explicitDataDir = env.DATA_DIR?.trim() || undefined;
+  if (explicitDataDir) return path.resolve(explicitDataDir);
+  if (envFilePath) return path.dirname(path.resolve(envFilePath));
+  if (env.ENV_FILE_PATH?.trim()) return path.dirname(path.resolve(env.ENV_FILE_PATH.trim()));
+  if (existsSync(path.resolve(process.cwd(), "data"))) return path.resolve(process.cwd(), "data");
+  return undefined;
 }
 
 function parseIntEnv(val: string | undefined, fallback: number): number {
@@ -168,16 +194,7 @@ export function loadConfigFromEnv(
   const enableDashboard = parseBoolEnv(env.ENABLE_DASHBOARD, true);
   const dashboardPath = normalizeDashboardPath(env.DASHBOARD_PATH);
 
-  const explicitDataDir = env.DATA_DIR?.trim() || undefined;
-  const resolvedDataDir =
-    explicitDataDir ??
-    (envFilePath
-      ? path.dirname(envFilePath)
-      : env.ENV_FILE_PATH?.trim()
-        ? path.dirname(env.ENV_FILE_PATH.trim())
-        : existsSync(path.resolve(process.cwd(), "data"))
-          ? path.resolve(process.cwd(), "data")
-          : undefined);
+  const resolvedDataDir = resolveGatewayDataDir(env, envFilePath);
 
   return {
     host: env.HOST?.trim() || "127.0.0.1",

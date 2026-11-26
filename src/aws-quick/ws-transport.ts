@@ -49,6 +49,16 @@ export const DEFAULT_CODING_AGENT_DESCRIPTION = "General software engineering an
 export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
   "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly. When structured <tool_call> schemas are provided in context, emit matching <tool_call> blocks directly when appropriate.";
 
+/**
+ * Normalizes an AWS Quick agent identifier (full ARN `arn:aws:quicksight:...:agent/<id>` or short ID)
+ * to its canonical short ID so slot bindings, UI highlights, and warm-session cache keys stay consistent.
+ */
+export function normalizeChatAgentShortId(raw: string): string {
+  const trimmed = raw.trim();
+  const slash = trimmed.lastIndexOf("/");
+  return slash >= 0 && slash < trimmed.length - 1 ? trimmed.slice(slash + 1) : trimmed;
+}
+
 export type QuickWebSocketFactory = (url: string, options?: Record<string, unknown>) => WebSocket;
 export type QuickFrameEncoder = (frame: Record<string, unknown>) => Uint8Array | string;
 export type QuickFrameDecoder = (msg: EventStreamMessage) => DecodedGatewayFrame | null;
@@ -280,6 +290,7 @@ export async function deleteCloudSessionsForKey(
         sendTimer = null;
       }
       detachMsg();
+      ws.on("error", () => {});
       try {
         ws.close();
       } catch { }
@@ -358,6 +369,7 @@ export async function listChatAgentsForKey(
       settled = true;
       clearTimeout(timer);
       detachMsg();
+      ws.on("error", () => {});
       try {
         ws.close();
       } catch { }
@@ -442,6 +454,7 @@ export async function createAndPublishCodingAgentForKey(
       clearTimeout(timer);
       if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
       detachMsg();
+      ws.on("error", () => {});
       try {
         ws.close();
       } catch { }
@@ -507,8 +520,8 @@ export async function createAndPublishCodingAgentForKey(
         } else if (evType === "agent_draft_saved" && stage === "updating") {
           triggerPublish();
         } else if (evType === "publish_agent_draft_success") {
-          const finalId = (typeof payload.agent_id === "string" && payload.agent_id.trim()) || draftAgentId;
-          done(() => resolve({ agentId: finalId, name }));
+          const rawFinalId = (typeof payload.agent_id === "string" && payload.agent_id.trim()) || draftAgentId;
+          done(() => resolve({ agentId: normalizeChatAgentShortId(rawFinalId), name }));
         } else if (
           evType === "publish_agent_draft_error" ||
           evType === "update_chat_agent_config_error" ||
@@ -543,7 +556,7 @@ export async function updateAndPublishAgentForKey(
   proxyUrl?: string,
   webSocketFactory?: QuickWebSocketFactory,
 ): Promise<{ agentId: string }> {
-  const cleanId = agentId.trim();
+  const cleanId = normalizeChatAgentShortId(agentId);
   if (!cleanId) throw new GatewayError("`agentId` is required.", 400, "invalid_request_error");
   const instructions = opts.instructions.trim();
   const { ws, encodeFrame, decodeFrame } = await dialQuickWebSocket({
@@ -564,6 +577,7 @@ export async function updateAndPublishAgentForKey(
       clearTimeout(timer);
       if (publishFallbackTimer) clearTimeout(publishFallbackTimer);
       detachMsg();
+      ws.on("error", () => {});
       try {
         ws.close();
       } catch { }
@@ -623,7 +637,7 @@ export async function updateAndPublishAgentForKey(
         } else if (evType === "agent_draft_saved" && stage === "updating") {
           triggerPublish();
         } else if (evType === "publish_agent_draft_success") {
-          done(() => resolve({ agentId: cleanId }));
+          done(() => resolve({ agentId: normalizeChatAgentShortId(cleanId) }));
         } else if (
           evType === "publish_agent_draft_error" ||
           evType === "update_chat_agent_config_error" ||

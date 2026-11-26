@@ -222,9 +222,10 @@ export function computeDialogPrefixHashes(params: {
       incrementalFiles = grpFiles;
     }
 
+    const hashText = grpText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, "").trim() || grpText.trim();
     const hashParts = isPureSingleUser
-      ? [runningHash, `USER:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`]
-      : [runningHash, `INPUT:${grpText.trim()}`, `IMG:${imagesDigest(grpImages)}`];
+      ? [runningHash, `USER:${hashText}`, `IMG:${imagesDigest(grpImages)}`]
+      : [runningHash, `INPUT:${hashText}`, `IMG:${imagesDigest(grpImages)}`];
     if (grpFiles.length > 0) {
       hashParts.push(`FILE:${filesDigest(grpFiles)}`);
     }

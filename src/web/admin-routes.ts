@@ -188,7 +188,10 @@ export async function tryHandleWebAdminRoute(
     adminAuth.requireAdminAuth(req, extractClientCredential(req));
     const force = new URL(req.url || "/", "http://localhost").searchParams.get("force") === "1";
     const info = await checkLatestVersion(force);
-    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    const effectiveDataDir =
+      process.env.AWS_QUICK_UPDATES_DATA_DIR?.trim() ||
+      config.dataDir ||
+      path.resolve(process.cwd(), "data");
     sendJson(res, 200, {
       ok: true,
       ...info,
@@ -200,7 +203,10 @@ export async function tryHandleWebAdminRoute(
 
   if (route === "/v1/admin/update/apply" && req.method === "POST") {
     adminAuth.requireAdminAuth(req, extractClientCredential(req));
-    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    const effectiveDataDir =
+      process.env.AWS_QUICK_UPDATES_DATA_DIR?.trim() ||
+      config.dataDir ||
+      path.resolve(process.cwd(), "data");
     const result = await applySelfUpdate({
       dataDir: effectiveDataDir,
       fetcher: ctx.selfUpdateFetcher,
@@ -214,7 +220,10 @@ export async function tryHandleWebAdminRoute(
 
   if (route === "/v1/admin/update/rollback" && req.method === "POST") {
     adminAuth.requireAdminAuth(req, extractClientCredential(req));
-    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    const effectiveDataDir =
+      process.env.AWS_QUICK_UPDATES_DATA_DIR?.trim() ||
+      config.dataDir ||
+      path.resolve(process.cwd(), "data");
     const result = rollbackSelfUpdate({ dataDir: effectiveDataDir });
     sendJson(res, 200, result);
     if (result.willRestart && ctx.requestSelfUpdateRestart) {
@@ -331,13 +340,21 @@ export async function tryHandleWebAdminRoute(
     if (typeof body.chatAgentId === "string") {
       patch.chatAgentId = body.chatAgentId;
     }
+    const prevSettings = keyPool.getSettings();
     keyPool.updateSettings(patch);
-    config.chatAgentId = keyPool.getSettings().chatAgentId;
-    config.customAgentPrompt = keyPool.getSettings().customAgentPrompt;
-    config.sanitizeClientSystemPrompt = keyPool.getSettings().sanitizeClientSystemPrompt;
-    config.autoRephraseOnContentFilter = keyPool.getSettings().autoRephraseOnContentFilter;
-    config.contentFilterRephrasePrompt = keyPool.getSettings().contentFilterRephrasePrompt;
-    config.contentFilterRephraseModel = keyPool.getSettings().contentFilterRephraseModel;
+    const nextSettings = keyPool.getSettings();
+    config.chatAgentId = nextSettings.chatAgentId;
+    config.customAgentPrompt = nextSettings.customAgentPrompt;
+    config.sanitizeClientSystemPrompt = nextSettings.sanitizeClientSystemPrompt;
+    config.autoRephraseOnContentFilter = nextSettings.autoRephraseOnContentFilter;
+    config.contentFilterRephrasePrompt = nextSettings.contentFilterRephrasePrompt;
+    config.contentFilterRephraseModel = nextSettings.contentFilterRephraseModel;
+    if (
+      (prevSettings.chatAgentId || "") !== (nextSettings.chatAgentId || "") ||
+      prevSettings.incognitoMode !== nextSettings.incognitoMode
+    ) {
+      engine.invalidateWarmSessionsAll();
+    }
     sendJson(res, 200, {
       ok: true,
       settings: {
@@ -650,8 +667,10 @@ export async function tryHandleWebAdminRoute(
       try {
         if (action === "delete") {
           keyPool.removeKey(id);
+          engine.invalidateWarmSessionsForSlot(id);
         } else {
           keyPool.updateSlotMeta(id, { enabled: action === "enable" });
+          if (action === "disable") engine.invalidateWarmSessionsForSlot(id);
         }
         affected += 1;
       } catch {
@@ -883,10 +902,37 @@ export async function tryHandleWebAdminRoute(
   }
 
   if (route === "/v1/admin/keys/sync-agents" && req.method === "POST") {
-    const body = (await readJsonBody(req, config.maxBodyBytes).catch(() => ({}))) as { slotIds?: string[] };
+    const rawBody = await readJsonBody(req, config.maxBodyBytes);
+    if (!isRecord(rawBody)) {
+      throw new GatewayError("JSON object expected.", 400, "invalid_request_error");
+    }
+    const body = rawBody as {
+      slotIds?: string[];
+      mode?: string;
+      name?: string;
+      description?: string;
+      instructions?: string;
+      setAsDefault?: boolean;
+    };
     const requestedIds = Array.isArray(body?.slotIds)
       ? body.slotIds.map((id) => String(id || "").trim()).filter(Boolean)
       : [];
+    const syncMode: "create" | "upgrade" = body?.mode === "upgrade" ? "upgrade" : "create";
+    const syncName = typeof body?.name === "string" ? body.name.trim() : "";
+    const syncDesc = typeof body?.description === "string" ? body.description.trim() : "";
+    const syncInstructions = typeof body?.instructions === "string" ? body.instructions.trim() : "";
+    const setAsDefault = body?.setAsDefault !== false;
+
+    if (syncName.length > 120) {
+      throw new GatewayError("Agent `name` must be 120 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (syncDesc.length > 500) {
+      throw new GatewayError("Agent `description` must be 500 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (syncInstructions.length > 16_000) {
+      throw new GatewayError("Agent `instructions` must be 16,000 characters or fewer.", 400, "invalid_request_error");
+    }
+
     const allKeys = keyPool.allManagedKeys();
     const targets =
       requestedIds.length > 0
@@ -898,7 +944,9 @@ export async function tryHandleWebAdminRoute(
         slotId: string;
         label: string;
         agentId: string;
+        name: string;
         action: "upgraded" | "created" | "unchanged";
+        boundAsDefault: boolean;
         previousName?: string;
       }>
     > = new Array(targets.length);
@@ -914,6 +962,13 @@ export async function tryHandleWebAdminRoute(
             target.slotId,
             keyPool,
             target.proxyUrl,
+            {
+              mode: syncMode,
+              ...(syncName ? { name: syncName } : {}),
+              ...(syncDesc ? { description: syncDesc } : {}),
+              ...(syncInstructions ? { instructions: syncInstructions } : {}),
+              setAsDefault,
+            },
           );
           settled[idx] = {
             status: "fulfilled",
@@ -953,6 +1008,8 @@ export async function tryHandleWebAdminRoute(
 
     sendJson(res, 200, {
       ok: true,
+      mode: syncMode,
+      setAsDefault,
       total: targets.length,
       upgraded,
       created,
@@ -984,7 +1041,10 @@ export async function tryHandleWebAdminRoute(
     const slotId = ensureAgentMatch[1]!;
     const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
     if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
-    const body = await readJsonBody(req, 16_384).catch(() => ({}));
+    const body = await readJsonBody(req, 16_384);
+    if (!isRecord(body)) {
+      throw new GatewayError("JSON object expected.", 400, "invalid_request_error");
+    }
     const upgrade = isRecord(body) && body.upgrade === true;
     if (upgrade) {
       const synced = await engine.syncCodingAgentForKey(
@@ -992,6 +1052,17 @@ export async function tryHandleWebAdminRoute(
         slotId,
         keyPool,
         target.proxyUrl,
+        {
+          mode: body.mode === "create" ? "create" : "upgrade",
+          ...(typeof body.name === "string" && body.name.trim() ? { name: body.name.trim() } : {}),
+          ...(typeof body.description === "string" && body.description.trim()
+            ? { description: body.description.trim() }
+            : {}),
+          ...(typeof body.instructions === "string" && body.instructions.trim()
+            ? { instructions: body.instructions.trim() }
+            : {}),
+          setAsDefault: body.setAsDefault !== false,
+        },
       );
       const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
       sendJson(res, 200, {
@@ -999,6 +1070,7 @@ export async function tryHandleWebAdminRoute(
         slotId,
         chatAgentId: synced.agentId,
         action: synced.action,
+        boundAsDefault: synced.boundAsDefault,
         ...(synced.previousName ? { previousName: synced.previousName } : {}),
         agents,
         keyPool: keyPool.statusSnapshot(),
@@ -1040,6 +1112,15 @@ export async function tryHandleWebAdminRoute(
     if (!isRecord(body) || typeof body.agentId !== "string" || typeof body.instructions !== "string") {
       throw new GatewayError("`agentId` and `instructions` strings are required.", 400, "invalid_request_error");
     }
+    if (typeof body.name === "string" && body.name.trim().length > 120) {
+      throw new GatewayError("Agent `name` must be 120 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (typeof body.description === "string" && body.description.trim().length > 500) {
+      throw new GatewayError("Agent `description` must be 500 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (body.instructions.trim().length > 16_000) {
+      throw new GatewayError("Agent `instructions` must be 16,000 characters or fewer.", 400, "invalid_request_error");
+    }
     const updated = await engine.updateAndPublishAgentForKey(
       target.rawKey,
       body.agentId,
@@ -1050,8 +1131,19 @@ export async function tryHandleWebAdminRoute(
       },
       target.proxyUrl,
     );
+    if (body.setAsDefault === true) {
+      keyPool.updateSlotMeta(slotId, { chatAgentId: updated.agentId });
+    }
+    // Always invalidate warm sessions for this slot so active threads pick up the newly published instructions/agentId immediately.
+    engine.invalidateWarmSessionsForSlot(slotId);
     const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
-    sendJson(res, 200, { ok: true, slotId, agentId: updated.agentId, agents });
+    sendJson(res, 200, {
+      ok: true,
+      slotId,
+      agentId: updated.agentId,
+      agents,
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -1060,12 +1152,14 @@ export async function tryHandleWebAdminRoute(
     const slotId = adminKeyMatch[1]!;
     if (req.method === "DELETE") {
       keyPool.removeKey(slotId);
+      engine.invalidateWarmSessionsForSlot(slotId);
       sendJson(res, 200, { ok: true, keyPool: keyPool.statusSnapshot() });
       return true;
     }
     if (req.method === "PATCH") {
       const body = await readJsonBody(req, config.maxBodyBytes);
       if (!isRecord(body)) throw new GatewayError("JSON object expected.", 400, "invalid_request_error");
+      const before = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
       keyPool.updateSlotMeta(slotId, {
         ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
         ...(typeof body.label === "string" ? { label: body.label } : {}),
@@ -1073,6 +1167,16 @@ export async function tryHandleWebAdminRoute(
         ...(typeof body.chatAgentId === "string" ? { chatAgentId: body.chatAgentId } : {}),
         ...(body.clearCooldown === true ? { clearCooldown: true } : {})
       });
+      const after = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
+      if (
+        !before ||
+        !after ||
+        (before.chatAgentId || "") !== (after.chatAgentId || "") ||
+        (before.proxyUrl || "") !== (after.proxyUrl || "") ||
+        (before.enabled && !after.enabled)
+      ) {
+        engine.invalidateWarmSessionsForSlot(slotId);
+      }
       sendJson(res, 200, { ok: true, keyPool: keyPool.statusSnapshot() });
       return true;
     }

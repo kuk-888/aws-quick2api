@@ -3,10 +3,11 @@ import WebSocket from "ws";
 import {
   decodeCloudOutputFrame,
   decodeGatewayFrame,
+  drainEventStream,
   encodeCloudInputFrame,
   encodeGatewayJsonFrame,
 } from "../aws-quick/event-stream-cbor.js";
-import { resolveOAuthAccessToken } from "../aws-quick/oauth-client.js";
+import { cacheOAuthUserIdentity, resolveOAuthAccessToken } from "../aws-quick/oauth-client.js";
 import { parseQuickCredential, stopSharedOutpost } from "../aws-quick/outpost-singleton.js";
 import type { SDKModel } from "../aws-quick/types.js";
 import {
@@ -16,11 +17,14 @@ import {
   DEFAULT_CODING_AGENT_INSTRUCTIONS,
   DEFAULT_CODING_AGENT_NAME,
   deleteCloudSessionsForKey as deleteCloudSessionsViaWs,
+  DESKTOP_CAPABILITIES,
   dialQuickWebSocket,
   LEGACY_CODING_AGENT_NAMES,
   listChatAgentsForKey as listChatAgentsViaWs,
+  normalizeChatAgentShortId,
   SURFACE_TYPE,
   updateAndPublishAgentForKey as updateAgentViaWs,
+  type DialedQuickWs,
   type QuickChatAgentInfo,
   type QuickFrameDecoder,
   type QuickFrameEncoder,
@@ -36,6 +40,7 @@ import {
   buildQuickImageAttachments,
   estimatePromptTokens,
   isPrivateOrReservedIp,
+  jsonStringUtf8Bytes,
   mapAttachmentUploadError,
   MAX_INLINE_FILES,
   MAX_INLINE_IMAGES,
@@ -159,6 +164,22 @@ export class QuickExecutionEngine {
     stopSharedOutpost();
   }
 
+  /**
+   * Immediately invalidates parked WebSockets & warm sessions for `slotId` and bumps its generation
+   * so in-flight turns with an outdated `chatAgentId` or instructions never park stale sockets.
+   */
+  invalidateWarmSessionsForSlot(slotId: string): number {
+    return this.warmPool.invalidateSlot(slotId);
+  }
+
+  /**
+   * Immediately invalidates parked WebSockets & warm sessions across all slots
+   * (e.g. when global `chatAgentId` or `incognitoMode` changes).
+   */
+  invalidateWarmSessionsAll(): number {
+    return this.warmPool.invalidateAll();
+  }
+
   async resolveModel(apiKey: string, requestedModel: string, body: Record<string, unknown>) {
     const models = await listLiveModels(apiKey, this.modelListFetcher);
     return resolveModelSelection(requestedModel, body, models.find((m) => m.id === requestedModel));
@@ -214,8 +235,12 @@ export class QuickExecutionEngine {
           const knownNames = new Set(LEGACY_CODING_AGENT_NAMES.map((n) => n.toLowerCase()));
           const preferred = customAgents.find((a) => knownNames.has(a.name.trim().toLowerCase()));
           if (preferred) {
-            const chosenId = preferred.shortId || preferred.agentId;
+            const chosenId = normalizeChatAgentShortId(preferred.shortId || preferred.agentId);
+            const prevBound = normalizeChatAgentShortId(
+              keyPool.allManagedKeys().find((k) => k.slotId === slotId)?.chatAgentId || "",
+            );
             keyPool.updateSlotMeta(slotId, { chatAgentId: chosenId });
+            if (chosenId !== prevBound) this.warmPool.invalidateSlot(slotId);
             this.autoEnsureFailedSlots.delete(slotId);
             return chosenId;
           }
@@ -226,9 +251,11 @@ export class QuickExecutionEngine {
           { instructions: templatePrompt },
           proxyUrl,
         );
-        keyPool.updateSlotMeta(slotId, { chatAgentId: created.agentId });
+        const createdId = normalizeChatAgentShortId(created.agentId);
+        keyPool.updateSlotMeta(slotId, { chatAgentId: createdId });
+        this.warmPool.invalidateSlot(slotId);
         this.autoEnsureFailedSlots.delete(slotId);
-        return created.agentId;
+        return createdId;
       } catch (err) {
         const prev = this.autoEnsureFailedSlots.get(slotId);
         const failCount = (prev?.count || 0) + 1;
@@ -255,68 +282,113 @@ export class QuickExecutionEngine {
   }
 
   /**
-   * One-click repair / upgrade for an account's coding custom agent:
-   * - Upgrades legacy `Quick2API Bridge` / `Quick2API Coding Bridge` or outdated `Coding Assistant`
-   *   in-place (renaming to `Coding Assistant` and publishing the current template instructions)
-   *   without touching unrelated user-created custom agents;
-   * - Creates and binds a new `Coding Assistant` if none exists;
-   * - Skips publishing when already bound to an up-to-date `Coding Assistant`.
+   * Batch/one-click cloud agent sync for an account:
+   * - `mode: "create"` (default): creates and publishes a brand-new cloud agent with the requested
+   *   `name`, `description`, and `instructions` without touching any existing cloud agents;
+   * - `mode: "upgrade"`: upgrades an existing agent matching `name` (or legacy `Quick2API Bridge`
+   *   when targeting default `Coding Assistant`) in-place, or creates a new one if none matches;
+   * - When `setAsDefault !== false` (default `true`), binds the resulting `agentId` to `slotId`
+   *   and immediately invalidates warm sessions / parked WebSockets for `slotId` so active
+   *   conversations hot-switch cleanly to the new agent on the very next turn.
    */
   async syncCodingAgentForKey(
     apiKey: string,
     slotId: string,
     keyPool: UpstreamKeyPool,
     proxyUrl?: string,
-  ): Promise<{ agentId: string; action: "upgraded" | "created" | "unchanged"; previousName?: string }> {
-    const targetName = DEFAULT_CODING_AGENT_NAME;
-    const targetDesc = DEFAULT_CODING_AGENT_DESCRIPTION;
-    const targetInstructions = (keyPool.getSettings().customAgentPrompt || DEFAULT_CODING_AGENT_INSTRUCTIONS).trim();
+    opts?: {
+      mode?: "create" | "upgrade";
+      name?: string;
+      description?: string;
+      instructions?: string;
+      setAsDefault?: boolean;
+    },
+  ): Promise<{
+    agentId: string;
+    name: string;
+    action: "upgraded" | "created" | "unchanged";
+    boundAsDefault: boolean;
+    previousName?: string;
+  }> {
+    const mode = opts?.mode === "upgrade" ? "upgrade" : "create";
+    const setAsDefault = opts?.setAsDefault !== false;
+    const targetName = (opts?.name || "").trim() || DEFAULT_CODING_AGENT_NAME;
+    const targetDesc =
+      typeof opts?.description === "string" && opts.description.trim()
+        ? opts.description.trim()
+        : DEFAULT_CODING_AGENT_DESCRIPTION;
+    const targetInstructions =
+      (opts?.instructions || "").trim() ||
+      (keyPool.getSettings().customAgentPrompt || DEFAULT_CODING_AGENT_INSTRUCTIONS).trim();
 
-    const agents = await this.listChatAgentsForKey(apiKey, proxyUrl);
-    const customAgents = agents.filter((a) => !a.isSystem);
-    const knownNames = new Set(LEGACY_CODING_AGENT_NAMES.map((n) => n.toLowerCase()));
-    const currentBoundId = (
-      keyPool.allManagedKeys().find((k) => k.slotId === slotId)?.chatAgentId || ""
-    ).trim();
+    if (targetName.length > 120) {
+      throw new GatewayError("Agent `name` must be 120 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (targetDesc.length > 500) {
+      throw new GatewayError("Agent `description` must be 500 characters or fewer.", 400, "invalid_request_error");
+    }
+    if (targetInstructions.length > 16_000) {
+      throw new GatewayError("Agent `instructions` must be 16,000 characters or fewer.", 400, "invalid_request_error");
+    }
 
-    const boundKnown = currentBoundId
-      ? customAgents.find(
-          (a) =>
-            (a.shortId === currentBoundId || a.agentId === currentBoundId) &&
-            knownNames.has(a.name.trim().toLowerCase()),
-        )
-      : undefined;
-    const candidate =
-      boundKnown || customAgents.find((a) => knownNames.has(a.name.trim().toLowerCase()));
+    const currentBoundId = normalizeChatAgentShortId(
+      keyPool.allManagedKeys().find((k) => k.slotId === slotId)?.chatAgentId || "",
+    );
 
-    if (candidate) {
-      const chosenId = candidate.shortId || candidate.agentId;
-      const isUpToDate =
-        candidate.name.trim() === targetName &&
-        candidate.description.trim() === targetDesc &&
-        candidate.systemPrompt.trim() === targetInstructions;
-      if (isUpToDate) {
-        keyPool.updateSlotMeta(slotId, { chatAgentId: chosenId });
-        this.autoEnsureFailedSlots.delete(slotId);
-        return { agentId: chosenId, action: "unchanged" };
+    if (mode === "upgrade") {
+      const agents = await this.listChatAgentsForKey(apiKey, proxyUrl);
+      const customAgents = agents.filter((a) => !a.isSystem);
+      const targetNameLow = targetName.toLowerCase();
+      const matchNames = new Set<string>([targetNameLow]);
+      if (targetNameLow === DEFAULT_CODING_AGENT_NAME.toLowerCase()) {
+        for (const n of LEGACY_CODING_AGENT_NAMES) matchNames.add(n.toLowerCase());
       }
-      await this.updateAndPublishAgentForKey(
-        apiKey,
-        chosenId,
-        {
+
+      const boundMatch = currentBoundId
+        ? customAgents.find(
+            (a) =>
+              (normalizeChatAgentShortId(a.shortId || a.agentId) === currentBoundId ||
+                a.agentId === currentBoundId) &&
+              matchNames.has(a.name.trim().toLowerCase()),
+          )
+        : undefined;
+      const candidate =
+        boundMatch || customAgents.find((a) => matchNames.has(a.name.trim().toLowerCase()));
+
+      if (candidate) {
+        const chosenId = normalizeChatAgentShortId(candidate.shortId || candidate.agentId);
+        const isUpToDate =
+          candidate.name.trim() === targetName &&
+          candidate.description.trim() === targetDesc &&
+          candidate.systemPrompt.trim() === targetInstructions;
+        if (!isUpToDate) {
+          await this.updateAndPublishAgentForKey(
+            apiKey,
+            chosenId,
+            {
+              name: targetName,
+              description: targetDesc,
+              instructions: targetInstructions,
+            },
+            proxyUrl,
+          );
+        }
+        if (setAsDefault) {
+          keyPool.updateSlotMeta(slotId, { chatAgentId: chosenId });
+          this.autoEnsureFailedSlots.delete(slotId);
+        }
+        // Invalidate warm sessions whenever cloud instructions/name changed OR the active binding changed
+        if (!isUpToDate || (setAsDefault && chosenId !== currentBoundId)) {
+          this.warmPool.invalidateSlot(slotId);
+        }
+        return {
+          agentId: chosenId,
           name: targetName,
-          description: targetDesc,
-          instructions: targetInstructions,
-        },
-        proxyUrl,
-      );
-      keyPool.updateSlotMeta(slotId, { chatAgentId: chosenId });
-      this.autoEnsureFailedSlots.delete(slotId);
-      return {
-        agentId: chosenId,
-        action: "upgraded",
-        ...(candidate.name.trim() !== targetName ? { previousName: candidate.name.trim() } : {}),
-      };
+          action: isUpToDate ? "unchanged" : "upgraded",
+          boundAsDefault: setAsDefault,
+          ...(candidate.name.trim() !== targetName ? { previousName: candidate.name.trim() } : {}),
+        };
+      }
     }
 
     const created = await this.createAndPublishCodingAgentForKey(
@@ -328,9 +400,18 @@ export class QuickExecutionEngine {
       },
       proxyUrl,
     );
-    keyPool.updateSlotMeta(slotId, { chatAgentId: created.agentId });
-    this.autoEnsureFailedSlots.delete(slotId);
-    return { agentId: created.agentId, action: "created" };
+    const createdId = normalizeChatAgentShortId(created.agentId);
+    if (setAsDefault) {
+      keyPool.updateSlotMeta(slotId, { chatAgentId: createdId });
+      this.warmPool.invalidateSlot(slotId);
+      this.autoEnsureFailedSlots.delete(slotId);
+    }
+    return {
+      agentId: createdId,
+      name: targetName,
+      action: "created",
+      boundAsDefault: setAsDefault,
+    };
   }
 
   async *executeTurnWithPool(
@@ -409,13 +490,17 @@ export class QuickExecutionEngine {
         },
       );
       remainingWaitBudgetMs = Math.max(0, remainingWaitBudgetMs - (Date.now() - waitStartedAt));
+      // Capture warm-session generation BEFORE reading chatAgentId / awaiting async ops so any
+      // concurrent hot-switch during ensure/resolveModel/rephrase prevents stale WS parking.
+      let expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
       const poolSettings = keyPool.getSettings();
       const isIncognito = poolSettings.incognitoMode;
       const shouldAutoEnsure =
         poolSettings.autoEnsureCodingAgent !== undefined
           ? poolSettings.autoEnsureCodingAgent
           : this.autoEnsureCodingAgent;
-      let effectiveChatAgentId = (lease.chatAgentId || poolSettings.chatAgentId || "").trim() || undefined;
+      let effectiveChatAgentId =
+        normalizeChatAgentShortId(lease.chatAgentId || poolSettings.chatAgentId || "") || undefined;
       let yieldedOutput = false;
       let hasEmittedClientText = false;
       let hasEmittedThinking = false;
@@ -472,6 +557,10 @@ export class QuickExecutionEngine {
             } else {
               effectiveChatAgentId = await ensurePromise;
             }
+            if (effectiveChatAgentId) {
+              effectiveChatAgentId = normalizeChatAgentShortId(effectiveChatAgentId) || undefined;
+              expectedWarmGeneration = this.warmPool.getSlotGeneration(lease.slotId);
+            }
           }
         }
         if (turn.signal?.aborted) {
@@ -479,6 +568,7 @@ export class QuickExecutionEngine {
         }
         const initialLeaseOpts = {
           attachmentCache,
+          expectedWarmGeneration,
           ...(allowContentFilterRephrase
             ? {
               onContentFilterCapture: (ctx: NonNullable<typeof capturedFilterCtx>) => {
@@ -510,6 +600,15 @@ export class QuickExecutionEngine {
         lease.markSuccess();
         return;
       } catch (err) {
+        // Immediately disarm any armed 15s `flushEarly` timer before rephrase/warm-fallback/failover
+        // so slow retries or next-account OOB errors never prematurely commit HTTP 200 keepalive.
+        wrappedMeta({
+          slotId: lease.slotId,
+          maskedKey: lease.maskedKey,
+          accountLabel: lease.label,
+          execMode: lastExecMode || (isIncognito ? "incognito" : "cloud"),
+          flushEarlyReady: false,
+        });
         let gwErr = mapSdkError(err);
 
         // Opt-in defensive auto-rephrase on upstream `content_filtered` (strictly keeps the requested model).
@@ -544,9 +643,13 @@ export class QuickExecutionEngine {
                   originalMessageId: filterCtx.messageId,
                   rootSessionId: filterCtx.rootSessionId,
                   threadId: filterCtx.threadId,
+                  handoffErrListener: undefined as (() => void) | undefined,
                 }
                 : undefined;
             if (editBranch && capturedFilterCtx) {
+              const keepSafeErr = () => { };
+              editBranch.ws.on("error", keepSafeErr);
+              editBranch.handoffErrListener = keepSafeErr;
               if (capturedFilterCtx.onIdleErr) {
                 editBranch.ws.off("error", capturedFilterCtx.onIdleErr);
                 capturedFilterCtx.onIdleErr = undefined;
@@ -556,7 +659,12 @@ export class QuickExecutionEngine {
               closeCapturedFilterWs();
             }
             try {
-              if (turn.stream && hasEmittedThinking) {
+              if (!turn.stream && (hasEmittedClientText || hasEmittedThinking)) {
+                yield { type: "reset" };
+                yieldedOutput = false;
+                hasEmittedClientText = false;
+                hasEmittedThinking = false;
+              } else if (turn.stream && hasEmittedThinking) {
                 yield {
                   type: "thinking",
                   text: "\n[Content filter triggered before answer; retrying with defensive phrasing...]\n",
@@ -575,6 +683,7 @@ export class QuickExecutionEngine {
                 keyPool,
                 {
                   attachmentCache,
+                  expectedWarmGeneration,
                   overridePromptText: rephrasedFinalPrompt,
                   ...(editBranch ? { editBranch } : { forceColdReplay: true }),
                   isRephraseRetry: true,
@@ -625,7 +734,7 @@ export class QuickExecutionEngine {
               wrappedMeta,
               effectiveChatAgentId,
               keyPool,
-              { attachmentCache, warmFallbackToCold: true },
+              { attachmentCache, expectedWarmGeneration, warmFallbackToCold: true },
             )) {
               if (ev.type === "text" || ev.type === "thinking" || ev.type === "tool_calls") {
                 yieldedOutput = true;
@@ -752,6 +861,7 @@ export class QuickExecutionEngine {
     keyPool?: UpstreamKeyPool,
     turnOpts?: {
       attachmentCache?: RequestAttachmentCache;
+      expectedWarmGeneration?: number;
       overridePromptText?: string;
       forceColdReplay?: boolean;
       isRephraseRetry?: boolean;
@@ -762,20 +872,25 @@ export class QuickExecutionEngine {
         originalMessageId: string;
         rootSessionId: string;
         threadId: string;
+        handoffErrListener?: () => void;
       };
       onContentFilterCapture?: (ctx: ContentFilterCaptureContext) => void;
     },
   ): AsyncGenerator<GatewayStreamEvent, void, unknown> {
+    const normalizedChatAgentId = chatAgentId ? normalizeChatAgentShortId(chatAgentId) || undefined : undefined;
+    const warmGeneration =
+      turnOpts?.expectedWarmGeneration ?? this.warmPool.getSlotGeneration(lease.slotId);
     const { selection } = await this.resolveModel(lease.apiKey, turn.requestedModel, turn.rawBody);
 
-    const hasCustomAgent = Boolean(chatAgentId);
+    const hasCustomAgent = Boolean(normalizedChatAgentId);
     const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice, {
       compactForCustomAgent: hasCustomAgent,
       preferClientToolsOverWorkspace: true,
     });
     const deepSanitizeEnabled =
-      Boolean(keyPool?.getSettings().sanitizeClientSystemPrompt) ||
-      Boolean(this.config.sanitizeClientSystemPrompt) ||
+      (keyPool
+        ? Boolean(keyPool.getSettings().sanitizeClientSystemPrompt)
+        : Boolean(this.config.sanitizeClientSystemPrompt)) ||
       Boolean(turnOpts?.isRephraseRetry);
     const customPromptParts: string[] = [];
     if (turn.systemPrompt?.trim()) {
@@ -790,18 +905,25 @@ export class QuickExecutionEngine {
     if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
     const customPrompt = customPromptParts.length > 0 ? customPromptParts.join("\n\n") : null;
 
-    const editBranch = turnOpts?.editBranch;
+    let activeEditBranch = turnOpts?.editBranch;
     const warmHit =
-      !editBranch &&
+      !activeEditBranch &&
         !turnOpts?.forceColdReplay &&
         turn.priorPrefixHash &&
         turn.incrementalUserText !== undefined
-        ? this.warmPool.lookup(turn.scope, turn.conversationKey, lease.slotId, isIncognito, turn.priorPrefixHash, chatAgentId)
+        ? this.warmPool.lookup(
+          turn.scope,
+          turn.conversationKey,
+          lease.slotId,
+          isIncognito,
+          turn.priorPrefixHash,
+          normalizedChatAgentId,
+        )
         : undefined;
-    let warmThreadId = editBranch ? editBranch.threadId : warmHit?.threadId;
-    const rootThreadId = editBranch ? editBranch.rootSessionId : warmHit?.rootThreadId;
-    let reusedWs = editBranch ? editBranch.ws : warmHit?.reusedWs;
-    let isWarmIncremental = Boolean(editBranch || warmThreadId);
+    let warmThreadId = activeEditBranch ? activeEditBranch.threadId : warmHit?.threadId;
+    const rootThreadId = activeEditBranch ? activeEditBranch.rootSessionId : warmHit?.rootThreadId;
+    let reusedWs = activeEditBranch ? activeEditBranch.ws : warmHit?.reusedWs;
+    let isWarmIncremental = Boolean(activeEditBranch || warmThreadId);
 
     let tempReusedDead = false;
     const onTempReusedDead = () => {
@@ -810,7 +932,22 @@ export class QuickExecutionEngine {
     if (reusedWs) {
       reusedWs.on("error", onTempReusedDead);
       reusedWs.on("close", onTempReusedDead);
+      if (activeEditBranch?.handoffErrListener) {
+        reusedWs.off("error", activeEditBranch.handoffErrListener);
+        activeEditBranch.handoffErrListener = undefined;
+      }
     }
+    const safeCloseReusedWs = () => {
+      if (!reusedWs) return;
+      const dead = reusedWs;
+      reusedWs = undefined;
+      dead.off("error", onTempReusedDead);
+      dead.off("close", onTempReusedDead);
+      dead.on("error", () => { });
+      try {
+        dead.close();
+      } catch { }
+    };
 
     const cred = parseQuickCredential(lease.apiKey);
     const isWeb = cred.mode === "web" && Boolean(cred.web);
@@ -826,12 +963,8 @@ export class QuickExecutionEngine {
     }
 
     if (reusedWs && (tempReusedDead || reusedWs.readyState !== WebSocket.OPEN)) {
-      reusedWs.off("error", onTempReusedDead);
-      reusedWs.off("close", onTempReusedDead);
-      try {
-        reusedWs.close();
-      } catch { }
-      reusedWs = undefined;
+      safeCloseReusedWs();
+      activeEditBranch = undefined;
       if (isIncognito) {
         warmThreadId = undefined;
         isWarmIncremental = false;
@@ -840,6 +973,192 @@ export class QuickExecutionEngine {
     let threadId = warmThreadId || crypto.randomUUID();
     let effectiveRootThreadId = rootThreadId || threadId;
     const reqAttCache = turnOpts?.attachmentCache;
+
+    const ensureHeadroomBeforeDial = async () => {
+      if (turn.signal?.aborted) {
+        throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
+      }
+      const activeForSlot = Math.max(
+        this.warmPool.getActiveWsCount(lease.slotId),
+        keyPool ? keyPool.activeInflightForSlot(lease.slotId) : 0,
+      );
+      const parkedForSlot = this.warmPool.countParkedWsForSlot(lease.slotId);
+      const overflow = activeForSlot + parkedForSlot - 4;
+      if (overflow > 0) {
+        this.warmPool.evictParkedWsForSlot(lease.slotId, overflow);
+      }
+      const settleMs = this.warmPool.getEvictSettlingRemainingMs(lease.slotId);
+      if (settleMs > 0 && !turn.signal?.aborted) {
+        await new Promise<void>((resolve) => {
+          const onAbort = () => {
+            clearTimeout(t);
+            resolve();
+          };
+          const t = setTimeout(() => {
+            turn.signal?.removeEventListener("abort", onAbort);
+            resolve();
+          }, settleMs);
+          t.unref?.();
+          turn.signal?.addEventListener("abort", onAbort, { once: true });
+          if (turn.signal?.aborted) onAbort();
+        });
+      }
+      if (turn.signal?.aborted) {
+        throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
+      }
+    };
+
+    // Speculative parallel WS dial + `session_connect` handshake during OOB attachment/text uploads.
+    // Overlaps the ~900-1000ms WS connect+handshake RTT behind OOB upload without risking leaks on abort/error.
+    interface SpeculativeDialState {
+      dialed: DialedQuickWs;
+      handshakeEstablished: boolean;
+      sessionConnectSent: boolean;
+      dead: boolean;
+      bufferedFrames: Buffer[];
+      detach: () => void;
+    }
+    let specCancelled = false;
+    let specPromise: Promise<SpeculativeDialState | null> | null = null;
+    const cancelSpeculativeDial = () => {
+      specCancelled = true;
+      if (specPromise) {
+        void specPromise.then((st) => {
+          if (!st) return;
+          st.detach();
+          st.dialed.ws.on("error", () => { });
+          try {
+            st.dialed.ws.close();
+          } catch { }
+        });
+        specPromise = null;
+      }
+    };
+
+    const rawSourceFiles = isWarmIncremental ? (turn.incrementalFiles ?? []) : (turn.files ?? []);
+    const rawSourceImages = isWarmIncremental ? (turn.incrementalImages ?? []) : turn.images;
+    const rawPromptEst =
+      turnOpts?.overridePromptText !== undefined
+        ? turnOpts.overridePromptText
+        : isWarmIncremental
+          ? turn.incrementalUserText
+          : turn.fullTranscriptText;
+    const willLikelyUseOob =
+      !reusedWs &&
+      !turn.signal?.aborted &&
+      ((isOAuthAccount && Boolean(cred.oauth)) || (isWeb && Boolean(cred.web))) &&
+      (rawSourceFiles.length > 0 ||
+        rawSourceImages.length > 0 ||
+        jsonStringUtf8Bytes(rawPromptEst || "") + jsonStringUtf8Bytes(customPrompt || "") > 44_000);
+
+    if (willLikelyUseOob) {
+      const oauthClientIdForSpec = cred.mode === "oauth" ? cred.oauth?.clientId : undefined;
+      specPromise = (async (): Promise<SpeculativeDialState | null> => {
+        try {
+          const dialed = await dialQuickWebSocket({
+            apiKey: lease.apiKey,
+            workingSessionId,
+            proxyUrl: lease.proxyUrl,
+            webSocketFactory: this.webSocketFactory,
+            beforeDial: ensureHeadroomBeforeDial,
+          });
+          if (specCancelled || turn.signal?.aborted) {
+            dialed.ws.on("error", () => { });
+            try {
+              dialed.ws.close();
+            } catch { }
+            return null;
+          }
+          const state: SpeculativeDialState = {
+            dialed,
+            handshakeEstablished: false,
+            sessionConnectSent: false,
+            dead: false,
+            bufferedFrames: [],
+            detach: () => { },
+          };
+          let specRecvBuf = Buffer.alloc(0);
+          const onSpecDead = () => {
+            state.dead = true;
+          };
+          const onSpecOpen = () => {
+            if (specCancelled || state.dead || dialed.ws.readyState !== WebSocket.OPEN) return;
+            try {
+              dialed.ws.send(
+                dialed.encodeFrame({
+                  type: "session_connect",
+                  payload: {
+                    ...(dialed.actorArn ? { actor_id: dialed.actorArn } : {}),
+                    surfaceType: dialed.surfaceType,
+                    outpostId: dialed.outpostId,
+                    appVersion: dialed.appVersion,
+                    ...DESKTOP_CAPABILITIES,
+                    ...(isIncognito ? { incognito: true } : {}),
+                  },
+                }),
+              );
+              if (!dialed.isWeb) {
+                dialed.ws.send(dialed.encodeFrame({ type: "federate_status", payload: {} }));
+              }
+              state.sessionConnectSent = true;
+            } catch {
+              state.dead = true;
+            }
+          };
+          const onSpecMessage = (data: Buffer) => {
+            const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
+            if (!state.handshakeEstablished) {
+              try {
+                specRecvBuf = Buffer.concat([specRecvBuf, chunk]);
+                const drained = drainEventStream(specRecvBuf, 0);
+                if (drained.consumed > 0) specRecvBuf = specRecvBuf.subarray(drained.consumed);
+                for (const esMsg of drained.messages) {
+                  const dec = dialed.decodeFrame(esMsg);
+                  if (dec?.type === "event" && dec.data && typeof dec.data === "object") {
+                    const evObj = dec.data as { type?: unknown; payload?: Record<string, unknown> };
+                    const evT = String(evObj.type || "");
+                    if (evT === "session_established" || evT === "connected") {
+                      state.handshakeEstablished = true;
+                      if (evT === "connected" && oauthClientIdForSpec) {
+                        const u = evObj.payload?.user as Record<string, unknown> | undefined;
+                        if (u && typeof u === "object") {
+                          cacheOAuthUserIdentity(oauthClientIdForSpec, {
+                            ...(typeof u.email === "string" ? { email: u.email } : {}),
+                            ...(typeof u.name === "string" ? { name: u.name } : {}),
+                            ...(typeof u.aws_account_id === "string" ? { accountId: u.aws_account_id } : {}),
+                          });
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch {
+                // Non-fatal: let runTurnStream handle or fail cleanly
+              }
+            } else {
+              state.bufferedFrames.push(chunk);
+            }
+          };
+          state.detach = () => {
+            dialed.ws.off("open", onSpecOpen);
+            dialed.ws.off("message", onSpecMessage);
+            dialed.ws.off("error", onSpecDead);
+            dialed.ws.off("close", onSpecDead);
+          };
+          dialed.ws.on("error", onSpecDead);
+          dialed.ws.on("close", onSpecDead);
+          dialed.ws.on("message", onSpecMessage);
+          if (dialed.ws.readyState === WebSocket.OPEN) {
+            onSpecOpen();
+          } else {
+            dialed.ws.once("open", onSpecOpen);
+          }
+          return state;
+        } catch {
+          return null;
+        }
+      })();
+    }
 
     let prompt: string;
     let attachments: QuickAttachment[];
@@ -862,12 +1181,8 @@ export class QuickExecutionEngine {
       attachments = built.attachments;
 
       if (reusedWs && (tempReusedDead || reusedWs.readyState !== WebSocket.OPEN)) {
-        reusedWs.off("error", onTempReusedDead);
-        reusedWs.off("close", onTempReusedDead);
-        try {
-          reusedWs.close();
-        } catch { }
-        reusedWs = undefined;
+        safeCloseReusedWs();
+        activeEditBranch = undefined;
         if (isIncognito) {
           warmThreadId = undefined;
           isWarmIncremental = false;
@@ -892,28 +1207,18 @@ export class QuickExecutionEngine {
         }
       }
     } catch (prepErr) {
-      if (reusedWs) {
-        reusedWs.off("error", onTempReusedDead);
-        reusedWs.off("close", onTempReusedDead);
-        try {
-          reusedWs.close();
-        } catch { }
-      }
+      safeCloseReusedWs();
+      cancelSpeculativeDial();
       throw prepErr;
     }
 
-    if (reusedWs) {
-      reusedWs.off("error", onTempReusedDead);
-      reusedWs.off("close", onTempReusedDead);
-    }
-
-    const execMode: ExecutionModeTag = isWarmIncremental
+    let execMode: ExecutionModeTag = isWarmIncremental
       ? "warm_incremental"
       : isIncognito
         ? "incognito"
         : "cloud";
 
-    const baseExecMeta = {
+    const buildBaseExecMeta = () => ({
       slotId: lease.slotId,
       maskedKey: lease.maskedKey,
       accountLabel: lease.label,
@@ -921,21 +1226,17 @@ export class QuickExecutionEngine {
       usedProxy: Boolean(lease.proxyUrl || process.env.HTTPS_PROXY || process.env.HTTP_PROXY),
       ...(turnOpts?.isRephraseRetry ? { contentFilterRecovered: true } : {}),
       ...(turnOpts?.warmFallbackToCold ? { warmFallbackToCold: true } : {}),
-      ...(!chatAgentId && !isInternalHelperCall ? { usedDefaultSystemAgent: true } : {}),
-    };
+      ...(!normalizedChatAgentId && !isInternalHelperCall ? { usedDefaultSystemAgent: true } : {}),
+    });
 
     // Bind execution metadata for tracing/ledger immediately, while explicitly keeping `flushEarly`
     // disarmed (`flushEarlyReady: false`) until OOB `.txt` upload + WS dial complete (and cancelling
     // any previous attempt's 15s timer on failover so 400/429/502 errors stay real HTTP statuses).
-    onExecMeta?.({ ...baseExecMeta, flushEarlyReady: false });
+    onExecMeta?.({ ...buildBaseExecMeta(), flushEarlyReady: false });
 
     if (turn.signal?.aborted) {
-      if (reusedWs) {
-        reusedWs.on("error", () => { });
-        try {
-          reusedWs.close();
-        } catch { }
-      }
+      safeCloseReusedWs();
+      cancelSpeculativeDial();
       throw new GatewayError("Request aborted by client.", 499, "client_aborted");
     }
 
@@ -955,6 +1256,8 @@ export class QuickExecutionEngine {
         attachments,
         isOAuthAccount,
         oauthCred: cred.oauth,
+        isWeb,
+        webCred: cred.web,
         effectiveProxy,
         reqAttCache,
       });
@@ -963,13 +1266,59 @@ export class QuickExecutionEngine {
       attachments = prepared.attachments;
       rawPromptForRephrase = prepared.rawPromptForRephrase;
       rephrasePreservePrefix = prepared.rephrasePreservePrefix;
-    } catch (chunkErr) {
-      if (reusedWs) {
-        reusedWs.on("error", () => { });
-        try {
-          reusedWs.close();
-        } catch { }
+
+      // If reusedWs died during a long OOB `.txt` upload under INCOGNITO=true, never dial a fresh WS
+      // with the old pod-local incognito threadId — cleanly rebuild as cold replay on a fresh threadId.
+      if (reusedWs && (tempReusedDead || reusedWs.readyState !== WebSocket.OPEN)) {
+        safeCloseReusedWs();
+        activeEditBranch = undefined;
+        if (isIncognito && isWarmIncremental) {
+          warmThreadId = undefined;
+          isWarmIncremental = false;
+          threadId = crypto.randomUUID();
+          effectiveRootThreadId = threadId;
+          execMode = "incognito";
+          onExecMeta?.({ ...buildBaseExecMeta(), flushEarlyReady: false });
+          const coldBuilt = await buildPromptAndAttachmentsForTurn({
+            turn,
+            slotId: lease.slotId,
+            customPrompt,
+            incremental: false,
+            threadId,
+            overridePromptText: turnOpts?.overridePromptText,
+            isOAuthAccount,
+            oauthCred: cred.oauth,
+            isWeb,
+            webCred: cred.web,
+            effectiveProxy,
+            reqAttCache,
+          });
+          const coldPrepared = await finalizePromptChunksAndOutOfBandText({
+            turn,
+            slotId: lease.slotId,
+            threadId,
+            isWarmIncremental: false,
+            overridePromptText: turnOpts?.overridePromptText,
+            prompt: coldBuilt.promptText,
+            customPrompt,
+            attachments: coldBuilt.attachments,
+            isOAuthAccount,
+            oauthCred: cred.oauth,
+            isWeb,
+            webCred: cred.web,
+            effectiveProxy,
+            reqAttCache,
+          });
+          chunks = coldPrepared.chunks;
+          effectiveCustomPrompt = coldPrepared.effectiveCustomPrompt;
+          attachments = coldPrepared.attachments;
+          rawPromptForRephrase = coldPrepared.rawPromptForRephrase;
+          rephrasePreservePrefix = coldPrepared.rephrasePreservePrefix;
+        }
       }
+    } catch (chunkErr) {
+      safeCloseReusedWs();
+      cancelSpeculativeDial();
       throw chunkErr;
     }
 
@@ -1017,68 +1366,83 @@ export class QuickExecutionEngine {
     let surfaceName: "web" | "desktop" = isWeb ? "web" : "desktop";
     let ws: WebSocket;
     let actorArn: string | undefined;
-    let outpostId = editBranch?.outpostId || warmHit?.reusedOutpostId || "web0";
+    let outpostId = activeEditBranch?.outpostId || warmHit?.reusedOutpostId || "web0";
+    let isReusedOpenWs = false;
+    let preSessionConnectSent = false;
+    let preBufferedFrames: Buffer[] | undefined;
 
-    if (reusedWs && reusedWs.readyState === WebSocket.OPEN) {
+    if (reusedWs && !tempReusedDead && reusedWs.readyState === WebSocket.OPEN) {
+      reusedWs.off("error", onTempReusedDead);
+      reusedWs.off("close", onTempReusedDead);
       ws = reusedWs;
+      isReusedOpenWs = true;
+      cancelSpeculativeDial();
     } else {
-      const ensureHeadroomBeforeDial = async () => {
-        if (turn.signal?.aborted) {
-          throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
+      safeCloseReusedWs();
+      let adoptedSpec: SpeculativeDialState | null = null;
+      if (specPromise) {
+        const candidate = await specPromise;
+        specPromise = null;
+        if (candidate) {
+          candidate.detach();
+          if (
+            !candidate.dead &&
+            (candidate.dialed.ws.readyState === WebSocket.OPEN ||
+              candidate.dialed.ws.readyState === WebSocket.CONNECTING)
+          ) {
+            adoptedSpec = candidate;
+          } else {
+            candidate.dialed.ws.on("error", () => { });
+            try {
+              candidate.dialed.ws.close();
+            } catch { }
+          }
         }
-        const activeForSlot = Math.max(
-          this.warmPool.getActiveWsCount(lease.slotId),
-          keyPool ? keyPool.activeInflightForSlot(lease.slotId) : 0,
-        );
-        const parkedForSlot = this.warmPool.countParkedWsForSlot(lease.slotId);
-        const overflow = activeForSlot + parkedForSlot - 4;
-        if (overflow > 0) {
-          this.warmPool.evictParkedWsForSlot(lease.slotId, overflow);
-        }
-        const settleMs = this.warmPool.getEvictSettlingRemainingMs(lease.slotId);
-        if (settleMs > 0 && !turn.signal?.aborted) {
-          await new Promise<void>((resolve) => {
-            const onAbort = () => {
-              clearTimeout(t);
-              resolve();
-            };
-            const t = setTimeout(() => {
-              turn.signal?.removeEventListener("abort", onAbort);
-              resolve();
-            }, settleMs);
-            t.unref?.();
-            turn.signal?.addEventListener("abort", onAbort, { once: true });
-            if (turn.signal?.aborted) onAbort();
-          });
-        }
-        if (turn.signal?.aborted) {
-          throw new GatewayError("Request aborted before dialing upstream WebSocket.", 499, "client_aborted");
-        }
-      };
+      }
 
-      const dialed = await dialQuickWebSocket({
-        apiKey: lease.apiKey,
-        workingSessionId,
-        proxyUrl: lease.proxyUrl,
-        webSocketFactory: this.webSocketFactory,
-        beforeDial: ensureHeadroomBeforeDial,
-      });
-      ws = dialed.ws;
-      encodeFrame = dialed.encodeFrame;
-      decodeFrame = dialed.decodeFrame;
-      surfaceType = dialed.surfaceType;
-      appVersion = dialed.appVersion;
-      surfaceName = dialed.surfaceName;
-      outpostId = dialed.outpostId;
-      actorArn = dialed.actorArn;
+      if (adoptedSpec) {
+        const { dialed } = adoptedSpec;
+        ws = dialed.ws;
+        encodeFrame = dialed.encodeFrame;
+        decodeFrame = dialed.decodeFrame;
+        surfaceType = dialed.surfaceType;
+        appVersion = dialed.appVersion;
+        surfaceName = dialed.surfaceName;
+        outpostId = dialed.outpostId;
+        actorArn = dialed.actorArn;
+        isReusedOpenWs = adoptedSpec.handshakeEstablished && ws.readyState === WebSocket.OPEN;
+        preSessionConnectSent =
+          !isReusedOpenWs && adoptedSpec.sessionConnectSent && ws.readyState === WebSocket.OPEN;
+        if (adoptedSpec.bufferedFrames.length > 0) {
+          preBufferedFrames = adoptedSpec.bufferedFrames;
+        }
+      } else {
+        const dialed = await dialQuickWebSocket({
+          apiKey: lease.apiKey,
+          workingSessionId,
+          proxyUrl: lease.proxyUrl,
+          webSocketFactory: this.webSocketFactory,
+          beforeDial: ensureHeadroomBeforeDial,
+        });
+        ws = dialed.ws;
+        encodeFrame = dialed.encodeFrame;
+        decodeFrame = dialed.decodeFrame;
+        surfaceType = dialed.surfaceType;
+        appVersion = dialed.appVersion;
+        surfaceName = dialed.surfaceName;
+        outpostId = dialed.outpostId;
+        actorArn = dialed.actorArn;
+      }
     }
 
     // OOB `.txt` upload and upstream WS dial succeeded — arm (or reset) the 15s `flushEarly` keepalive timer now.
-    onExecMeta?.({ ...baseExecMeta, flushEarlyReady: true });
+    onExecMeta?.({ ...buildBaseExecMeta(), flushEarlyReady: true });
 
     yield* runTurnStream({
       ws,
-      isReusedOpenWs: Boolean(reusedWs && ws === reusedWs && ws.readyState === WebSocket.OPEN),
+      isReusedOpenWs,
+      preSessionConnectSent,
+      preBufferedFrames,
       encodeFrame,
       decodeFrame,
       isWeb,
@@ -1094,7 +1458,8 @@ export class QuickExecutionEngine {
       proxyUrl: lease.proxyUrl,
       execMode,
       selection,
-      chatAgentId,
+      chatAgentId: normalizedChatAgentId,
+      warmGeneration,
       isIncognito,
       isWarmIncremental,
       isInternalHelperCall,
@@ -1108,7 +1473,7 @@ export class QuickExecutionEngine {
       rephrasePreservePrefix,
       toolFilter,
       uiTagSanitizer,
-      editBranch,
+      editBranch: activeEditBranch,
       onContentFilterCapture: turnOpts?.onContentFilterCapture,
       runMaxTimeoutMs: this.config.runMaxTimeoutMs,
       runIdleTimeoutMs: this.config.runIdleTimeoutMs,

@@ -1115,7 +1115,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               <div style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" id="credBatchRecheckBtn">批量检测</button>
                 <button type="button" id="credClearSessionsBtn">清理会话</button>
-                <button type="button" id="credSyncAgentsBtn" title="一键将旧版 Quick2API Bridge 或过期编程 Agent 热升级为最新无指纹 Coding Assistant 模板">同步 Agent</button>
+                <button type="button" id="credSyncAgentsBtn" title="批量为勾选或已启用账号新增/同步 AWS Quick 云端智能体并设为默认">同步云端智能体</button>
                 <button type="button" id="credBatchImportBtn">导入 JSON</button>
                 <input type="file" id="credBatchImportFile" accept=".json,application/json" style="display:none;" />
                 <button type="button" id="credExportBtn">导出 JSON</button>
@@ -1561,6 +1561,56 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     </div>
   </div>
 
+  <!-- Batch Sync Cloud Agent Modal -->
+  <div class="modal-mask" id="syncAgentModal" role="dialog" aria-modal="true" aria-labelledby="syncAgentModalTitle" style="z-index:76;">
+    <div class="modal-card" style="max-width: 540px;">
+      <div class="panel-hdr">
+        <div>
+          <h2 id="syncAgentModalTitle">同步云端智能体</h2>
+          <p id="syncAgentTargetInfo" style="margin:2px 0 0;font-size:12px;color:var(--fg-muted);"></p>
+        </div>
+        <button class="btn-xs btn-ghost" id="syncAgentCloseBtn" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="modal-body" style="gap:12px;">
+        <div>
+          <label class="field-lbl" for="syncAgentNameInput">智能体名称</label>
+          <input id="syncAgentNameInput" type="text" maxlength="120" style="width:100%;" placeholder="例如：Coding Assistant" />
+        </div>
+        <div>
+          <label class="field-lbl" for="syncAgentDescInput">智能体描述</label>
+          <input id="syncAgentDescInput" type="text" maxlength="500" style="width:100%;" placeholder="例如：General software engineering and coding assistant." />
+        </div>
+        <div>
+          <label class="field-lbl" for="syncAgentModeSelect">同步方式</label>
+          <select id="syncAgentModeSelect" style="width:100%;">
+            <option value="create">新增云端智能体（推荐 · 不覆盖已有个人智能体）</option>
+            <option value="upgrade">优先原地升级同名 / 旧版 Bridge（无则新增）</option>
+          </select>
+        </div>
+        <label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:12.5px;line-height:1.45;padding:9px 11px;background:var(--subtle);border:1px solid var(--border);border-radius:6px;">
+          <input id="syncAgentSetDefaultCb" type="checkbox" checked style="margin-top:2px;flex-shrink:0;" />
+          <span>
+            <strong style="display:block;font-weight:600;color:var(--fg);">创建 / 更新后自动设为账号默认智能体</strong>
+            <span style="font-size:11.5px;color:var(--fg-muted);">立即更新账号绑定的 Agent ID 并刷新该账号热会话连接，下一轮对话直接生效</span>
+          </span>
+        </label>
+        <details id="syncAgentPromptDetails" class="ag-adv">
+          <summary>高级：查看 / 微调智能体系统指令（默认套用全局推荐模板）</summary>
+          <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px;">
+            <div style="display:flex;justify-content:flex-end;">
+              <button type="button" class="btn-xs" id="syncAgentPromptResetBtn">恢复内置推荐模板</button>
+            </div>
+            <textarea id="syncAgentPromptInput" rows="4" class="mono" style="width:100%;resize:vertical;line-height:1.45;font-size:12px;"></textarea>
+          </div>
+        </details>
+      </div>
+      <div class="modal-foot">
+        <button type="button" id="syncAgentCancelBtn">取消</button>
+        <button type="button" class="btn-solid" id="syncAgentConfirmBtn">开始同步并发布</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Prompt Template Editor Modal -->
   <div class="modal-mask" id="promptEditorModal" role="dialog" aria-modal="true" aria-labelledby="promptEditorTitle" style="z-index:75;">
     <div class="modal-card" style="max-width: 580px;">
@@ -1740,7 +1790,18 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto Defensive Rephrase on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
       "深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)": "Deep-Sanitize Heavy Client Framework System Prompts (SANITIZE_CLIENT_SYSTEM_PROMPT)",
       "默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 <user_rules>/<system-reminder> 转为中性标题（完整保留业务规则正文）。": "Off by default (user-supplied system prompts pass through untouched). Recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive smart blocks or refuse local tool calls: softens conflicting AI identities, strips IDE anti-bypass boilerplate, and unwraps <user_rules>/<system-reminder> tags while preserving all workspace rule content.",
-      "同步 Agent": "Sync Agents",
+      "同步 Agent": "Sync Cloud Agents",
+      "同步云端智能体": "Sync Cloud Agents",
+      "智能体名称": "Agent Name",
+      "智能体描述": "Agent Description",
+      "同步方式": "Sync Mode",
+      "新增云端智能体（推荐 · 不覆盖已有个人智能体）": "Create New Cloud Agent (Recommended · never overwrites existing agents)",
+      "优先原地升级同名 / 旧版 Bridge（无则新增）": "Upgrade Matching Name / Legacy Bridge In-Place (create if missing)",
+      "创建 / 更新后自动设为账号默认智能体": "Set as account default agent automatically",
+      "立即更新账号绑定的 Agent ID 并刷新该账号热会话连接，下一轮对话直接生效": "Immediately binds the new Agent ID and refreshes warm sessions for the next turn",
+      "高级：查看 / 微调智能体系统指令（默认套用全局推荐模板）": "Advanced: View / customize agent instructions (uses global template by default)",
+      "恢复内置推荐模板": "Reset Built-in Template",
+      "开始同步并发布": "Sync & Publish",
       "默认关闭。开启后，仅当上游返回 content_filtered 且尚未向客户端输出正文时，由辅助模型将最后一条用户提问自动重述为防御性工程措辞，并死守用户请求的原模型重试 1 次（热会话优先使用原生 edit_message 分支保留前文缓存，绝不降级偷换主回答模型）。": "Off by default. When enabled, ONLY if upstream returns content_filtered before any answer text is emitted, a lightweight helper model rephrases the latest user prompt into defensive engineering phrasing and retries once on the exact same user-requested model (using native edit_message on warm threads; never downgrading the answering model).",
       "防御性重述提示词模板与辅助模型 (CONTENT_FILTER_REPHRASE_PROMPT)": "Defensive Rephrase Prompt Template & Helper Model (CONTENT_FILTER_REPHRASE_PROMPT)",
       "仅用于重述被误拦的提问本身，绝不替代最终回答模型；留空或点击「恢复默认」将使用内置模板。": "Used strictly to rephrase the blocked prompt, never to replace the answering model. Leave empty or click Reset to use the built-in template.",
@@ -3010,10 +3071,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       }
       if ($("credSyncAgentsBtn") && !$("credSyncAgentsBtn").disabled) {
         $("credSyncAgentsBtn").textContent = selectedCredIds.size > 0
-          ? tr("同步所选 Agent (" + selectedCredIds.size + ")", "Sync Agents (" + selectedCredIds.size + ")")
+          ? tr("同步云端智能体 (" + selectedCredIds.size + ")", "Sync Cloud Agents (" + selectedCredIds.size + ")")
           : (filterActive
-            ? tr("同步筛选 Agent (" + filtered.length + ")", "Sync Filtered (" + filtered.length + ")")
-            : tr("同步 Agent", "Sync Agents"));
+            ? tr("同步筛选智能体 (" + filtered.length + ")", "Sync Filtered Agents (" + filtered.length + ")")
+            : tr("同步云端智能体", "Sync Cloud Agents"));
       }
       if ($("credSelectAllCb")) {
         $("credSelectAllCb").checked = filtered.length > 0 && filtered.every((s) => selectedCredIds.has(s.slotId));
@@ -4248,23 +4309,32 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         }
       };
 
+      const normAgentShortId = (v) => {
+        const s = String(v || "").trim();
+        const i = s.lastIndexOf("/");
+        return i >= 0 && i < s.length - 1 ? s.slice(i + 1) : s;
+      };
+
       const renderAgents = (agents, boundId) => {
         if (!Array.isArray(agents) || agents.length === 0) {
           listBox.innerHTML = '<div style="color:var(--fg-muted);padding:16px;text-align:center;">' + esc(tr("未查询到自定义 Agent，可点击右下角按钮一键自动创建。", "No agents found. Click Auto-Find / Create below.")) + '</div>';
           return;
         }
+        const effectiveBoundShort = normAgentShortId(boundId || window.__globalChatAgentId || "");
+        const usingGlobalFallback = !normAgentShortId(boundId) && Boolean(effectiveBoundShort);
         listBox.innerHTML = "";
         agents.forEach((a) => {
           const isSystem = Boolean(a.isSystem);
+          const aShort = normAgentShortId(a.shortId || a.agentId);
           const isBound = isSystem
-            ? !boundId
-            : Boolean(boundId && (a.shortId === boundId || a.agentId === boundId));
+            ? !effectiveBoundShort
+            : Boolean(effectiveBoundShort && aShort === effectiveBoundShort);
           const btn = document.createElement("div");
           btn.setAttribute("role", "button");
           btn.tabIndex = isBound ? -1 : 0;
           btn.className = "ag-item" + (isBound ? " active" : "");
           const badgeHtml = isBound
-            ? '<span class="ag-pill ok">● ' + esc(tr("当前使用", "Active")) + '</span>'
+            ? '<span class="ag-pill ok">● ' + esc(usingGlobalFallback ? tr("全局生效", "Global Active") : tr("当前使用", "Active")) + '</span>'
             : '<span class="ag-pill">' + esc(isSystem ? tr("切换默认", "Use Default") : tr("点击选用", "Select")) + '</span>';
           const isLegacyBridgeName = !isSystem && /^quick2api\b/i.test(String(a.name || "").trim());
           const tagHtml = isSystem
@@ -4304,20 +4374,31 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
       const openPromptEditor = (agent) => {
         const curPrompt = agent.systemPrompt || "";
+        const curName = agent.name || "";
+        const curDesc = agent.description || "";
         listBox.innerHTML = "";
         const wrap = document.createElement("div");
         wrap.style.cssText = "display:flex;flex-direction:column;gap:10px;";
         wrap.innerHTML =
           '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
-            '<div style="font-weight:600;font-size:13px;">' + esc(tr("编辑 Agent 提示词：", "Edit Agent Prompt: ") + (agent.name || agent.shortId)) + '</div>' +
+            '<div style="font-weight:600;font-size:13px;">' + esc(tr("编辑 Agent 配置：", "Edit Agent: ") + (agent.name || agent.shortId)) + '</div>' +
             '<button type="button" class="btn-xs" id="agApplyTplBtn">' + esc(tr("套用全局模板", "Use Global Template")) + '</button>' +
           '</div>' +
-          '<textarea id="agPromptTextarea" rows="5" style="width:100%;resize:vertical;line-height:1.5;">' + esc(curPrompt) + '</textarea>' +
+          '<div style="display:grid;grid-template-columns:1fr;gap:8px;">' +
+            '<div><label class="field-lbl" style="margin-bottom:3px;">' + esc(tr("智能体名称", "Agent Name")) + '</label>' +
+            '<input id="agNameInput" type="text" maxlength="120" style="width:100%;" value="' + esc(curName) + '" /></div>' +
+            '<div><label class="field-lbl" style="margin-bottom:3px;">' + esc(tr("智能体描述", "Agent Description")) + '</label>' +
+            '<input id="agDescInput" type="text" maxlength="500" style="width:100%;" value="' + esc(curDesc) + '" /></div>' +
+            '<div><label class="field-lbl" style="margin-bottom:3px;">' + esc(tr("系统指令", "System Instructions")) + '</label>' +
+            '<textarea id="agPromptTextarea" rows="5" style="width:100%;resize:vertical;line-height:1.5;">' + esc(curPrompt) + '</textarea></div>' +
+          '</div>' +
           '<div style="display:flex;justify-content:flex-end;align-items:center;gap:8px;">' +
             '<button type="button" id="agPromptBackBtn">' + esc(tr("返回列表", "Back")) + '</button>' +
             '<button type="button" class="btn-solid" id="agPromptPublishBtn">' + esc(tr("保存并热发布到 AWS Quick", "Save & Publish")) + '</button>' +
           '</div>';
         listBox.appendChild(wrap);
+        const nameInp = wrap.querySelector("#agNameInput");
+        const descInp = wrap.querySelector("#agDescInput");
         const ta = wrap.querySelector("#agPromptTextarea");
         wrap.querySelector("#agApplyTplBtn").addEventListener("click", () => {
           ta.value = window.__activeCustomAgentPrompt || window.__defaultCustomAgentPrompt || "";
@@ -4332,11 +4413,17 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           try {
             const res = await api("/v1/admin/keys/" + slotId + "/agents/update", {
               method: "POST",
-              body: JSON.stringify({ agentId: agent.shortId || agent.agentId, instructions: ta.value.trim() })
+              body: JSON.stringify({
+                agentId: agent.shortId || agent.agentId,
+                name: nameInp.value.trim() || undefined,
+                description: descInp.value.trim(),
+                instructions: ta.value.trim()
+              })
             });
-            notify(tr("已热更新并发布该自定义 Agent 提示词。", "Custom agent prompt updated and published."));
+            notify(tr("已热更新并发布该自定义 Agent，该账号热会话已同步刷新。", "Custom agent updated & published; warm sessions refreshed."));
             busy = false;
             renderAgents(res.agents || [], activeBoundId);
+            await loadConsoleData("");
           } catch (e) {
             notify(e.message, true);
             pubBtn.disabled = false;
@@ -4882,9 +4969,26 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    let syncAgentTargetSlotIds = [];
+    let syncAgentUseExplicitSlots = false;
+    const closeSyncAgentModal = () => {
+      if ($("syncAgentModal")) $("syncAgentModal").classList.remove("open");
+    };
+    if ($("syncAgentCloseBtn")) $("syncAgentCloseBtn").onclick = closeSyncAgentModal;
+    if ($("syncAgentCancelBtn")) $("syncAgentCancelBtn").onclick = closeSyncAgentModal;
+    if ($("syncAgentModal")) {
+      $("syncAgentModal").onclick = (ev) => { if (ev.target === $("syncAgentModal")) closeSyncAgentModal(); };
+    }
+    if ($("syncAgentPromptResetBtn")) {
+      $("syncAgentPromptResetBtn").onclick = () => {
+        if ($("syncAgentPromptInput")) {
+          $("syncAgentPromptInput").value = window.__defaultCustomAgentPrompt || "";
+        }
+      };
+    }
+
     if ($("credSyncAgentsBtn")) {
-      $("credSyncAgentsBtn").onclick = async () => {
-        const btn = $("credSyncAgentsBtn");
+      $("credSyncAgentsBtn").onclick = () => {
         const ids = [...selectedCredIds];
         const filterActive = ids.length === 0 && isCredFilterActive();
         const filteredIds = filterActive ? getFilteredCreds().map((s) => s.slotId) : [];
@@ -4894,54 +4998,110 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         if (!totalCount) {
           return notify(
             filterActive
-              ? tr("当前筛选结果为空，没有可同步 Agent 的账号。", "No matching accounts to sync agents.")
-              : tr("当前没有已启用的账号可同步 Agent。", "No enabled accounts available to sync agents."),
+              ? tr("当前筛选结果为空，没有可同步云端智能体的账号。", "No matching accounts to sync cloud agents.")
+              : tr("当前没有已启用的账号可同步云端智能体。", "No enabled accounts available to sync cloud agents."),
             true
           );
         }
-        const ok = await uiConfirm({
-          title: tr("一键同步 / 升级编程 Agent", "Batch Sync / Upgrade Coding Agents"),
-          desc: tr(
-            "将检测目标 " + totalCount + " 个账号：把旧版 Quick2API Bridge 或过期编程 Agent 原地热升级为最新无指纹 Coding Assistant 模板（含 <tool_call> 授权锚点），缺失时自动创建并绑定；账号下您自建的其他个人智能体不会被修改。确认执行吗？",
-            "Inspect " + totalCount + " target account(s): upgrade legacy Quick2API Bridge or outdated Coding Assistants in-place to the latest Coding Assistant template (with <tool_call> anchor), or create & bind one if missing. Unrelated custom agents are untouched. Proceed?"
-          ),
-          okText: tr("开始同步", "Sync Now")
-        });
-        if (!ok) return;
-        btn.disabled = true;
-        btn.textContent = tr("同步中...", "Syncing...");
-        const targetIds = explicitIds.length > 0 ? explicitIds : defaultEnabledSlots.map((s) => s.slotId);
+        syncAgentUseExplicitSlots = explicitIds.length > 0;
+        syncAgentTargetSlotIds = explicitIds.length > 0 ? explicitIds : defaultEnabledSlots.map((s) => s.slotId);
+
+        if ($("syncAgentTargetInfo")) {
+          $("syncAgentTargetInfo").textContent = ids.length > 0
+            ? tr("目标范围：已勾选的 " + ids.length + " 个账号", "Target: " + ids.length + " selected account(s)")
+            : (filterActive
+              ? tr("目标范围：当前筛选展示的 " + totalCount + " 个账号", "Target: " + totalCount + " filtered account(s)")
+              : tr("目标范围：全部 " + totalCount + " 个已启用账号（可先勾选指定账号）", "Target: all " + totalCount + " enabled account(s) (or check specific rows first)"));
+        }
+        if ($("syncAgentNameInput")) $("syncAgentNameInput").value = "Coding Assistant";
+        if ($("syncAgentDescInput")) $("syncAgentDescInput").value = "General software engineering and coding assistant.";
+        if ($("syncAgentModeSelect")) {
+          $("syncAgentModeSelect").value = "create";
+          if (typeof syncSelectUi === "function") syncSelectUi($("syncAgentModeSelect"));
+        }
+        if ($("syncAgentSetDefaultCb")) $("syncAgentSetDefaultCb").checked = true;
+        if ($("syncAgentPromptInput")) {
+          $("syncAgentPromptInput").value = (window.__activeCustomAgentPrompt || window.__defaultCustomAgentPrompt || "").trim();
+        }
+        if ($("syncAgentPromptDetails")) $("syncAgentPromptDetails").open = false;
+        if ($("syncAgentModal")) $("syncAgentModal").classList.add("open");
+      };
+    }
+
+    if ($("syncAgentConfirmBtn")) {
+      $("syncAgentConfirmBtn").onclick = async () => {
+        const confirmBtn = $("syncAgentConfirmBtn");
+        const toolbarBtn = $("credSyncAgentsBtn");
+        const name = $("syncAgentNameInput") ? $("syncAgentNameInput").value.trim() : "";
+        const description = $("syncAgentDescInput") ? $("syncAgentDescInput").value.trim() : "";
+        const mode = $("syncAgentModeSelect") ? $("syncAgentModeSelect").value : "create";
+        const setAsDefault = $("syncAgentSetDefaultCb") ? $("syncAgentSetDefaultCb").checked : true;
+        const instructions = $("syncAgentPromptInput") ? $("syncAgentPromptInput").value.trim() : "";
+        if (!name) {
+          notify(tr("请输入智能体名称。", "Please enter an agent name."), true);
+          if ($("syncAgentNameInput")) $("syncAgentNameInput").focus();
+          return;
+        }
+        const targetIds = [...syncAgentTargetSlotIds];
+        if (!targetIds.length) {
+          closeSyncAgentModal();
+          return;
+        }
+        confirmBtn.disabled = true;
+        const origConfirmText = confirmBtn.textContent;
+        confirmBtn.textContent = tr("同步发布中...", "Syncing...");
+        if (toolbarBtn) {
+          toolbarBtn.disabled = true;
+          toolbarBtn.textContent = tr("同步中...", "Syncing...");
+        }
         targetIds.forEach((id) => busySyncIds.add(id));
         setCredPanelLoading();
         renderCredTable();
         try {
+          const payload = {
+            ...(syncAgentUseExplicitSlots ? { slotIds: targetIds } : {}),
+            mode: mode === "upgrade" ? "upgrade" : "create",
+            name,
+            ...(description ? { description } : {}),
+            ...(instructions ? { instructions } : {}),
+            setAsDefault
+          };
           const r = await api("/v1/admin/keys/sync-agents", {
             method: "POST",
-            body: JSON.stringify(explicitIds.length > 0 ? { slotIds: explicitIds } : {})
+            body: JSON.stringify(payload)
           });
+          if (Array.isArray(r.keyPool)) {
+            poolSlotsCache = r.keyPool;
+          }
           const upgraded = Number(r.upgraded || 0);
           const created = Number(r.created || 0);
           const unchanged = Number(r.unchanged || 0);
           const failedCount = Number(r.failedCount || 0);
+          const defaultSuffix = setAsDefault
+            ? tr("，已设为默认并刷新热会话。", ", bound as default & warm sessions refreshed.")
+            : tr("（未改动默认绑定）。", " (default binding unchanged).");
           if (failedCount === 0) {
             notify(tr(
-              "Agent 同步完成：升级 " + upgraded + " 个，新建 " + created + " 个，已是最新 " + unchanged + " 个。",
-              "Agents synced: " + upgraded + " upgraded, " + created + " created, " + unchanged + " already up-to-date."
+              "云端智能体同步完成：新建 " + created + " 个、升级 " + upgraded + " 个、已是最新 " + unchanged + " 个" + defaultSuffix,
+              "Cloud agents synced: " + created + " created, " + upgraded + " upgraded, " + unchanged + " up-to-date" + defaultSuffix
             ));
           } else {
             const firstErr = String((Array.isArray(r.results) ? r.results.find((x) => x.status === "error")?.error : "") || tr("未知错误", "Unknown error")).slice(0, 120);
             notify(tr(
-              "Agent 同步：升级 " + upgraded + " / 新建 " + created + " / 最新 " + unchanged + "，失败 " + failedCount + " 个（" + firstErr + "）",
-              "Agents synced: " + upgraded + " upgraded, " + created + " created, " + failedCount + " failed (" + firstErr + ")"
+              "同步完成：新建 " + created + " / 升级 " + upgraded + " / 最新 " + unchanged + "，失败 " + failedCount + " 个（" + firstErr + "）",
+              "Synced: " + created + " created, " + upgraded + " upgraded, " + failedCount + " failed (" + firstErr + ")"
             ), true);
           }
+          closeSyncAgentModal();
           await loadConsoleData("");
         } catch (e) {
-          notify(tr("同步 Agent 失败: ", "Agent sync failed: ") + e.message, true);
+          notify(tr("同步云端智能体失败: ", "Cloud agent sync failed: ") + e.message, true);
         } finally {
           targetIds.forEach((id) => busySyncIds.delete(id));
           setCredPanelLoading();
-          btn.disabled = false;
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = origConfirmText;
+          if (toolbarBtn) toolbarBtn.disabled = false;
           renderCredTable();
         }
       };
@@ -5116,6 +5276,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     document.addEventListener("keydown", (e) => {
       if (e.key !== "Escape") return;
       if (openTraceId) closeTraceDrawer();
+      else if ($("syncAgentModal") && $("syncAgentModal").classList.contains("open")) closeSyncAgentModal();
+      else if ($("promptEditorModal") && $("promptEditorModal").classList.contains("open")) closePromptEditor();
       else if ($("updateModal") && $("updateModal").classList.contains("open")) window.closeUpdateModal();
       else if ($("addModal").classList.contains("open")) window.closeAddModal();
       else if ($("clientKeyModal").classList.contains("open")) window.closeCkModal();
