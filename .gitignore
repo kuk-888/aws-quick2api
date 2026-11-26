@@ -9,6 +9,7 @@ release-assets/
 !.env.example
 gateway-keys.json
 usage-ledger.json
+request-traces.json
 pool-state.json
 model-access.json
 admin-password.json

@@ -144,18 +144,22 @@ npm start
 
 ### Docker Compose 运行
 
+默认使用已发布的双架构（`linux/amd64`、`linux/arm64`）GHCR 镜像（`ghcr.io/kuk-888/aws-quick2api:latest`）：
+
 ```bash
 cp .env.example .env
-docker compose up -d --build
+docker compose up -d
 ```
 
-若直接使用发布的双架构（`linux/amd64`、`linux/arm64`）GHCR 镜像（`ghcr.io/kuk-888/aws-quick2api:latest`）：
+后续更新镜像：
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-> **无损升级与网页一键热更新（账号、子密钥与账本均不会丢失）**：所有运行态持久化数据均与程序代码/镜像解耦——账号池与路由配置原子保存在 `./data/pool-state.json`（低频增删改与 OAuth 轮换同时异步镜像回可写的 `.env` 兜底防丢），网关子密钥（`gateway-keys.json`）、模型开关（`model-access.json`）、用量账本（`usage-ledger.json`）与管理会话保存在 `./data/`：
+如需从本地源码自行构建，可在 `docker-compose.yml` 中注释 `image:` 并取消注释 `build: .`，执行 `docker compose up -d --build`。
+
+> **无损升级与网页一键热更新（账号、子密钥与账本均不会丢失）**：所有运行态持久化数据均与程序代码/镜像解耦——账号池与路由配置原子保存在 `./data/pool-state.json`（低频增删改与 OAuth 轮换同时异步镜像回可写的 `.env` 兜底防丢），网关子密钥（`gateway-keys.json`）、模型开关（`model-access.json`）、用量账本（`usage-ledger.json`）、纯元数据请求审计日志（`request-traces.json`）与管理会话保存在 `./data/`：
 > - **网页一键热更新（Docker & 源码通用，无需 `docker.sock`）**：升级到含 `bootstrap.js` 引导器的新版本后（Docker 拉一次新镜像、源码通过 `npm start` 或 `node dist/src/bootstrap.js` 启动），后续版本可直接在 Web 管理台右上角点击版本胶囊 → **「一键更新并重启」**。内置强制 `SHA256SUMS.txt` 校验、原生依赖指纹 `depsHash` 保护、启动崩溃 5 秒自动回滚与手动一键回滚（仅当某次大版本变动 `sharp`/`ws` 等底层依赖时会自动拦截并引导执行终端命令）。
 > - **Docker 终端升级**：保留 `./.env` 和 `./data`，执行 `docker compose pull && docker compose up -d` 即可无损升级（升级后内置镜像版本 `>=` 热更缓存版时自动切换回镜像内置版）；
 > - **源码终端升级**：保留 `.env` 和 `data/`，执行 `git pull && npm ci && npm run build` 后重启服务（推荐 `npm start` / `node dist/src/bootstrap.js`）；

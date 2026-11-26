@@ -52,11 +52,65 @@ export class WarmSessionPool {
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly activeWsBySlot = new Map<string, number>();
   private readonly evictSettlingUntilBySlot = new Map<string, number>();
+  private readonly slotGeneration = new Map<string, number>();
+  private globalGeneration = 0;
 
   constructor(opts: { maxWarmSessions?: number; warmSessionTtlMs?: number }) {
     this.maxWarmSessions = opts.maxWarmSessions || MAX_WARM_THREADS;
     this.maxParkedWs = Math.max(MIN_PARKED_WS, Math.floor(this.maxWarmSessions / 2));
     this.warmSessionTtlMs = opts.warmSessionTtlMs || WARM_THREAD_TTL_MS;
+  }
+
+  /**
+   * Returns a monotonic generation token for `slotId`. Any change to the slot's
+   * `chatAgentId`, published agent instructions, proxy, or global agent/incognito settings
+   * bumps this generation so in-flight turns finishing with stale settings refuse to park.
+   */
+  getSlotGeneration(slotId: string): number {
+    return this.globalGeneration + (this.slotGeneration.get(slotId) || 0);
+  }
+
+  /**
+   * Immediately closes all parked WebSockets and drops all warm threads for `slotId`,
+   * bumping its generation so in-flight turns started before this change will not park stale sockets.
+   */
+  invalidateSlot(slotId: string): number {
+    this.slotGeneration.set(slotId, (this.slotGeneration.get(slotId) || 0) + 1);
+    let invalidated = 0;
+    let closedParked = 0;
+    for (const entry of new Set(this.warmThreads.values())) {
+      if (entry.slotId !== slotId) continue;
+      if (entry.parkedWs) closedParked += 1;
+      this.removeEntry(entry, true);
+      invalidated += 1;
+    }
+    if (closedParked > 0) {
+      this.evictSettlingUntilBySlot.set(
+        slotId,
+        Math.max(this.evictSettlingUntilBySlot.get(slotId) || 0, Date.now() + 150),
+      );
+    }
+    return invalidated;
+  }
+
+  /**
+   * Invalidates warm threads and parked WebSockets across all slots (e.g. when global
+   * `chatAgentId` or `incognitoMode` changes).
+   */
+  invalidateAll(): number {
+    this.globalGeneration += 1;
+    let invalidated = 0;
+    const closedSlots = new Set<string>();
+    for (const entry of new Set(this.warmThreads.values())) {
+      if (entry.parkedWs) closedSlots.add(entry.slotId);
+      this.removeEntry(entry, true);
+      invalidated += 1;
+    }
+    const settleUntil = Date.now() + 150;
+    for (const sid of closedSlots) {
+      this.evictSettlingUntilBySlot.set(sid, Math.max(this.evictSettlingUntilBySlot.get(sid) || 0, settleUntil));
+    }
+    return invalidated;
   }
 
   private warmKey(
@@ -218,6 +272,7 @@ export class WarmSessionPool {
     slotId: string;
     isIncognito: boolean;
     chatAgentId?: string;
+    expectedGeneration?: number;
     prefixHashes: readonly string[];
     threadId: string;
     rootThreadId?: string;
@@ -234,6 +289,7 @@ export class WarmSessionPool {
       slotId,
       isIncognito,
       chatAgentId,
+      expectedGeneration,
       prefixHashes,
       threadId,
       rootThreadId,
@@ -244,6 +300,11 @@ export class WarmSessionPool {
       proxyUrl,
       lastAckSeq,
     } = params;
+    // Race guard: if the slot's agent/settings were hot-updated while this turn was in flight,
+    // refuse to park the stale-agent thread or WebSocket so the caller closes it cleanly.
+    if (expectedGeneration !== undefined && expectedGeneration !== this.getSlotGeneration(slotId)) {
+      return false;
+    }
     const keys = Array.from(
       new Set(prefixHashes.filter(Boolean).map((h) => this.warmKey(scope, conversationKey, slotId, isIncognito, h, chatAgentId))),
     );

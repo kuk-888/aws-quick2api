@@ -43,6 +43,7 @@ const FORBIDDEN_TRACKED_FILES = [
   /^\.env($|\.)/i,
   /^gateway-keys\.json$/i,
   /^usage-ledger\.json$/i,
+  /^request-traces\.json$/i,
   /^admin-session\.key$/i,
   /\.(key|pem|p12|pfx)$/i,
 ];

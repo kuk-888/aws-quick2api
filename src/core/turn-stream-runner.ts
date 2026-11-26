@@ -67,6 +67,7 @@ export interface RunTurnStreamParams {
     thinkingEffort?: string;
   };
   chatAgentId?: string;
+  warmGeneration?: number;
   isIncognito: boolean;
   isWarmIncremental: boolean;
   isInternalHelperCall: boolean;
@@ -118,6 +119,7 @@ export async function* runTurnStream(
     execMode,
     selection,
     chatAgentId,
+    warmGeneration,
     isIncognito,
     isWarmIncremental,
     isInternalHelperCall,
@@ -432,6 +434,7 @@ export async function* runTurnStream(
           slotId,
           isIncognito,
           ...(chatAgentId ? { chatAgentId } : {}),
+          ...(warmGeneration !== undefined ? { expectedGeneration: warmGeneration } : {}),
           prefixHashes: nextHashes,
           threadId: effectiveFinishThreadId,
           rootThreadId: effectiveRootThreadId,

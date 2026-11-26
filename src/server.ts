@@ -424,7 +424,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
   const modelAccess = new ModelAccessController(config);
   const usageTracker = new UsageTracker();
   const usageLedger = new UsageLedger(config.usageLedgerFile, config.recordClientIp !== false);
-  const traceLogger = new RequestTraceLogger(100);
+  const traceFilePath = config.dataDir ? path.join(config.dataDir, "request-traces.json") : undefined;
+  const traceLogger = new RequestTraceLogger(100, traceFilePath);
   const engine = new QuickExecutionEngine({
     config,
     usageTracker,
@@ -950,6 +951,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       keyPool.dispose();
       clientKeys.flushStatsToDisk();
       usageLedger.flush();
+      traceLogger.flush();
     }
   };
 }

@@ -138,18 +138,22 @@ npm start
 
 ### Run with Docker Compose
 
+Uses the published multi-arch (`linux/amd64`, `linux/arm64`) GHCR image (`ghcr.io/kuk-888/aws-quick2api:latest`) by default:
+
 ```bash
 cp .env.example .env
-docker compose up -d --build
+docker compose up -d
 ```
 
-When using published multi-arch (`linux/amd64`, `linux/arm64`) GHCR images (`ghcr.io/kuk-888/aws-quick2api:latest`):
+To upgrade later:
 
 ```bash
 docker compose pull && docker compose up -d
 ```
 
-> **Lossless Upgrades & One-Click Web Self-Update (Zero Data Loss)**: All runtime state is decoupled from the code/image — upstream pool credentials and routing settings persist atomically in `./data/pool-state.json` (with debounced best-effort mirroring back to writable `.env` on structural edits and OAuth rotations), while client sub-keys (`gateway-keys.json`), model toggles (`model-access.json`), usage ledger (`usage-ledger.json`), and admin sessions stay in `./data/`:
+To build from local source instead, comment out `image:` and uncomment `build: .` in `docker-compose.yml`, then run `docker compose up -d --build`.
+
+> **Lossless Upgrades & One-Click Web Self-Update (Zero Data Loss)**: All runtime state is decoupled from the code/image — upstream pool credentials and routing settings persist atomically in `./data/pool-state.json` (with debounced best-effort mirroring back to writable `.env` on structural edits and OAuth rotations), while client sub-keys (`gateway-keys.json`), model toggles (`model-access.json`), usage ledger (`usage-ledger.json`), metadata-only request audit logs (`request-traces.json`), and admin sessions stay in `./data/`:
 > - **One-Click Web Self-Update (Docker & Source, zero `docker.sock`)**: Once running under the `bootstrap.js` supervisor (pull the latest Docker image once, or start host installs via `npm start` / `node dist/src/bootstrap.js`), click the version pill in the Web Console → **Update & Restart**. Every update verifies `SHA256SUMS.txt`, checks the native dependency fingerprint (`depsHash`), flushes state cleanly, restarts in-place (~2–5s), and auto-rolls back if the new release crashes within startup grace (manual rollback is also one click away; releases that bump native dependencies like `sharp`/`ws` are safely blocked with terminal upgrade commands).
 > - **Docker CLI Upgrade**: Keep `./.env` and `./data`, then run `docker compose pull && docker compose up -d` (a newer built-in image automatically supersedes any older cached hot-update);
 > - **Source CLI Upgrade**: Keep `.env` and `data/`, then run `git pull && npm ci && npm run build` and restart (using `npm start` or `node dist/src/bootstrap.js`);

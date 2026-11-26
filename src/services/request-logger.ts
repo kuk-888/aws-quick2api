@@ -1,10 +1,13 @@
 import crypto from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import fsPromises from "node:fs/promises";
+import path from "node:path";
 import type { ParsedProtocolTurn, TurnTokenMetrics } from "../core/types.js";
 import type { ExecutionModeTag } from "./usage-tracker.js";
 import { classifyClient } from "../utils/user-agent.js";
 
 /**
- * Metadata-only request log (in-memory ring buffer, never persisted).
+ * Metadata-only request log (bounded ring buffer with optional debounced atomic persistence to `${DATA_DIR}/request-traces.json`).
  *
  * PRIVACY CONTRACT: this module must never hold prompt, system prompt, tool arguments, tool results,
  * model output, thinking text or any other conversation content. Only counts, sizes, timings,
@@ -86,16 +89,26 @@ function countMessages(rawBody: Record<string, unknown>): number {
   return typeof rawBody.input === "string" ? 1 : 0;
 }
 
+const TRACE_PERSIST_DEBOUNCE_MS = 1_000;
+
 export class RequestTraceLogger {
   private readonly maxEntries: number;
+  private readonly filePath?: string;
   private readonly records = new Map<string, MutableTraceRecord>();
+  private dirty = false;
+  private flushTimer: NodeJS.Timeout | null = null;
+  private writeChain: Promise<void> = Promise.resolve();
+  private tmpSeq = 0;
 
-  constructor(maxEntries = 100) {
+  constructor(maxEntries = 100, storageFilePath?: string) {
     this.maxEntries = maxEntries;
+    this.filePath = storageFilePath;
+    this.loadFromDisk();
   }
 
   clear(): void {
     this.records.clear();
+    this.schedulePersist();
   }
 
   startTrace(
@@ -237,6 +250,7 @@ export class RequestTraceLogger {
     rec.durationMs = Date.now() - rec.startedAtMs;
     if (rec.ttftMs === null) rec.ttftMs = rec.durationMs;
     if (stopReason) rec.stopReason = stopReason;
+    this.schedulePersist();
   }
 
   finishError(traceId: string | null, httpStatus: number, errorMessage: string): void {
@@ -247,6 +261,7 @@ export class RequestTraceLogger {
     rec.httpStatus = httpStatus;
     rec.durationMs = Date.now() - rec.startedAtMs;
     rec.errorMessage = errorMessage.slice(0, 300);
+    this.schedulePersist();
   }
 
   listSummaries(limit = 100): RequestTraceSummary[] {
@@ -260,6 +275,170 @@ export class RequestTraceLogger {
   getDetail(id: string): RequestTraceDetail | null {
     const rec = this.records.get(id);
     return rec ? this.toPublic(rec, Date.now()) : null;
+  }
+
+  /** Synchronously flushes any pending metadata-only traces to disk (used on graceful shutdown). */
+  flush(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (!this.filePath || !this.dirty) return;
+    this.dirty = false;
+    const payload = this.buildPersistJson();
+    const dir = path.dirname(this.filePath);
+    const tmpPath = `${this.filePath}.${process.pid}.${++this.tmpSeq}.sync.tmp`;
+    try {
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      writeFileSync(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
+      try {
+        chmodSync(tmpPath, 0o600);
+      } catch {
+        // Non-POSIX
+      }
+      renameSync(tmpPath, this.filePath);
+    } catch {
+      try {
+        unlinkSync(tmpPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
+
+  async flushAsync(): Promise<void> {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.dirty) {
+      this.dirty = false;
+      this.enqueueAsyncWrite();
+    }
+    await this.writeChain;
+  }
+
+  private schedulePersist(): void {
+    if (!this.filePath) return;
+    this.dirty = true;
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      if (!this.dirty) return;
+      this.dirty = false;
+      this.enqueueAsyncWrite();
+    }, TRACE_PERSIST_DEBOUNCE_MS);
+    this.flushTimer.unref?.();
+  }
+
+  private buildPersistJson(): string {
+    const now = Date.now();
+    const items: RequestTraceDetail[] = [];
+    for (const r of this.records.values()) {
+      if (r.status === "running") continue;
+      items.push(this.toPublic(r, now));
+    }
+    return `${JSON.stringify({ version: 1, records: items.slice(-this.maxEntries) })}\n`;
+  }
+
+  private enqueueAsyncWrite(): void {
+    if (!this.filePath) return;
+    const targetPath = this.filePath;
+    const payload = this.buildPersistJson();
+    const tmpPath = `${targetPath}.${process.pid}.${++this.tmpSeq}.tmp`;
+    const dir = path.dirname(targetPath);
+    this.writeChain = this.writeChain
+      .then(async () => {
+        await fsPromises.mkdir(dir, { recursive: true, mode: 0o700 });
+        await fsPromises.writeFile(tmpPath, payload, { encoding: "utf8", mode: 0o600 });
+        try {
+          await fsPromises.chmod(tmpPath, 0o600);
+        } catch {
+          // Non-POSIX
+        }
+        await fsPromises.rename(tmpPath, targetPath);
+      })
+      .catch(async () => {
+        try {
+          await fsPromises.unlink(tmpPath);
+        } catch {
+          // Ignore cleanup errors
+        }
+      });
+  }
+
+  private loadFromDisk(): void {
+    if (!this.filePath || !existsSync(this.filePath)) return;
+    try {
+      const raw = JSON.parse(readFileSync(this.filePath, "utf8")) as { records?: unknown };
+      const list = Array.isArray(raw?.records) ? raw.records : Array.isArray(raw) ? raw : [];
+      for (const item of list.slice(-this.maxEntries)) {
+        if (!item || typeof item !== "object") continue;
+        const r = item as Partial<RequestTraceDetail>;
+        if (typeof r.id !== "string" || !r.id || typeof r.startedAt !== "string") continue;
+        const startedMs = Date.parse(r.startedAt);
+        const rec: MutableTraceRecord = {
+          id: r.id,
+          startedAt: r.startedAt,
+          startedAtMs: Number.isFinite(startedMs) ? startedMs : Date.now(),
+          status: r.status === "success" || r.status === "error" ? r.status : "error",
+          httpStatus: typeof r.httpStatus === "number" ? r.httpStatus : 200,
+          protocol:
+            r.protocol === "openai-chat" ||
+            r.protocol === "openai-responses" ||
+            r.protocol === "anthropic-messages" ||
+            r.protocol === "playground"
+              ? r.protocol
+              : "openai-chat",
+          stream: Boolean(r.stream),
+          requestedModel: typeof r.requestedModel === "string" ? r.requestedModel : "auto",
+          ...(typeof r.clientKeyId === "string" ? { clientKeyId: r.clientKeyId } : {}),
+          ...(typeof r.clientKeyName === "string" ? { clientKeyName: r.clientKeyName } : {}),
+          ...(typeof r.clientIp === "string" ? { clientIp: r.clientIp } : {}),
+          ...(typeof r.userAgent === "string" ? { userAgent: r.userAgent } : {}),
+          ...(typeof r.client === "string" ? { client: r.client } : {}),
+          ...(typeof r.slotId === "string" ? { slotId: r.slotId } : {}),
+          ...(typeof r.accountLabel === "string" ? { accountLabel: r.accountLabel } : {}),
+          ...(typeof r.maskedKey === "string" ? { maskedKey: r.maskedKey } : {}),
+          ...(typeof r.execMode === "string" ? { execMode: r.execMode } : {}),
+          ...(r.usedProxy ? { usedProxy: true } : {}),
+          ...(r.contentFilterRecovered ? { contentFilterRecovered: true } : {}),
+          ...(r.warmFallbackToCold ? { warmFallbackToCold: true } : {}),
+          ...(typeof r.accountFailoverCount === "number" && r.accountFailoverCount > 0
+            ? { accountFailoverCount: r.accountFailoverCount }
+            : {}),
+          ...(r.usedDefaultSystemAgent ? { usedDefaultSystemAgent: true } : {}),
+          ttftMs: typeof r.ttftMs === "number" ? r.ttftMs : null,
+          durationMs: typeof r.durationMs === "number" ? r.durationMs : null,
+          toolCount: typeof r.toolCount === "number" ? r.toolCount : 0,
+          emittedToolCallsCount: typeof r.emittedToolCallsCount === "number" ? r.emittedToolCallsCount : 0,
+          hasThinking: Boolean(r.hasThinking),
+          upstreamSentChars: typeof r.upstreamSentChars === "number" ? r.upstreamSentChars : 0,
+          transcriptTotalChars: typeof r.transcriptTotalChars === "number" ? r.transcriptTotalChars : 0,
+          outputChars: typeof r.outputChars === "number" ? r.outputChars : 0,
+          ...(r.metrics && typeof r.metrics === "object" ? { metrics: r.metrics } : {}),
+          messageCount: typeof r.messageCount === "number" ? r.messageCount : 0,
+          imageCount: typeof r.imageCount === "number" ? r.imageCount : 0,
+          toolNames: Array.isArray(r.toolNames) ? r.toolNames.filter((x): x is string => typeof x === "string") : [],
+          ...(typeof r.stopReason === "string" ? { stopReason: r.stopReason } : {}),
+          ...(typeof r.errorMessage === "string" ? { errorMessage: r.errorMessage } : {}),
+          fingerprint:
+            r.fingerprint && typeof r.fingerprint === "object"
+              ? {
+                  ...(typeof r.fingerprint.conversation === "string" ? { conversation: r.fingerprint.conversation } : {}),
+                  ...(typeof r.fingerprint.priorPrefix === "string" ? { priorPrefix: r.fingerprint.priorPrefix } : {}),
+                  ...(typeof r.fingerprint.currentPrefix === "string" ? { currentPrefix: r.fingerprint.currentPrefix } : {}),
+                }
+              : {},
+          fullPromptChars: 0,
+          incrementalDeltaChars: 0,
+          toolResumeDeltaChars: 0,
+        };
+        this.records.set(rec.id, rec);
+      }
+    } catch {
+      // Corrupt or unreadable trace cache: start clean without affecting gateway boot
+    }
   }
 
   private toPublic(r: MutableTraceRecord, now: number): RequestTraceDetail {

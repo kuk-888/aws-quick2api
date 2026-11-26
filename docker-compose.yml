@@ -1,9 +1,9 @@
 services:
   aws-quick2api:
-    # Option A (local build): keep `build: .`
-    # Option B (prebuilt multi-arch GHCR image): comment out `build: .` and uncomment the line below
-    # image: ghcr.io/kuk-888/aws-quick2api:latest
-    build: .
+    # Option A (default, prebuilt multi-arch GHCR image): works directly with `docker compose pull && docker compose up -d`
+    image: ghcr.io/kuk-888/aws-quick2api:latest
+    # Option B (build from local source): comment out `image:` above and uncomment `build: .` below
+    # build: .
     container_name: aws-quick2api
     restart: unless-stopped
     cap_drop:

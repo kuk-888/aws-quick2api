@@ -4810,4 +4810,84 @@ setInterval(() => {}, 10_000);
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("persists metadata-only RequestTraceLogger across restarts without content leakage and defaults docker-compose.yml to GHCR image", async () => {
+    const { RequestTraceLogger } = await import("../src/services/request-logger.js");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-traces-persist-"));
+    const traceFile = path.join(tmpDir, "request-traces.json");
+    try {
+      const logger1 = new RequestTraceLogger(50, traceFile);
+      const secretPrompt = "TOP_SECRET_PROMPT_SHOULD_NEVER_HIT_DISK_9981";
+      const secretOutput = "TOP_SECRET_MODEL_REPLY_SHOULD_NEVER_HIT_DISK_7721";
+      const id = logger1.startTrace(
+        "anthropic-messages",
+        {
+          requestedModel: "quick-smart",
+          stream: true,
+          systemPrompt: secretPrompt,
+          fullTranscriptText: secretPrompt,
+          incrementalUserText: secretPrompt,
+          trailingToolResults: [],
+          tools: [{ name: "Read", description: "Read file", inputSchema: {} }],
+          toolChoice: "auto",
+          estimatedInputTokens: 100,
+          images: [],
+          files: [],
+          incrementalFiles: [],
+          rawBody: { messages: [{ role: "user", content: secretPrompt }] },
+          conversationKey: "conv-persist-1",
+          priorPrefixHash: "prev-hash",
+          currentInputPrefixHash: "curr-hash",
+        },
+        { keyId: "k1", keyName: "team-key", clientIp: "127.0.0.1", userAgent: "claude-cli/2.1" },
+      );
+      logger1.bindExecutionMeta(id, {
+        slotId: "slot1",
+        maskedKey: "oauth:...abcd",
+        accountLabel: "Acc-1",
+        execMode: "warm_incremental",
+      });
+      logger1.recordThinkingDelta(id, "SECRET_THINKING_TEXT");
+      logger1.recordTextDelta(id, secretOutput);
+      logger1.recordUsage(id, {
+        inputTokens: 1200,
+        cacheReadTokens: 8000,
+        cacheWriteTokens: 0,
+        outputTokens: 300,
+        resolvedModel: "us.anthropic.claude-opus-5-5",
+      });
+      logger1.finishSuccess(id, "end_turn");
+      await logger1.flushAsync();
+
+      const diskRaw = readFileSync(traceFile, "utf8");
+      assert.ok(!diskRaw.includes(secretPrompt), "prompt text must NEVER be persisted to request-traces.json");
+      assert.ok(!diskRaw.includes(secretOutput), "output text must NEVER be persisted to request-traces.json");
+      assert.ok(!diskRaw.includes("SECRET_THINKING_TEXT"), "thinking text must NEVER be persisted");
+      assert.ok(!diskRaw.includes("fullPromptChars"), "internal fields must not leak");
+
+      // Reload into a brand-new RequestTraceLogger (simulating container/process restart)
+      const logger2 = new RequestTraceLogger(50, traceFile);
+      const list = logger2.listSummaries(10);
+      assert.equal(list.length, 1);
+      assert.equal(list[0]!.id, id);
+      assert.equal(list[0]!.requestedModel, "quick-smart");
+      assert.equal(list[0]!.accountLabel, "Acc-1");
+      assert.equal(list[0]!.execMode, "warm_incremental");
+      assert.equal(list[0]!.metrics?.cacheReadTokens, 8000);
+      assert.equal(logger2.getDetail(id)?.toolNames[0], "Read");
+
+      // Clearing traces persists the cleared state
+      logger2.clear();
+      logger2.flush();
+      const logger3 = new RequestTraceLogger(50, traceFile);
+      assert.equal(logger3.listSummaries(10).length, 0);
+
+      // docker-compose.yml defaults to prebuilt GHCR `image:` so `docker compose pull && docker compose up -d` works out of the box
+      const composeRaw = readFileSync(path.resolve(process.cwd(), "docker-compose.yml"), "utf8");
+      assert.ok(/^\s*image:\s*ghcr\.io\/kuk-888\/aws-quick2api:latest\s*$/m.test(composeRaw), "docker-compose.yml must enable GHCR image by default");
+      assert.ok(!/^\s*build:\s*\.\s*$/m.test(composeRaw), "docker-compose.yml should keep `build: .` commented out when GHCR image is default");
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
