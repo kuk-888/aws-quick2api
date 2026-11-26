@@ -12,6 +12,14 @@ import { evictQuotaCachesForKey } from "../services/quota-service.js";
 import { normalizeBaseModelId, redactSecrets } from "../utils/hash.js";
 import { maskProxyUrl, validateProxyUrl } from "../utils/proxy-agent.js";
 import { persistPoolConfigToEnvFile } from "./config.js";
+import {
+  hashEnvKeyForSeedTracking,
+  loadPoolStateFromDisk,
+  POOL_STATE_FILENAME,
+  POOL_STATE_VERSION,
+  PoolStateWriter,
+  type PersistedPoolState,
+} from "./pool-state-store.js";
 import { SessionAffinityTable, type AffinityBindingView } from "./session-affinity.js";
 import { GatewayError, type AutoDisabledState, type GatewayConfig, type LbStrategy } from "./types.js";
 
@@ -119,6 +127,7 @@ export interface PoolRoutingSettings {
   incognitoMode: boolean;
   autoEnsureCodingAgent: boolean;
   customAgentPrompt?: string;
+  sanitizeClientSystemPrompt: boolean;
   autoRephraseOnContentFilter: boolean;
   contentFilterRephrasePrompt?: string;
   contentFilterRephraseModel: string;
@@ -206,6 +215,9 @@ export class UpstreamKeyPool {
   private readonly maxInflightPerSlot: number;
   private readonly envFilePath?: string;
   private readonly identityFilePath?: string;
+  private readonly poolStateWriter?: PoolStateWriter;
+  private readonly seenEnvKeyHashes = new Set<string>();
+  private migratedFromEnvAt?: string;
   private readonly savedIdentities: Record<string, { userEmail?: string; displayName?: string }> = Object.create(null);
   readonly affinityTable = new SessionAffinityTable();
 
@@ -216,6 +228,7 @@ export class UpstreamKeyPool {
   private incognitoMode: boolean;
   private autoEnsureCodingAgent: boolean;
   private customAgentPrompt?: string;
+  private sanitizeClientSystemPrompt: boolean;
   private autoRephraseOnContentFilter: boolean;
   private contentFilterRephrasePrompt?: string;
   private contentFilterRephraseModel: string;
@@ -245,6 +258,7 @@ export class UpstreamKeyPool {
     | "keyChatAgentIds"
     | "autoEnsureCodingAgent"
     | "customAgentPrompt"
+    | "sanitizeClientSystemPrompt"
     | "autoRephraseOnContentFilter"
     | "contentFilterRephrasePrompt"
     | "contentFilterRephraseModel"
@@ -260,42 +274,132 @@ export class UpstreamKeyPool {
     this.incognitoMode = config.incognitoMode !== false;
     this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
     this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
+    this.sanitizeClientSystemPrompt = config.sanitizeClientSystemPrompt === true;
     this.autoRephraseOnContentFilter = config.autoRephraseOnContentFilter === true;
     this.contentFilterRephrasePrompt = config.contentFilterRephrasePrompt?.trim() || undefined;
     this.contentFilterRephraseModel =
       config.contentFilterRephraseModel?.trim() === "quick-balanced" ? "quick-balanced" : "quick-fast";
     this.chatAgentId = config.chatAgentId?.trim() || undefined;
     this.envFilePath = config.envFilePath;
+    let persistedState: PersistedPoolState | null = null;
     if (config.dataDir) {
       this.identityFilePath = path.join(config.dataDir, "account-identities.json");
       this.loadSavedIdentities();
+      const statePath = path.join(config.dataDir, POOL_STATE_FILENAME);
+      this.poolStateWriter = new PoolStateWriter(statePath, { envFilePath: config.envFilePath });
+      persistedState = loadPoolStateFromDisk(statePath);
     }
 
     const bootNow = Date.now();
-    const totalBootKeys = config.quickTokens.length + config.disabledQuickTokens.length;
-    let bootIdx = 0;
-    for (const k of config.quickTokens) {
-      const s = this.upsertInternal(k, true);
-      if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
-      if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
-      if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
-      s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
-      bootIdx += 1;
-    }
-    for (const k of config.disabledQuickTokens) {
-      if (!this.slots.some((s) => s.rawKey === k)) {
-        const s = this.upsertInternal(k, false);
+    if (persistedState) {
+      // Authoritative runtime state from `${dataDir}/pool-state.json`
+      this.lbStrategy = persistedState.lbStrategy;
+      this.sessionAffinityEnabled = persistedState.sessionAffinityEnabled;
+      this.sessionAffinityTtlMs = persistedState.sessionAffinityTtlMs;
+      this.autoDisableExhaustedKeys = persistedState.autoDisableExhaustedKeys;
+      this.incognitoMode = persistedState.incognitoMode;
+      this.autoEnsureCodingAgent = persistedState.autoEnsureCodingAgent;
+      this.customAgentPrompt = persistedState.customAgentPrompt.trim() || undefined;
+      this.sanitizeClientSystemPrompt = persistedState.sanitizeClientSystemPrompt === true;
+      this.autoRephraseOnContentFilter = persistedState.autoRephraseOnContentFilter;
+      this.contentFilterRephrasePrompt = persistedState.contentFilterRephrasePrompt.trim() || undefined;
+      this.contentFilterRephraseModel =
+        persistedState.contentFilterRephraseModel === "quick-balanced" ? "quick-balanced" : "quick-fast";
+      this.chatAgentId = persistedState.chatAgentId.trim() || undefined;
+      this.migratedFromEnvAt = persistedState.migratedFromEnvAt;
+      for (const h of persistedState.seenEnvKeyHashes) this.seenEnvKeyHashes.add(h);
+
+      const totalPersistedKeys = persistedState.activeKeys.length + persistedState.disabledKeys.length;
+      let bootIdx = 0;
+      for (const k of persistedState.activeKeys) {
+        const s = this.upsertInternal(k, true);
+        if (persistedState.keyLabels[s.slotId]) s.label = persistedState.keyLabels[s.slotId];
+        if (persistedState.keyProxies[s.slotId]) s.proxyUrl = persistedState.keyProxies[s.slotId];
+        if (persistedState.keyChatAgentIds[s.slotId]) s.chatAgentId = persistedState.keyChatAgentIds[s.slotId];
+        s.addedAt = persistedState.keyAddedAt[s.slotId] ?? (bootNow - (totalPersistedKeys - bootIdx) * 1000);
+        bootIdx += 1;
+      }
+      for (const k of persistedState.disabledKeys) {
+        if (!this.slots.some((s) => s.rawKey === k)) {
+          const s = this.upsertInternal(k, false);
+          if (persistedState.keyLabels[s.slotId]) s.label = persistedState.keyLabels[s.slotId];
+          if (persistedState.keyProxies[s.slotId]) s.proxyUrl = persistedState.keyProxies[s.slotId];
+          if (persistedState.keyChatAgentIds[s.slotId]) s.chatAgentId = persistedState.keyChatAgentIds[s.slotId];
+          s.addedAt = persistedState.keyAddedAt[s.slotId] ?? (bootNow - (totalPersistedKeys - bootIdx) * 1000);
+          bootIdx += 1;
+          const saved = persistedState.keyAutoDisabled[s.slotId];
+          if (saved) {
+            s.autoDisabledKind = saved.kind;
+            s.autoDisabledReason = saved.reason || undefined;
+            if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
+          }
+        }
+      }
+
+      // Smart `.env` new-key merge: if user manually added a brand-new token to `.env` after migration,
+      // import it automatically without re-adding deleted keys or old rotated OAuth refresh tokens.
+      let mergedNewEnvKeys = false;
+      const hasRealPersistedSlots = this.slots.some((s) => s.rawKey !== "local-outpost");
+      const tryImportNewEnvKey = (rawKey: string, enabled: boolean) => {
+        if (rawKey === "local-outpost" && hasRealPersistedSlots) return;
+        const hash = hashEnvKeyForSeedTracking(rawKey);
+        if (this.seenEnvKeyHashes.has(hash)) return;
+        this.seenEnvKeyHashes.add(hash);
+        if (!this.slots.some((s) => s.rawKey === rawKey)) {
+          const s = this.upsertInternal(rawKey, enabled);
+          if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
+          if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+          if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
+          s.addedAt = config.keyAddedAt?.[s.slotId] ?? Date.now();
+          if (!enabled) {
+            const saved = config.keyAutoDisabled?.[s.slotId];
+            if (saved) {
+              s.autoDisabledKind = saved.kind;
+              s.autoDisabledReason = saved.reason || undefined;
+              if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
+            }
+          }
+          mergedNewEnvKeys = true;
+        }
+      };
+      for (const k of config.quickTokens) tryImportNewEnvKey(k, true);
+      for (const k of config.disabledQuickTokens) tryImportNewEnvKey(k, false);
+      if (mergedNewEnvKeys) {
+        this.persist();
+      }
+    } else {
+      // First boot / seamless migration from `.env`
+      const totalBootKeys = config.quickTokens.length + config.disabledQuickTokens.length;
+      let bootIdx = 0;
+      for (const k of config.quickTokens) {
+        this.seenEnvKeyHashes.add(hashEnvKeyForSeedTracking(k));
+        const s = this.upsertInternal(k, true);
         if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
         if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
         if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
         s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
         bootIdx += 1;
-        const saved = config.keyAutoDisabled?.[s.slotId];
-        if (saved) {
-          s.autoDisabledKind = saved.kind;
-          s.autoDisabledReason = saved.reason || undefined;
-          if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
+      }
+      for (const k of config.disabledQuickTokens) {
+        this.seenEnvKeyHashes.add(hashEnvKeyForSeedTracking(k));
+        if (!this.slots.some((s) => s.rawKey === k)) {
+          const s = this.upsertInternal(k, false);
+          if (config.keyLabels[s.slotId]) s.label = config.keyLabels[s.slotId];
+          if (config.keyProxies?.[s.slotId]) s.proxyUrl = config.keyProxies[s.slotId];
+          if (config.keyChatAgentIds?.[s.slotId]) s.chatAgentId = config.keyChatAgentIds[s.slotId];
+          s.addedAt = config.keyAddedAt?.[s.slotId] ?? (bootNow - (totalBootKeys - bootIdx) * 1000);
+          bootIdx += 1;
+          const saved = config.keyAutoDisabled?.[s.slotId];
+          if (saved) {
+            s.autoDisabledKind = saved.kind;
+            s.autoDisabledReason = saved.reason || undefined;
+            if (saved.resetAtMs) s.autoResetAtMs = saved.resetAtMs;
+          }
         }
+      }
+      if (this.poolStateWriter) {
+        this.migratedFromEnvAt = new Date().toISOString();
+        this.poolStateWriter.flushSync(this.buildPersistedState());
       }
     }
 
@@ -304,14 +408,46 @@ export class UpstreamKeyPool {
     });
   }
 
+  flushStateToDisk(): void {
+    if (this.poolStateWriter) {
+      this.poolStateWriter.flushSync(this.buildPersistedState());
+    }
+  }
+
+  async flushStateAsync(): Promise<void> {
+    if (this.poolStateWriter) {
+      await this.poolStateWriter.flushAsync();
+    }
+  }
+
+  getPoolStateWriteCount(): number {
+    return this.poolStateWriter?.getWriteCount() ?? 0;
+  }
+
+  getEnvMirrorWriteCount(): number {
+    return this.poolStateWriter?.getEnvMirrorWriteCount() ?? 0;
+  }
+
+  getPersistenceError(): string | null {
+    return this.poolStateWriter?.getLastError() ?? null;
+  }
+
+  async flushEnvMirrorAsync(): Promise<void> {
+    if (this.poolStateWriter) {
+      await this.poolStateWriter.flushEnvMirrorAsync();
+    }
+  }
+
   dispose(): void {
     this.unsubscribeOAuthRotation();
+    this.flushStateToDisk();
   }
 
   private rekeySlotCredential(slot: InternalKeySlot, newRawKey: string): void {
     const oldRawKey = slot.rawKey;
     const oldSlotId = slot.slotId;
     if (oldRawKey === newRawKey) return;
+    this.seenEnvKeyHashes.add(hashEnvKeyForSeedTracking(oldRawKey));
     const newSlotId = computeKeySlotId(newRawKey);
     const newMaskedKey = maskSecretKey(newRawKey);
     slot.rawKey = newRawKey;
@@ -456,7 +592,7 @@ export class UpstreamKeyPool {
     }
   }
 
-  private persist(): void {
+  private buildPersistedState(): PersistedPoolState {
     const keyLabels: Record<string, string> = {};
     const keyProxies: Record<string, string> = {};
     const keyChatAgentIds: Record<string, string> = {};
@@ -477,7 +613,11 @@ export class UpstreamKeyPool {
         };
       }
     }
-    persistPoolConfigToEnvFile(this.envFilePath, {
+    return {
+      version: POOL_STATE_VERSION,
+      updatedAt: new Date().toISOString(),
+      ...(this.migratedFromEnvAt ? { migratedFromEnvAt: this.migratedFromEnvAt } : {}),
+      seenEnvKeyHashes: Array.from(this.seenEnvKeyHashes),
       activeKeys: this.slots.filter((s) => s.enabled).map((s) => s.rawKey),
       disabledKeys: this.slots.filter((s) => !s.enabled).map((s) => s.rawKey),
       keyLabels,
@@ -493,10 +633,20 @@ export class UpstreamKeyPool {
       incognitoMode: this.incognitoMode,
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
       customAgentPrompt: this.customAgentPrompt ?? "",
+      sanitizeClientSystemPrompt: this.sanitizeClientSystemPrompt,
       autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
       contentFilterRephrasePrompt: this.contentFilterRephrasePrompt ?? "",
-      contentFilterRephraseModel: this.contentFilterRephraseModel
-    });
+      contentFilterRephraseModel: this.contentFilterRephraseModel,
+    };
+  }
+
+  private persist(opts?: { mirrorToEnv?: boolean }): void {
+    const state = this.buildPersistedState();
+    if (this.poolStateWriter) {
+      this.poolStateWriter.schedule(state, { mirrorToEnv: opts?.mirrorToEnv !== false });
+      return;
+    }
+    persistPoolConfigToEnvFile(this.envFilePath, state);
   }
 
   getSettings(): PoolRoutingSettings {
@@ -508,6 +658,7 @@ export class UpstreamKeyPool {
       incognitoMode: this.incognitoMode,
       autoEnsureCodingAgent: this.autoEnsureCodingAgent,
       ...(this.customAgentPrompt ? { customAgentPrompt: this.customAgentPrompt } : {}),
+      sanitizeClientSystemPrompt: this.sanitizeClientSystemPrompt,
       autoRephraseOnContentFilter: this.autoRephraseOnContentFilter,
       ...(this.contentFilterRephrasePrompt ? { contentFilterRephrasePrompt: this.contentFilterRephrasePrompt } : {}),
       contentFilterRephraseModel: this.contentFilterRephraseModel,
@@ -535,6 +686,9 @@ export class UpstreamKeyPool {
     }
     if (typeof patch.customAgentPrompt === "string") {
       this.customAgentPrompt = patch.customAgentPrompt.trim().slice(0, 4000) || undefined;
+    }
+    if (typeof patch.sanitizeClientSystemPrompt === "boolean") {
+      this.sanitizeClientSystemPrompt = patch.sanitizeClientSystemPrompt;
     }
     if (typeof patch.autoRephraseOnContentFilter === "boolean") {
       this.autoRephraseOnContentFilter = patch.autoRephraseOnContentFilter;
@@ -609,7 +763,12 @@ export class UpstreamKeyPool {
       }
     }
     if (changed) {
-      this.persist();
+      try {
+        this.persist({ mirrorToEnv: false });
+      } catch (err) {
+        // Never brick all inference/admin endpoints if `.env` is temporarily read-only (e.g. Docker root-owned bind mount).
+        console.warn("[key-pool] Failed to persist cycle-reset revival to .env:", err instanceof Error ? err.message : String(err));
+      }
       for (const s of revived) {
         this.notifySlotAvailable(s, this.maxInflightPerSlot);
       }
@@ -666,7 +825,7 @@ export class UpstreamKeyPool {
 
   private notifySlotAvailable(releasedSlot?: InternalKeySlot, maxWake = 1): void {
     let woken = 0;
-    for (let i = 0; i < this.slotWaiters.length && woken < maxWake; ) {
+    for (let i = 0; i < this.slotWaiters.length && woken < maxWake;) {
       const w = this.slotWaiters[i]!;
       if (w.canUse(releasedSlot)) {
         this.slotWaiters.splice(i, 1);
@@ -675,6 +834,21 @@ export class UpstreamKeyPool {
       } else {
         i += 1;
       }
+    }
+  }
+
+  /**
+   * Immediately wakes all queued waiters when no enabled/non-exhausted slots remain,
+   * preventing waiters from hanging uselessly for the full 15s wait budget.
+   */
+  private wakeWaitersIfPoolDepleted(): void {
+    if (this.slotWaiters.length === 0) return;
+    const anyUsable = this.slots.some(
+      (s) => s.enabled && (!this.isSlotPoolExhausted(s, "auto") || !this.isSlotPoolExhausted(s, "api")),
+    );
+    if (!anyUsable) {
+      const toWake = this.slotWaiters.splice(0, this.slotWaiters.length);
+      for (const w of toWake) w.wake();
     }
   }
 
@@ -743,14 +917,24 @@ export class UpstreamKeyPool {
       }
       const enabledSlots = this.slots.filter((s) => s.enabled && !excludeKeys?.has(s.rawKey));
       if (enabledSlots.length === 0) {
-        throw new GatewayError("No enabled upstream AWS Quick credentials available.", 503, "no_enabled_keys");
+        const soonestResetSec = this.computeSoonestAutoResetSec(now);
+        throw new GatewayError(
+          "No enabled upstream AWS Quick credentials available.",
+          503,
+          "no_enabled_keys",
+          undefined,
+          soonestResetSec,
+        );
       }
       const usableSlots = enabledSlots.filter((s) => !this.isSlotPoolExhausted(s, targetPool));
       if (usableSlots.length === 0) {
+        const soonestResetSec = this.computeSoonestAutoResetSec(now, enabledSlots);
         throw new GatewayError(
           `All enabled AWS Quick accounts have exhausted their '${targetPool}' quota.`,
           429,
           "quota_exhausted",
+          undefined,
+          soonestResetSec ?? 300,
         );
       }
 
@@ -782,10 +966,16 @@ export class UpstreamKeyPool {
         usableSlots.every((s) => s.cooldownUntil > now) && soonestAnyCooldownMs > Math.max(0, remainingMs);
 
       if (remainingMs <= 0 || allCoolingBeyondBudget || (!hasWaited && this.slotWaiters.length >= maxQueue)) {
+        const retryAfterSec =
+          Number.isFinite(soonestAnyCooldownMs) && soonestAnyCooldownMs > 0
+            ? Math.min(3600, Math.max(1, Math.ceil(soonestAnyCooldownMs / 1000)))
+            : 5;
         throw new GatewayError(
           "All upstream AWS Quick accounts are currently rate-limited or at capacity. Please retry in a few seconds.",
           429,
           "rate_limit_exceeded",
+          undefined,
+          retryAfterSec,
         );
       }
 
@@ -1016,15 +1206,36 @@ export class UpstreamKeyPool {
     if (until > slot.cooldownUntil) slot.cooldownUntil = until;
   }
 
+  private computeSoonestAutoResetSec(now: number, subset?: InternalKeySlot[]): number | undefined {
+    const list = subset ?? this.slots;
+    let minMs = Number.POSITIVE_INFINITY;
+    for (const s of list) {
+      if (s.autoResetAtMs && s.autoResetAtMs > now) {
+        minMs = Math.min(minMs, s.autoResetAtMs - now);
+      }
+    }
+    if (!Number.isFinite(minMs)) return undefined;
+    return Math.min(3600, Math.max(5, Math.ceil(minMs / 1000)));
+  }
+
+  private readonly lastRateLimitEscalatedBySlot = new Map<string, number>();
+
   /**
    * Exponential backoff cooldown with ±15% jitter for transient 429 burst errors
    * (30s -> 60s -> 120s -> max 300s). Honors upstream `Retry-After` when supplied.
+   * Deduplicates simultaneous burst 429s on the same slot within a 3s window so 4
+   * concurrent requests hitting 1 burst do not escalate `consecutiveRateLimits` 4x.
    */
   reportRateLimit(rawKey: string, retryAfterMs?: number): void {
     const slot = this.slots.find((s) => s.rawKey === rawKey);
     if (!slot) return;
+    const now = Date.now();
     slot.rateLimits += 1;
-    slot.consecutiveRateLimits += 1;
+    const lastEsc = this.lastRateLimitEscalatedBySlot.get(slot.slotId) || 0;
+    if (now - lastEsc >= 3_000 || slot.consecutiveRateLimits === 0) {
+      slot.consecutiveRateLimits += 1;
+      this.lastRateLimitEscalatedBySlot.set(slot.slotId, now);
+    }
     const multiplier = Math.min(10, 2 ** (slot.consecutiveRateLimits - 1));
     const baseBackoff = Math.min(300_000, this.baseCooldownMs * multiplier);
     const jittered = Math.round(baseBackoff * (0.85 + Math.random() * 0.3));
@@ -1032,7 +1243,8 @@ export class UpstreamKeyPool {
       typeof retryAfterMs === "number" && Number.isFinite(retryAfterMs) && retryAfterMs > 0
         ? Math.min(300_000, Math.max(1_000, Math.round(retryAfterMs)))
         : Math.min(300_000, Math.max(1_000, jittered));
-    slot.cooldownUntil = Date.now() + effectiveBackoff;
+    const until = now + effectiveBackoff;
+    if (until > slot.cooldownUntil) slot.cooldownUntil = until;
     this.affinityTable.evictAllForKey(rawKey);
   }
 
@@ -1068,8 +1280,9 @@ export class UpstreamKeyPool {
       slot.autoDisabledReason = reasonDetail
         ? `Auto-disabled (quota exhausted): ${redactSecrets(reasonDetail).slice(0, 60)}`
         : "Auto-disabled: quota exhausted";
-      this.persist();
+      this.persist({ mirrorToEnv: false });
     }
+    this.wakeWaitersIfPoolDepleted();
 
     if (this.onQuotaExhaustedCallback) {
       const lastProbe = this.quotaProbeCooldownBySlot.get(slot.slotId) || 0;
@@ -1096,10 +1309,11 @@ export class UpstreamKeyPool {
       slot.autoDisabledReason = reasonDetail
         ? `Auto-disabled (auth failed): ${redactSecrets(reasonDetail).slice(0, 60)}`
         : "Auto-disabled: authentication failed (401 Unauthorized)";
-      this.persist();
+      this.persist({ mirrorToEnv: false });
     } else {
       slot.cooldownUntil = Date.now() + this.baseCooldownMs * 10;
     }
+    this.wakeWaitersIfPoolDepleted();
   }
 
   /**
@@ -1159,7 +1373,7 @@ export class UpstreamKeyPool {
           : Number.NaN;
       if (Number.isFinite(rawSessionResumeMs) && rawSessionResumeMs > now) {
         slot.autoResetAtMs = rawSessionResumeMs;
-        if (slot.autoResetAtMs !== prevResetMs) this.persist();
+        if (slot.autoResetAtMs !== prevResetMs) this.persist({ mirrorToEnv: false });
       }
       return;
     }
@@ -1194,7 +1408,7 @@ export class UpstreamKeyPool {
         ? "Auto-disabled: Monthly 10h pool reached 0%"
         : "Auto-disabled: Session burst pool reached 0%";
       this.affinityTable.evictAllForKey(rawKey);
-      this.persist();
+      this.persist({ mirrorToEnv: false });
       return;
     }
 
@@ -1208,11 +1422,11 @@ export class UpstreamKeyPool {
         slot.cooldownUntil = 0;
         slot.connLimitCooldownUntil = 0;
         slot.consecutiveRateLimits = 0;
-        this.persist();
+        this.persist({ mirrorToEnv: false });
         this.notifySlotAvailable(slot, this.maxInflightPerSlot);
         return;
       }
-      if (slot.autoResetAtMs !== prevResetMs) this.persist();
+      if (slot.autoResetAtMs !== prevResetMs) this.persist({ mirrorToEnv: false });
     }
   }
 
@@ -1361,6 +1575,7 @@ export class UpstreamKeyPool {
     if (idx < 0) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
     const [removed] = this.slots.splice(idx, 1);
     if (removed) {
+      this.seenEnvKeyHashes.add(hashEnvKeyForSeedTracking(removed.rawKey));
       this.affinityTable.evictAllForKey(removed.rawKey);
       evictQuotaCachesForKey(removed.rawKey);
     }

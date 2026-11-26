@@ -346,27 +346,32 @@ class Socks5TunnelAgent extends https.Agent {
 }
 
 const agentCache = new Map<string, https.Agent>();
-const MAX_PROXY_AGENT_CACHE = 64;
+const MAX_PROXY_AGENT_CACHE = 512;
 
 export function getProxyAgent(proxyUrl: string | undefined): https.Agent | undefined {
   const effective = validateProxyUrl(proxyUrl);
   if (!effective) return undefined;
   let agent = agentCache.get(effective);
-  if (!agent) {
-    if (agentCache.size >= MAX_PROXY_AGENT_CACHE) {
-      const oldestKey = agentCache.keys().next().value;
-      if (oldestKey) {
-        agentCache.get(oldestKey)?.destroy();
-        agentCache.delete(oldestKey);
-      }
-    }
-    const parsed = new URL(effective);
-    agent =
-      parsed.protocol === "socks5:" || parsed.protocol === "socks5h:"
-        ? new Socks5TunnelAgent(effective)
-        : new HttpConnectTunnelAgent(effective);
+  if (agent) {
+    // Refresh LRU recency without recreating or destroying active connections.
+    agentCache.delete(effective);
     agentCache.set(effective, agent);
+    return agent;
   }
+  if (agentCache.size >= MAX_PROXY_AGENT_CACHE) {
+    const oldestKey = agentCache.keys().next().value;
+    if (oldestKey) {
+      // Do NOT call .destroy() on eviction — an in-flight TLS/WS connection may still be active;
+      // removing from cache lets idle sockets drain and GC naturally.
+      agentCache.delete(oldestKey);
+    }
+  }
+  const parsed = new URL(effective);
+  agent =
+    parsed.protocol === "socks5:" || parsed.protocol === "socks5h:"
+      ? new Socks5TunnelAgent(effective)
+      : new HttpConnectTunnelAgent(effective);
+  agentCache.set(effective, agent);
   return agent;
 }
 

@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type http from "node:http";
 import { persistAdminPasswordToEnvFile } from "../core/config.js";
@@ -44,7 +44,7 @@ export class AuthFailureThrottle {
   constructor(
     private readonly maxPerIp = 8,
     private readonly windowMs = 15 * 60 * 1000
-  ) {}
+  ) { }
 
   private prune(list: number[], now: number): number[] {
     const cutoff = now - this.windowMs;
@@ -138,6 +138,8 @@ export class AdminAuthManager {
   private signingSecret: Buffer;
   private adminPassword?: string;
   private readonly envFilePath?: string;
+  private readonly envBootstrapPasswordHash: string;
+  private readonly passwordFilePath?: string;
   private readonly trustProxy: "loopback" | "all" | "off";
   readonly throttle = new AuthFailureThrottle();
   /** Bearer attempts against admin routes are counted apart from the login form, so API-client probing cannot lock the admin out. */
@@ -148,15 +150,37 @@ export class AdminAuthManager {
       Partial<Pick<GatewayConfig, "gatewayTokens" | "dataDir" | "trustProxy">>
   ) {
     this.adminPassword = config.adminPassword;
+    this.envBootstrapPasswordHash = config.adminPassword
+      ? crypto.createHash("sha256").update(config.adminPassword).digest("hex")
+      : "";
     this.envFilePath = config.envFilePath;
     this.trustProxy = config.trustProxy ?? "loopback";
     const stateDir = config.dataDir ?? (this.envFilePath ? path.dirname(this.envFilePath) : undefined);
     // Random secret (never derived from the password) persisted beside state files so sessions survive restarts.
     this.secretFilePath = stateDir ? path.join(stateDir, "admin-session.key") : undefined;
+    this.passwordFilePath = stateDir ? path.join(stateDir, "admin-password.json") : undefined;
+    this.loadPersistedPasswordIfCurrent();
     this.signingSecret = this.loadOrCreateSecret();
   }
 
   private readonly secretFilePath?: string;
+
+  private loadPersistedPasswordIfCurrent(): void {
+    if (!this.passwordFilePath || !existsSync(this.passwordFilePath)) return;
+    try {
+      const parsed = JSON.parse(readFileSync(this.passwordFilePath, "utf8")) as {
+        password?: unknown;
+        envBootstrapPasswordHash?: unknown;
+      };
+      if (typeof parsed?.password !== "string" || !parsed.password.trim()) return;
+      const savedEnvHash = typeof parsed.envBootstrapPasswordHash === "string" ? parsed.envBootstrapPasswordHash : "";
+      // If operator explicitly changed ADMIN_PASSWORD in `.env` for emergency reset, `.env` takes precedence.
+      if (this.envBootstrapPasswordHash && this.envBootstrapPasswordHash !== savedEnvHash) return;
+      this.adminPassword = parsed.password.trim();
+    } catch {
+      // Fall back to env password
+    }
+  }
 
   private loadOrCreateSecret(): Buffer {
     if (this.secretFilePath && existsSync(this.secretFilePath)) {
@@ -238,7 +262,30 @@ export class AdminAuthManager {
     }
     this.adminPassword = trimmed;
     this.signingSecret = this.rotateSecret();
-    persistAdminPasswordToEnvFile(this.envFilePath, trimmed);
+    let persistedInDataDir = false;
+    if (this.passwordFilePath) {
+      const dir = path.dirname(this.passwordFilePath);
+      const tmp = `${this.passwordFilePath}.${process.pid}.tmp`;
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileSync(
+          tmp,
+          `${JSON.stringify({ version: 1, password: trimmed, envBootstrapPasswordHash: this.envBootstrapPasswordHash, updatedAt: new Date().toISOString() }, null, 2)}\n`,
+          { mode: 0o600 },
+        );
+        try { chmodSync(tmp, 0o600); } catch { }
+        renameSync(tmp, this.passwordFilePath);
+        persistedInDataDir = true;
+      } catch {
+        try { unlinkSync(tmp); } catch { }
+      }
+    }
+    try {
+      persistAdminPasswordToEnvFile(this.envFilePath, trimmed);
+    } catch (err) {
+      if (!persistedInDataDir) throw err;
+      // `.env` may be mounted read-only in Docker; password is safely stored in `${dataDir}/admin-password.json`.
+    }
     return this.issueSessionToken();
   }
 

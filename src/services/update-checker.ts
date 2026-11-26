@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface VersionCheckResult {
   currentVersion: string;
@@ -9,13 +10,26 @@ export interface VersionCheckResult {
   releaseUrl: string | null;
   releaseNotes: string | null;
   checkedAt: string | null;
+  /** Official hot-update tarball asset URL (when published with the release). */
+  bundleUrl?: string | null;
+  /** Official SHA256SUMS.txt asset URL (required for verified self-update). */
+  checksumUrl?: string | null;
+  /** Expected tarball asset filename (e.g. `aws-quick2api-dist-v0.1.21.tar.gz`). */
+  bundleAssetName?: string | null;
 }
 
-export function readPackageVersion(): string {
+const THIS_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+export function readPackageVersion(explicitAppRoot?: string): string {
+  const envReleaseDir = process.env.AWS_QUICK_ACTIVE_RELEASE_DIR?.trim();
   const candidates = [
+    explicitAppRoot ? path.join(explicitAppRoot, "package.json") : "",
+    envReleaseDir ? path.join(envReleaseDir, "package.json") : "",
+    // From `dist/src/services/update-checker.js` -> `<appRoot>/package.json`
+    path.resolve(THIS_DIR, "../../..", "package.json"),
     path.resolve(process.cwd(), "package.json"),
     path.resolve(process.cwd(), "../package.json"),
-  ];
+  ].filter(Boolean);
   for (const p of candidates) {
     if (!existsSync(p)) continue;
     try {
@@ -26,7 +40,7 @@ export function readPackageVersion(): string {
   return "0.1.0";
 }
 
-function compareSemver(a: string, b: string): number {
+export function compareSemver(a: string, b: string): number {
   const pa = a.replace(/^v/i, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
   const pb = b.replace(/^v/i, "").split(".").map((n) => Number.parseInt(n, 10) || 0);
   for (let i = 0; i < 3; i++) {
@@ -37,7 +51,7 @@ function compareSemver(a: string, b: string): number {
   return 0;
 }
 
-const DEFAULT_UPDATE_CHECK_REPO = "kuk-888/aws-quick2api";
+export const DEFAULT_UPDATE_CHECK_REPO = "kuk-888/aws-quick2api";
 const DISABLED_VALUES = new Set(["off", "false", "none", "0", "disabled"]);
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 let cachedResult: VersionCheckResult | null = null;
@@ -82,9 +96,20 @@ export async function checkLatestVersion(force = false): Promise<VersionCheckRes
       tag_name?: string;
       html_url?: string;
       body?: string;
+      assets?: Array<{ name?: string; browser_download_url?: string }>;
     };
     const latest = (data.tag_name || "").replace(/^v/i, "").trim() || null;
     const hasUpdate = latest ? compareSemver(latest, currentVersion) > 0 : false;
+    const assets = Array.isArray(data.assets) ? data.assets : [];
+    const expectedBundleName = latest ? `aws-quick2api-dist-v${latest}.tar.gz` : null;
+    const bundleAsset = expectedBundleName
+      ? assets.find((a) => a.name === expectedBundleName && typeof a.browser_download_url === "string")
+      : undefined;
+    const checksumAsset = assets.find(
+      (a) =>
+        (a.name === "SHA256SUMS.txt" || (expectedBundleName && a.name === `${expectedBundleName}.sha256`)) &&
+        typeof a.browser_download_url === "string",
+    );
     cachedResult = {
       currentVersion,
       latestVersion: latest,
@@ -93,6 +118,9 @@ export async function checkLatestVersion(force = false): Promise<VersionCheckRes
       releaseUrl: data.html_url || `https://github.com/${repo}/releases`,
       releaseNotes: data.body ? data.body.slice(0, 3000) : null,
       checkedAt: new Date(now).toISOString(),
+      bundleUrl: bundleAsset?.browser_download_url || null,
+      checksumUrl: checksumAsset?.browser_download_url || null,
+      bundleAssetName: bundleAsset?.name || expectedBundleName,
     };
     cachedAtMs = now;
     return cachedResult;

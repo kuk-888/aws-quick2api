@@ -101,14 +101,14 @@ export function normalizeSystemReminderTagsForUpstream(input: string): string {
 
 /**
  * Soften direct identity-override phrases from third-party CLI/IDE agents (e.g. Claude Code,
- * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes) when tools are enabled so they do not
- * clash with AWS Quick's built-in identity or trigger false-positive prompt-injection refusals.
+ * Codex, Cline, Roo Code, Kilo, Cursor, OpenCode, Hermes, Antigravity, ZCode, Windsurf, Aider)
+ * when tools are enabled so they do not clash with AWS Quick's built-in identity or paralyze `<tool_call>`.
  */
 export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTools = true): string {
   if (!systemPrompt || !hasTools) return systemPrompt;
   return stripHighRiskClientHeaders(systemPrompt)
     .replace(
-      /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|Hermes)\b[^\n.]*\.?/gi,
+      /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|Hermes|Antigravity|ZCode|Windsurf|Aider|Augment|Trae)\b[^\n.]*\.?/gi,
       "You are assisting a developer through an external coding client.",
     )
     .replace(
@@ -123,6 +123,102 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
       /\bYou are a coding agent running in[^\n.]*\.?/gi,
       "You are assisting a developer working in a local coding environment.",
     );
+}
+
+function replacePairedXmlBlockLinear(
+  input: string,
+  tagNameLower: string,
+  replacer: (inner: string) => string,
+): string {
+  const lower = input.toLowerCase();
+  const openTag = `<${tagNameLower}>`;
+  const closeTag = `</${tagNameLower}>`;
+  if (!lower.includes(openTag)) return input;
+  let out = "";
+  let pos = 0;
+  while (pos < input.length) {
+    const start = lower.indexOf(openTag, pos);
+    if (start < 0) {
+      out += input.slice(pos);
+      break;
+    }
+    out += input.slice(pos, start);
+    const end = lower.indexOf(closeTag, start + openTag.length);
+    if (end < 0) {
+      out += input.slice(start);
+      break;
+    }
+    const inner = input.slice(start + openTag.length, end).trim();
+    out += replacer(inner);
+    pos = end + closeTag.length;
+  }
+  return out;
+}
+
+/**
+ * Opt-in deep sanitization for heavy agent IDE system prompts (`SANITIZE_CLIENT_SYSTEM_PROMPT=true`,
+ * OFF by default so user-authored `systemPrompt` text is never altered unless explicitly enabled).
+ *
+ * Neutralizes third-party `<identity>` blocks, IDE anti-jailbreak `<guidelines>` trigger word clusters,
+ * `<user_rules>` / `<RULE[...]>` / `<skills>` / `<system-reminder>` XML wrappers, and canonical
+ * prompt-injection override imperatives (`WITHOUT ANY EXCEPTION` / `take precedence over any other instructions`),
+ * while preserving 100% of the user's actual workspace rules and skill descriptions.
+ */
+export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
+  if (!systemPrompt) return systemPrompt;
+  let text = normalizeSystemReminderTagsForUpstream(stripHighRiskClientHeaders(systemPrompt));
+
+  // 1. Replace `<identity>...</identity>` persona blocks when they assert a third-party AI identity
+  text = replacePairedXmlBlockLinear(text, "identity", (inner) => {
+    if (
+      /\b(?:You are|designed by|Anthropic|OpenAI|Google Deepmind|Antigravity|Claude|Codex|ZCode|Cursor|Kilo|Cline|Roo|Windsurf)\b/i.test(
+        inner,
+      )
+    ) {
+      return "You are assisting a developer working in their local workspace. Prioritize addressing the user's software engineering request concisely and accurately.";
+    }
+    return inner;
+  });
+
+  // 2. Strip IDE-injected `<guidelines>` boilerplate ONLY when it contains anti-bypass/CAPTCHA trigger clusters
+  //    (user-authored coding guidelines without those clusters are preserved as neutral markdown).
+  text = replacePairedXmlBlockLinear(text, "guidelines", (inner) => {
+    const hasSecurityCluster =
+      /\b(?:bypass|defeat)\b[\s\S]{0,120}\b(?:access control|permission check|sandbox|CAPTCHA|anti-bot)\b/i.test(inner);
+    if (hasSecurityCluster) return "";
+    return inner ? `## Guidelines\n${inner}` : "";
+  });
+
+  // 3. Unwrap `<user_rules>` and `<RULE[...]>` wrappers into plain Markdown headings (preserving all rule body text)
+  text = replacePairedXmlBlockLinear(text, "user_rules", (inner) =>
+    inner ? `## Workspace Conventions\n${inner}` : "",
+  );
+  text = text
+    .replace(/<RULE\[([^\]]*)\]>/gi, (_m, p1: string) => {
+      const base = String(p1 || "").split(/[\\/]/).pop()?.trim();
+      return base ? `### Rules (${base})` : "### Rules";
+    })
+    .replace(/<\/RULE\[[^\]]*\]>/gi, "");
+
+  // 4. Unwrap `<skills>` XML wrapper while keeping skill paths and descriptions intact
+  text = replacePairedXmlBlockLinear(text, "skills", (inner) =>
+    inner ? `## Available Workspace Skills\n${inner}` : "",
+  );
+
+  // 5. Soften standalone IDE identity lines and canonical prompt-injection override imperatives
+  text = sanitizeClientSystemPromptForQuick(text, true)
+    .replace(
+      /The following are user-defined rules that you MUST ALWAYS FOLLOW WITHOUT ANY EXCEPTION\.\s*These rules take precedence over any other instructions\./gi,
+      "Please follow these workspace conventions during coding and analysis tasks:",
+    )
+    .replace(/\bMUST ALWAYS FOLLOW WITHOUT ANY EXCEPTION\b/gi, "should consistently follow")
+    .replace(/\btake precedence over any other instructions\b/gi, "apply to workspace tasks")
+    .replace(
+      /If a skill seems relevant to your current task,\s*you MUST read its `SKILL\.md` instructions before proceeding\./gi,
+      "If a skill below is relevant to the current task, read its `SKILL.md` instructions before proceeding.",
+    );
+
+  return text.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**
@@ -337,6 +433,7 @@ function tryParseJsonObject(raw: string): Record<string, unknown> | null {
 function buildNormalizedToolCall(
   parsed: Record<string, unknown>,
   allowedToolNames?: ReadonlySet<string>,
+  customToolNames?: ReadonlySet<string>,
 ): NormalizedToolCall | null {
   const name = typeof parsed.name === "string" ? parsed.name.trim() : "";
   if (!name) return null;
@@ -352,8 +449,14 @@ function buildNormalizedToolCall(
       argsObject = {};
     } else {
       const parsedArgs = tryParseJsonObject(rawArgs);
-      if (!parsedArgs) return null;
-      argsObject = parsedArgs;
+      if (parsedArgs) {
+        argsObject = parsedArgs;
+      } else if (customToolNames?.has(name)) {
+        // Free-form custom tools (e.g. Codex CLI `apply_patch`) may emit raw patch/text strings directly.
+        argsObject = { input: rawArgs };
+      } else {
+        return null;
+      }
     }
   } else if (typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
     argsObject = rawArgs as Record<string, unknown>;
@@ -453,6 +556,7 @@ function findToolCallCloseOutsideJsonStrings(text: string, contentStart: number)
 export function parseToolCallsFromText(
   text: string,
   allowedToolNames?: ReadonlySet<string>,
+  customToolNames?: ReadonlySet<string>,
 ): {
   cleanText: string;
   toolCalls: NormalizedToolCall[];
@@ -485,7 +589,7 @@ export function parseToolCallsFromText(
     if (closeIdx !== -1) {
       const rawBlock = text.slice(contentStart, closeIdx).trim();
       const parsed = tryParseJsonObject(rawBlock);
-      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
+      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames, customToolNames) : null;
       textParts.push(text.slice(cursor, idx));
       const blockEnd = closeIdx + closeLen;
       if (tc) {
@@ -501,7 +605,7 @@ export function parseToolCallsFromText(
       // Unclosed trailing `<tool_call>...`
       const rawTail = text.slice(contentStart);
       const parsed = tryParseJsonObject(rawTail);
-      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames) : null;
+      const tc = parsed ? buildNormalizedToolCall(parsed, allowedToolNames, customToolNames) : null;
       if (tc) {
         textParts.push(text.slice(cursor, idx));
         toolCalls.push(tc);
@@ -527,14 +631,16 @@ export function parseToolCallsFromText(
  */
 export class StreamingToolCallFilter {
   private readonly allowedToolNames?: ReadonlySet<string>;
+  private readonly customToolNames?: ReadonlySet<string>;
   private pending = "";
   private capturing = false;
   private captured = "";
   private readonly fence: FenceState = { char: null, len: 0, linePrefix: "" };
   private lastEmittedChar = "";
 
-  constructor(allowedToolNames?: ReadonlySet<string>) {
+  constructor(allowedToolNames?: ReadonlySet<string>, customToolNames?: ReadonlySet<string>) {
     this.allowedToolNames = allowedToolNames;
+    this.customToolNames = customToolNames;
   }
 
   feed(delta: string): string {
@@ -591,7 +697,7 @@ export class StreamingToolCallFilter {
       this.pending = "";
       return { remainingText: rem, toolCalls: [] };
     }
-    const { cleanText, toolCalls } = parseToolCallsFromText(this.captured, this.allowedToolNames);
+    const { cleanText, toolCalls } = parseToolCallsFromText(this.captured, this.allowedToolNames, this.customToolNames);
     this.captured = "";
     this.capturing = false;
     return { remainingText: cleanText, toolCalls };

@@ -179,10 +179,11 @@ export function resolveModelSelection(
 
   let explicitModelEffort: QuickThinkingEffort | undefined = suffixEffort;
 
-  // Check bracket param e.g. quick-balanced[effort=high]
+  // Check bracket param e.g. quick-balanced[effort=high] (case-insensitive keys)
   if (bracketParams) {
     for (const part of bracketParams.split(",")) {
-      const [k, v] = part.split("=").map((s) => s.trim());
+      const [rawK, v] = part.split("=").map((s) => s.trim());
+      const k = rawK?.toLowerCase();
       if (k === "effort" || k === "thinking_effort") {
         const parsed = parseEffort(v);
         if (parsed) explicitModelEffort = parsed;
@@ -237,10 +238,13 @@ export function resolveModelSelection(
   const resolvedBodyEffort: QuickThinkingEffort | undefined = thinkingDisabled
     ? "off"
     : explicitBodyEffort ??
-      (explicitModelEffort ? undefined : implicitThinkingEffort);
+    (explicitModelEffort ? undefined : implicitThinkingEffort);
 
   if (resolvedBodyEffort && found.agentMode !== "fast") {
-    effort = found.agentMode === "advanced" && resolvedBodyEffort === "off" ? "high" : resolvedBodyEffort;
+    effort = resolvedBodyEffort;
+  }
+  if (found.agentMode === "advanced" && effort === "off") {
+    effort = "high";
   }
 
   return {

@@ -149,9 +149,10 @@ When using published multi-arch (`linux/amd64`, `linux/arm64`) GHCR images (`ghc
 docker compose pull && docker compose up -d
 ```
 
-> **Lossless Upgrades (Zero Data Loss)**: All persistent state lives outside the code/image — imported AWS accounts, proxies, agent bindings, and routing settings stay in your host `.env`, while client sub-keys (`gateway-keys.json`), usage ledger (`usage-ledger.json`), and admin sessions stay in `./data/`. All new options default safely so existing deployments upgrade without reconfiguring:
-> - **Docker**: Keep `./.env` and `./data`, then run `docker compose pull && docker compose up -d`;
-> - **Source**: Keep `.env` and `data/`, then run `git pull && npm ci && npm run build` and restart the service;
+> **Lossless Upgrades & One-Click Web Self-Update (Zero Data Loss)**: All runtime state is decoupled from the code/image — upstream pool credentials and routing settings persist atomically in `./data/pool-state.json` (with debounced best-effort mirroring back to writable `.env` on structural edits and OAuth rotations), while client sub-keys (`gateway-keys.json`), model toggles (`model-access.json`), usage ledger (`usage-ledger.json`), and admin sessions stay in `./data/`:
+> - **One-Click Web Self-Update (Docker & Source, zero `docker.sock`)**: Once running under the `bootstrap.js` supervisor (pull the latest Docker image once, or start host installs via `npm start` / `node dist/src/bootstrap.js`), click the version pill in the Web Console → **Update & Restart**. Every update verifies `SHA256SUMS.txt`, checks the native dependency fingerprint (`depsHash`), flushes state cleanly, restarts in-place (~2–5s), and auto-rolls back if the new release crashes within startup grace (manual rollback is also one click away; releases that bump native dependencies like `sharp`/`ws` are safely blocked with terminal upgrade commands).
+> - **Docker CLI Upgrade**: Keep `./.env` and `./data`, then run `docker compose pull && docker compose up -d` (a newer built-in image automatically supersedes any older cached hot-update);
+> - **Source CLI Upgrade**: Keep `.env` and `data/`, then run `git pull && npm ci && npm run build` and restart (using `npm start` or `node dist/src/bootstrap.js`);
 > - **One-time permission step only when upgrading Docker from `<= v0.1.15`**: `v0.1.16+` runs as non-root (`node`, UID/GID `1000:1000`) with `cap_drop: [ALL]`. If your existing `./data` or `.env` is owned by `root`, run `chown -R 1000:1000 data .env` once before upgrading.
 
 - **Web Console**: `http://127.0.0.1:3456/dashboard`
@@ -178,11 +179,13 @@ See [.env.example](./.env.example) for the full template:
 | `AWS_QUICK_LOCALE` | `en-US` | Locale sent to upstream |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | Desktop client version header override |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | Global default proxy (per-account `http://`, `https://`, `socks5://` and shorthand proxies can be set in Console) |
+| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | Opt-in toggle (hot-configurable in Console; off by default so user-supplied `system` prompts pass through untouched): recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive `smart` blocks or refuse local tool calls; neutralizes conflicting AI identities and pseudo-system XML wrappers while preserving all workspace rule content |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | Opt-in toggle (hot-configurable in Console): when enabled, if upstream returns `content_filtered` before text emission, a helper model rephrases the latest user prompt into defensive engineering wording and retries once on the exact same requested model (via native `edit_message` on warm threads) |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | Custom prompt template for defensive auto-rephrase (empty = built-in default; editable in Console with one-click reset) |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | Lightweight helper model (`quick-fast` or `quick-balanced`) used strictly for short prompt rephrasing; never replaces the answering model |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental session cache TTL (30 min) and max entries |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | GitHub `owner/repo` for non-blocking release check in Console (set `off` to disable) |
+| `DISABLE_SELF_UPDATE` | `false` | Set to `true` to completely disable Web Console one-click hot-update & rollback endpoints |
 
 ---
 

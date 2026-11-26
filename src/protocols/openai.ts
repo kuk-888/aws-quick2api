@@ -172,7 +172,18 @@ export function parseOpenAiTools(rawTools: unknown): {
         if (!subName) continue;
         const fnObj = isRecord(sub.function) ? sub.function : sub;
         const subDesc = typeof fnObj.description === "string" && fnObj.description ? fnObj.description : undefined;
-        const subSchema = isRecord(fnObj.parameters) ? fnObj.parameters : { type: "object", properties: {} };
+        const subSchema =
+          subType === "custom"
+            ? {
+              type: "object",
+              properties: {
+                input: { type: "string", description: "Raw tool input text payload" },
+              },
+              required: ["input"],
+            }
+            : isRecord(fnObj.parameters)
+              ? fnObj.parameters
+              : { type: "object", properties: {} };
         customTools.push({
           name: `${ns}__${subName}`,
           ...(subDesc ? { description: subDesc } : {}),
@@ -182,8 +193,25 @@ export function parseOpenAiTools(rawTools: unknown): {
           wireName: subName,
         });
       }
+    } else if (rawType === "apply_patch") {
+      const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : "apply_patch";
+      customTools.push({
+        name,
+        description:
+          typeof item.description === "string" && item.description
+            ? item.description
+            : "Apply a structured file patch.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            input: { type: "string", description: "Raw patch text payload" },
+          },
+          required: ["input"],
+        },
+        toolKind: "custom",
+      });
     } else if (rawType === "local_shell" || rawType === "shell") {
-      // OpenAI Responses / Codex CLI local shell tool
+      // OpenAI Responses / Codex CLI local shell / GA shell tool
       const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : rawType;
       customTools.push({
         name,
@@ -191,16 +219,27 @@ export function parseOpenAiTools(rawTools: unknown): {
           typeof item.description === "string" && item.description
             ? item.description
             : "Propose a shell command for the local CLI runner to execute.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            command: { type: "array", items: { type: "string" }, description: "Command argv array" },
-            working_directory: { type: "string" },
-            timeout_ms: { type: "number" },
-          },
-          required: ["command"],
-        },
-        toolKind: rawType === "local_shell" ? "local_shell" : "function",
+        inputSchema:
+          rawType === "shell"
+            ? {
+              type: "object",
+              properties: {
+                commands: { type: "array", items: { type: "string" }, description: "Shell command strings to execute" },
+                timeout_ms: { type: "number" },
+                max_output_length: { type: "number" },
+              },
+              required: ["commands"],
+            }
+            : {
+              type: "object",
+              properties: {
+                command: { type: "array", items: { type: "string" }, description: "Command argv array" },
+                working_directory: { type: "string" },
+                timeout_ms: { type: "number" },
+              },
+              required: ["command"],
+            },
+        toolKind: rawType === "local_shell" ? "local_shell" : "shell",
       });
     }
   }
@@ -492,7 +531,9 @@ export function parseResponsesRequest(
       if (
         itemType === "function_call_output" ||
         itemType === "custom_tool_call_output" ||
-        itemType === "local_shell_call_output"
+        itemType === "local_shell_call_output" ||
+        itemType === "shell_call_output" ||
+        itemType === "apply_patch_call_output"
       ) {
         hasToolResults = true;
         const callId = typeof item.call_id === "string" ? item.call_id.trim() : "";
@@ -502,12 +543,30 @@ export function parseResponsesRequest(
         if (typeof item.output === "string") {
           outStr = item.output;
         } else if (Array.isArray(item.output)) {
-          const parts = extractContentParts(item.output, allFiles.length);
-          outStr = parts.text;
-          outImages = parts.images;
-          outFiles = parts.files;
-          allImages.push(...outImages);
-          allFiles.push(...outFiles);
+          // Codex CLI GA `shell_call_output` entries have `{ stdout, stderr, outcome }`
+          const shellChunks = item.output
+            .map((entry) => {
+              if (!isRecord(entry) || !("stdout" in entry || "stderr" in entry)) return null;
+              const stdout = typeof entry.stdout === "string" ? entry.stdout : "";
+              const stderr = typeof entry.stderr === "string" ? entry.stderr : "";
+              const outcome = isRecord(entry.outcome) ? JSON.stringify(entry.outcome) : "";
+              return [stdout, stderr ? `[stderr]\n${stderr}` : "", outcome ? `[outcome] ${outcome}` : ""]
+                .filter(Boolean)
+                .join("\n");
+            })
+            .filter((s): s is string => s !== null);
+          if (shellChunks.length > 0) {
+            outStr = shellChunks.join("\n");
+          } else {
+            const parts = extractContentParts(item.output, allFiles.length);
+            outStr = parts.text;
+            outImages = parts.images;
+            outFiles = parts.files;
+            allImages.push(...outImages);
+            allFiles.push(...outFiles);
+          }
+        } else if (itemType === "apply_patch_call_output" && typeof item.status === "string") {
+          outStr = item.output ? JSON.stringify(item.output) : `status=${item.status}`;
         } else {
           outStr = JSON.stringify(item.output ?? "");
         }
@@ -531,15 +590,25 @@ export function parseResponsesRequest(
         });
         continue;
       }
-      if (itemType === "function_call" || itemType === "custom_tool_call" || itemType === "local_shell_call") {
+      if (
+        itemType === "function_call" ||
+        itemType === "custom_tool_call" ||
+        itemType === "local_shell_call" ||
+        itemType === "shell_call" ||
+        itemType === "apply_patch_call"
+      ) {
         trailingToolResults.length = 0;
         const callId = typeof item.call_id === "string" ? item.call_id : "";
         const rawName =
           itemType === "local_shell_call"
             ? "local_shell"
-            : typeof item.name === "string"
-              ? item.name
-              : "";
+            : itemType === "shell_call"
+              ? "shell"
+              : itemType === "apply_patch_call"
+                ? "apply_patch"
+                : typeof item.name === "string"
+                  ? item.name
+                  : "";
         const ns = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : "";
         const name = ns && rawName ? `${ns}__${rawName}` : rawName;
         const args =
@@ -547,11 +616,13 @@ export function parseResponsesRequest(
             ? typeof item.input === "string"
               ? item.input
               : JSON.stringify(item.input ?? "")
-            : itemType === "local_shell_call"
+            : itemType === "local_shell_call" || itemType === "shell_call"
               ? JSON.stringify(item.action ?? {})
-              : typeof item.arguments === "string"
-                ? item.arguments
-                : "{}";
+              : itemType === "apply_patch_call"
+                ? JSON.stringify(item.operation ?? item.input ?? {})
+                : typeof item.arguments === "string"
+                  ? item.arguments
+                  : "{}";
         const toolCallLine = `[ASSISTANT_TOOL_CALLS]:\n${name}(${args}) [id=${callId}]`;
         transcriptLines.push(toolCallLine);
         items.push({
@@ -564,9 +635,38 @@ export function parseResponsesRequest(
         });
         continue;
       }
+      if (itemType === "compaction") {
+        // Codex CLI / Responses API compaction summary item: preserve summary text if present.
+        const summary =
+          typeof item.summary === "string"
+            ? item.summary.trim()
+            : typeof item.encrypted_content === "string"
+              ? ""
+              : "";
+        if (summary) {
+          const line = `[USER]:\n[Compacted Context Summary]\n${summary}`;
+          transcriptLines.push(line);
+          items.push({ role: "user", text: summary, images: [], hasTools: false, formattedLine: line });
+        }
+        continue;
+      }
       if (itemType !== "message" && !("role" in item)) {
-        // reasoning / item_reference / web_search_call: carry no new input for the model.
-        if (itemType === "reasoning" || itemType === "item_reference" || itemType === "web_search_call") continue;
+        // Non-user/server-side Responses items carry no actionable client text to replay.
+        if (
+          itemType === "reasoning" ||
+          itemType === "item_reference" ||
+          itemType === "web_search_call" ||
+          itemType === "mcp_call" ||
+          itemType === "mcp_list_tools" ||
+          itemType === "mcp_approval_request" ||
+          itemType === "mcp_approval_response" ||
+          itemType === "code_interpreter_call" ||
+          itemType === "file_search_call" ||
+          itemType === "computer_call" ||
+          itemType === "computer_call_output"
+        ) {
+          continue;
+        }
         throw new GatewayError(
           `Unsupported input item type '${itemType}'. This gateway refuses to silently ignore it.`,
           400,
@@ -724,8 +824,17 @@ export const openAiChatAdapter: ProtocolAdapter = {
           : [{ index: 0, delta, finish_reason: finishReason }]
       };
       if (usageObj) payload.usage = usageObj;
+      else if (turn.includeStreamUsage) payload.usage = null;
       return `data: ${JSON.stringify(payload)}\n\n`;
     };
+
+    const fallbackMetrics = (): TurnTokenMetrics => ({
+      inputTokens: Math.max(1, turn.estimatedInputTokens || 1),
+      outputTokens: 1,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    });
+    const disableParallel = turn.rawBody?.parallel_tool_calls === false;
 
     let sentRole = false;
     let sentDone = false;
@@ -740,8 +849,9 @@ export const openAiChatAdapter: ProtocolAdapter = {
       } else if (ev.type === "text") {
         yield makeChunk({ content: ev.text });
       } else if (ev.type === "tool_calls") {
+        const calls = disableParallel ? ev.calls.slice(0, 1) : ev.calls;
         yield makeChunk({
-          tool_calls: ev.calls.map((tc, idx) => ({
+          tool_calls: calls.map((tc, idx) => ({
             index: idx,
             id: tc.id,
             type: "function",
@@ -757,12 +867,17 @@ export const openAiChatAdapter: ProtocolAdapter = {
           yield makeChunk({ role: "assistant", content: "" });
         }
         yield makeChunk({}, ev.stopReason);
-        if (lastMetrics && turn.includeStreamUsage) yield makeChunk({}, null, formatOpenAiUsageObject(lastMetrics));
+        if (turn.includeStreamUsage) {
+          yield makeChunk({}, null, formatOpenAiUsageObject(lastMetrics ?? fallbackMetrics()));
+        }
       }
     }
     if (!sentDone) {
       if (!sentRole) yield makeChunk({ role: "assistant", content: "" });
       yield makeChunk({}, "stop");
+      if (turn.includeStreamUsage) {
+        yield makeChunk({}, null, formatOpenAiUsageObject(lastMetrics ?? fallbackMetrics()));
+      }
     }
     yield "data: [DONE]\n\n";
   },
@@ -837,6 +952,26 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
             ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
           },
         });
+      } else if (kind === "shell") {
+        const rawCmds = tc.argsObject.commands ?? tc.argsObject.command;
+        const commands = Array.isArray(rawCmds)
+          ? rawCmds.map((x) => String(x))
+          : typeof rawCmds === "string"
+            ? [rawCmds]
+            : [];
+        output.push({
+          id: `sh_${crypto.randomUUID().replace(/-/g, "")}`,
+          type: "shell_call",
+          status: "completed",
+          call_id: tc.id,
+          action: {
+            commands,
+            ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
+            ...(typeof tc.argsObject.max_output_length === "number"
+              ? { max_output_length: tc.argsObject.max_output_length }
+              : {}),
+          },
+        });
       } else {
         output.push({
           id: `fc_${crypto.randomUUID().replace(/-/g, "")}`,
@@ -898,7 +1033,14 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
     let sawMessage = false;
     let sawToolCalls = false;
     let finalStopReason: "stop" | "tool_calls" | "length" = "stop";
-    let metrics: TurnTokenMetrics = { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 };
+    let metrics: TurnTokenMetrics = {
+      inputTokens: Math.max(1, turn.estimatedInputTokens || 1),
+      outputTokens: 1,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+    };
+    const disableParallel = turn.rawBody?.parallel_tool_calls === false;
+    let emittedCreated = false;
 
     const closeOpen = function* (): Generator<string> {
       if (!open) return;
@@ -948,13 +1090,14 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
     try {
       let step = await iter.next();
 
-      yield sse("response.created", { response: baseResponse("in_progress", []) });
-      yield sse("response.in_progress", { response: baseResponse("in_progress", []) });
+      emittedCreated = true;
+      yield sse("response.created", { response: baseResponse("in_progress", [], { error: null, incomplete_details: null }) });
+      yield sse("response.in_progress", { response: baseResponse("in_progress", [], { error: null, incomplete_details: null }) });
 
       while (!step.done) {
         const ev = step.value;
         if (ev.type === "thinking") {
-          if (ev.text) {
+          if (ev.text && !sawMessage && !sawToolCalls) {
             yield* openItem("reasoning");
             open!.text += ev.text;
             yield sse("response.reasoning_summary_text.delta", {
@@ -967,7 +1110,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
             open!.text += ev.text;
             fullText += ev.text;
             yield sse("response.output_text.delta", {
-              item_id: open!.id, output_index: open!.index, content_index: 0, delta: ev.text
+              item_id: open!.id, output_index: open!.index, content_index: 0, delta: ev.text, logprobs: []
             });
           }
         } else if (ev.type === "tool_calls") {
@@ -978,7 +1121,8 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
             toolMetaByName.set(t.name, t);
             if (t.wireName && !toolMetaByName.has(t.wireName)) toolMetaByName.set(t.wireName, t);
           }
-          for (const tc of ev.calls) {
+          const calls = disableParallel ? ev.calls.slice(0, 1) : ev.calls;
+          for (const tc of calls) {
             const index = output.length;
             const meta = toolMetaByName.get(tc.name);
             const kind = meta?.toolKind ?? "function";
@@ -1015,6 +1159,25 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
               yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
               output[index] = item;
               yield sse("response.output_item.done", { output_index: index, item });
+            } else if (kind === "shell") {
+              const id = newId("sh");
+              const rawCmds = tc.argsObject.commands ?? tc.argsObject.command;
+              const commands = Array.isArray(rawCmds)
+                ? rawCmds.map((x) => String(x))
+                : typeof rawCmds === "string"
+                  ? [rawCmds]
+                  : [];
+              const action = {
+                commands,
+                ...(typeof tc.argsObject.timeout_ms === "number" ? { timeout_ms: tc.argsObject.timeout_ms } : {}),
+                ...(typeof tc.argsObject.max_output_length === "number"
+                  ? { max_output_length: tc.argsObject.max_output_length }
+                  : {}),
+              };
+              const item = { id, type: "shell_call", call_id: tc.id, status: "completed", action };
+              yield sse("response.output_item.added", { output_index: index, item: { ...item, status: "in_progress" } });
+              output[index] = item;
+              yield sse("response.output_item.done", { output_index: index, item });
             } else {
               const id = newId("fc");
               const base = { id, type: "function_call", call_id: tc.id, name: wireName, ...nsField };
@@ -1033,6 +1196,25 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
         }
         step = await iter.next();
       }
+    } catch (streamErr) {
+      if (!emittedCreated) throw streamErr;
+      const gwErr = streamErr instanceof GatewayError
+        ? streamErr
+        : new GatewayError(streamErr instanceof Error ? streamErr.message : String(streamErr), 502, "upstream_error");
+      yield* closeOpen();
+      yield sse("response.failed", {
+        response: baseResponse("failed", output, {
+          error: { code: gwErr.code, message: gwErr.message },
+          incomplete_details: null,
+          output_text: fullText,
+        }),
+      });
+      yield sse("error", {
+        code: gwErr.code,
+        message: gwErr.message,
+        param: gwErr.param ?? null,
+      });
+      return;
     } finally {
       await iter.return?.().catch(() => undefined);
     }
@@ -1065,6 +1247,7 @@ export const openAiResponsesAdapter: ProtocolAdapter = {
       type: "error",
       code: err.code,
       message: err.message,
-      param: err.param ?? null
+      param: err.param ?? null,
+      sequence_number: 0,
     })}\n\n`
 };

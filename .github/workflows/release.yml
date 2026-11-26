@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -28,6 +28,17 @@ jobs:
           npm ci
           npm run typecheck
           npm test
+
+      - name: Build & attach hot-update bundle to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/build-update-bundle.mjs --out release-assets
+          gh release upload "${{ github.event.release.tag_name }}" \
+            release-assets/aws-quick2api-dist-v*.tar.gz \
+            release-assets/SHA256SUMS.txt \
+            --clobber
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

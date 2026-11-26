@@ -98,10 +98,10 @@ export interface ProtocolAdapter {
 /** Maps internal error codes onto the `type` vocabulary of the official OpenAI / Anthropic APIs (the precise code stays in `code`). */
 export function officialErrorType(err: { status: number; code: string }, flavor: "openai" | "anthropic"): string {
   const s = err.status;
-  if (s === 400 || s === 415 || s === 422) return "invalid_request_error";
+  if (s === 400 || s === 405 || s === 415 || s === 422) return "invalid_request_error";
   if (s === 401) return "authentication_error";
   if (s === 403) return "permission_error";
-  if (s === 404 || s === 405) return flavor === "anthropic" ? "not_found_error" : "invalid_request_error";
+  if (s === 404) return flavor === "anthropic" ? "not_found_error" : "invalid_request_error";
   if (s === 413) return flavor === "anthropic" ? "request_too_large" : "invalid_request_error";
   if (s === 429) return "rate_limit_error";
   if (s === 529 || err.code === "overloaded") return flavor === "anthropic" ? "overloaded_error" : "server_error";

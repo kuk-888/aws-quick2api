@@ -71,7 +71,7 @@ export class UsageTracker {
   }
 
   snapshot() {
-    const totalPrompt = this.totals.inputTokens + this.totals.cacheReadTokens;
+    const totalPrompt = this.totals.inputTokens + this.totals.cacheReadTokens + this.totals.cacheWriteTokens;
     const cacheHitRatePercent = totalPrompt > 0
       ? Number(((this.totals.cacheReadTokens / totalPrompt) * 100).toFixed(2))
       : 0;

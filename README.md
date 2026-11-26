@@ -155,9 +155,10 @@ docker compose up -d --build
 docker compose pull && docker compose up -d
 ```
 
-> **无损升级说明（账号、子密钥与账本均不会丢失）**：所有持久化数据均与程序目录解耦——已导入的 AWS 账号、代理、Agent 绑定与路由配置保存在宿主机 `.env`，网关子密钥（`gateway-keys.json`）、用量账本（`usage-ledger.json`）与管理会话保存在 `./data/`。新增配置项均带安全默认值，老用户升级无需重新配置：
-> - **Docker 用户**：保留 `./.env` 和 `./data`，直接执行 `docker compose pull && docker compose up -d` 即可无损升级；
-> - **源码用户**：保留 `.env` 和 `data/`，执行 `git pull && npm ci && npm run build` 后重启服务即可；
+> **无损升级与网页一键热更新（账号、子密钥与账本均不会丢失）**：所有运行态持久化数据均与程序代码/镜像解耦——账号池与路由配置原子保存在 `./data/pool-state.json`（低频增删改与 OAuth 轮换同时异步镜像回可写的 `.env` 兜底防丢），网关子密钥（`gateway-keys.json`）、模型开关（`model-access.json`）、用量账本（`usage-ledger.json`）与管理会话保存在 `./data/`：
+> - **网页一键热更新（Docker & 源码通用，无需 `docker.sock`）**：升级到含 `bootstrap.js` 引导器的新版本后（Docker 拉一次新镜像、源码通过 `npm start` 或 `node dist/src/bootstrap.js` 启动），后续版本可直接在 Web 管理台右上角点击版本胶囊 → **「一键更新并重启」**。内置强制 `SHA256SUMS.txt` 校验、原生依赖指纹 `depsHash` 保护、启动崩溃 5 秒自动回滚与手动一键回滚（仅当某次大版本变动 `sharp`/`ws` 等底层依赖时会自动拦截并引导执行终端命令）。
+> - **Docker 终端升级**：保留 `./.env` 和 `./data`，执行 `docker compose pull && docker compose up -d` 即可无损升级（升级后内置镜像版本 `>=` 热更缓存版时自动切换回镜像内置版）；
+> - **源码终端升级**：保留 `.env` 和 `data/`，执行 `git pull && npm ci && npm run build` 后重启服务（推荐 `npm start` / `node dist/src/bootstrap.js`）；
 > - **仅从 `<= v0.1.15` 升级 Docker 时一次性操作**：`v0.1.16+` 镜像已切换为非 root 用户（`node`，UID/GID `1000:1000`）运行并启用最小权限，若宿主机旧的 `./data` 或 `.env` 归 `root` 所有，首次升级前请执行一次 `chown -R 1000:1000 data .env`。
 
 - **Web 管理台**：`http://127.0.0.1:3456/dashboard`
@@ -184,11 +185,13 @@ docker compose pull && docker compose up -d
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | 桌面端版本号请求头覆盖 |
 | `HTTPS_PROXY` / `HTTP_PROXY` | - | 全局默认代理（单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独配置） |
+| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | 可选开关（管理台支持热切换，默认关闭以保证用户自定义 `system` 提示词 100% 原样透传）：重型 Agent 客户端（Claude Code / Cursor / Kilo / Antigravity / ZCode 等）遇 `smart` 频繁误拦或拒调本地工具时建议开启，自动柔化冲突身份声明与伪系统 XML 标签，完整保留业务规则正文 |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型润色最后一句提问并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | 防御性重述提示词模板（留空使用内置默认模板，可在管理台直接微调并一键恢复默认） |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | 仅用于短文本重述的辅助模型（`quick-fast` 或 `quick-balanced`），绝不替代最终回答模型 |
 | `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 多轮增量热复用的会话缓存时长（30 分钟）与上限 |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | 管理台新版本提示仓库（设为 `off` 关闭） |
+| `DISABLE_SELF_UPDATE` | `false` | 设为 `true` 可彻底禁用 Web 管理台一键热更新与回滚接口 |
 
 ---
 

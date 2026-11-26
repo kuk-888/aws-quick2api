@@ -40,12 +40,13 @@ import {
   isPrivateOrReservedIp,
   isPseudo200UsageLimitPrefix,
   isPseudo200UsageLimitText,
+  mapAttachmentUploadError,
   MAX_PARKED_WS_PER_SLOT,
   pinnedHttpGet,
   splitPromptIntoSafeChunks,
 } from "../src/core/engine.js";
 import { GatewayError } from "../src/core/types.js";
-import { findInsecurePlaceholderConfig, loadConfigFromEnv } from "../src/core/config.js";
+import { assertDataDirWritable, findInsecurePlaceholderConfig, loadConfigFromEnv } from "../src/core/config.js";
 import { UpstreamKeyPool, validateChatAgentId } from "../src/core/key-pool.js";
 import {
   buildToolBridgePrompt,
@@ -55,16 +56,37 @@ import {
 } from "../src/core/tool-bridge.js";
 import { StreamingUiTagSanitizer } from "../src/core/ui-tag-sanitizer.js";
 import {
+  openAiChatAdapter,
   openAiResponsesAdapter,
   parseChatCompletionsRequest,
   parseResponsesRequest,
 } from "../src/protocols/openai.js";
-import { anthropicMessagesAdapter, parseAnthropicMessagesRequest } from "../src/protocols/anthropic.js";
+import {
+  anthropicMessagesAdapter,
+  estimateAnthropicTokens,
+  parseAnthropicMessagesRequest,
+  stabilizeAnthropicUsage,
+} from "../src/protocols/anthropic.js";
 import { extendHashWithAssistantTurn, normalizeSystemPromptForHash } from "../src/utils/hash.js";
 import { AWS_QUICK_MODELS, formatOpenAiModelList, resolveModelSelection } from "../src/services/model-catalog.js";
 import { ClientGatewayKeyManager } from "../src/services/client-keys.js";
 import { checkLatestVersion } from "../src/services/update-checker.js";
-import { establishSocks5Tunnel, fetchViaOptionalProxy, maskProxyUrl, validateProxyUrl } from "../src/utils/proxy-agent.js";
+import { createTarGzBuffer, extractTarGzSafely } from "../src/services/tar-archive.js";
+import {
+  applySelfUpdate,
+  assertAllowedDownloadUrl,
+  computeRuntimeDepsHash,
+  ensureReleaseNodeModulesLink,
+  EXIT_CODE_SELF_UPDATE_RESTART,
+  getSelfUpdateCapability,
+  loadSelfUpdateState,
+  readBuiltinRuntimeInfo,
+  releaseDirForVersion,
+  rollbackSelfUpdate,
+  saveSelfUpdateState,
+} from "../src/services/self-updater.js";
+import { resolveBootTarget, runBootstrapSupervisor } from "../src/bootstrap.js";
+import { establishSocks5Tunnel, fetchViaOptionalProxy, getProxyAgent, maskProxyUrl, validateProxyUrl } from "../src/utils/proxy-agent.js";
 import { AdminAuthManager, isDirectLoopbackRequest } from "../src/web/admin-auth.js";
 import { tryHandleWebAdminRoute, type WebAdminContext } from "../src/web/admin-routes.js";
 import { renderDashboardHtml } from "../src/web/dashboard-ui.js";
@@ -1001,11 +1023,12 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.equal(pool.getSettings().autoEnsureCodingAgent, false);
       assert.equal(pool.getSettings().customAgentPrompt, "Line1\nLine2 custom prompt");
 
-      const envContent = fs.readFileSync(envPath, "utf8");
-      assert.ok(envContent.includes("CHAT_AGENT_ID=agent-global-002"));
-      assert.ok(envContent.includes("AUTO_ENSURE_CODING_AGENT=false"));
-      assert.ok(envContent.includes("CUSTOM_AGENT_PROMPT=Line1\\nLine2 custom prompt"));
-      assert.ok(envContent.includes(`"${slotA.slotId}":"agent-slot-a"`));
+      pool.flushStateToDisk();
+      const stateContent = fs.readFileSync(path.join(tmpDir, "pool-state.json"), "utf8");
+      assert.ok(stateContent.includes('"chatAgentId": "agent-global-002"'));
+      assert.ok(stateContent.includes('"autoEnsureCodingAgent": false'));
+      assert.ok(stateContent.includes("Line1\\nLine2 custom prompt"));
+      assert.ok(stateContent.includes(`"${slotA.slotId}": "agent-slot-a"`));
 
       // Clear per-account and global overrides cleanly & re-enable autoEnsureCodingAgent
       pool.updateSlotMeta(slotA.slotId, { chatAgentId: "" });
@@ -2147,11 +2170,20 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.equal(pool.getSettings().autoRephraseOnContentFilter, true);
       assert.equal(pool.getSettings().contentFilterRephrasePrompt, "Rule 1\nRule 2");
       assert.equal(pool.getSettings().contentFilterRephraseModel, "quick-balanced");
+      pool.dispose();
 
-      const envContent = fs.readFileSync(envFile, "utf8");
-      assert.ok(envContent.includes("AUTO_REPHRASE_ON_CONTENT_FILTER=true"));
-      assert.ok(envContent.includes("CONTENT_FILTER_REPHRASE_PROMPT=Rule 1\\nRule 2"));
-      assert.ok(envContent.includes("CONTENT_FILTER_REPHRASE_MODEL=quick-balanced"));
+      // Persisted atomically to `${dataDir}/pool-state.json` without rewriting `.env`
+      const poolStatePath = path.join(tmpDir, "pool-state.json");
+      const persistedJson = JSON.parse(fs.readFileSync(poolStatePath, "utf8")) as Record<string, unknown>;
+      assert.equal(persistedJson.autoRephraseOnContentFilter, true);
+      assert.equal(persistedJson.contentFilterRephrasePrompt, "Rule 1\nRule 2");
+      assert.equal(persistedJson.contentFilterRephraseModel, "quick-balanced");
+
+      const poolReloaded = new UpstreamKeyPool(cfg);
+      assert.equal(poolReloaded.getSettings().autoRephraseOnContentFilter, true);
+      assert.equal(poolReloaded.getSettings().contentFilterRephrasePrompt, "Rule 1\nRule 2");
+      assert.equal(poolReloaded.getSettings().contentFilterRephraseModel, "quick-balanced");
+      poolReloaded.dispose();
 
       const reloaded = loadConfigFromEnv(
         {
@@ -3378,17 +3410,12 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.equal(rotated, true);
       pool1.dispose();
 
-      // Reload from disk `.env` simulating process restart
-      const envText = readFileSync(envPath, "utf8");
-      const parsedEnv: Record<string, string> = {};
-      for (const line of envText.split(/\r?\n/)) {
-        const eq = line.indexOf("=");
-        if (eq > 0) parsedEnv[line.slice(0, eq)] = line.slice(eq + 1);
-      }
-      const cfg2 = loadConfigFromEnv(parsedEnv, envPath);
+      // Reload from disk simulating process restart (`.env` still has old `aor_rot_v1`, `pool-state.json` holds `aor_rot_v2`)
+      const cfg2 = loadConfigFromEnv({ QUICK_TOKENS: origOAuth }, envPath);
       const pool2 = new UpstreamKeyPool(cfg2);
       const slotAfter = pool2.statusSnapshot()[0]!;
       const reloadedCred = parseOAuthCredential(pool2.allManagedKeys()[0]!.rawKey);
+      assert.equal(pool2.allManagedKeys().length, 1, "old .env token must NOT be re-imported after rotation");
       assert.equal(reloadedCred?.refreshToken, "aor_rot_v2", "rotated refreshToken must survive restart");
       assert.equal(slotAfter.label, "Prod-US", "slot label must survive refreshToken rotation");
       assert.equal(slotAfter.chatAgentId, "agent-custom-1", "slot chatAgentId must survive refreshToken rotation");
@@ -3734,6 +3761,1053 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       assert.equal(r3.stats.warmIdleSessions, 0, "turn_aborted must NEVER park the WS for reuse");
     } finally {
       await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it("hardens Codex/Claude protocols, 6-file multi-turn, UI sanitizer, SSE error/usage parity, and 100-account pool resilience", async () => {
+    // 1) Codex CLI shell_call / shell_call_output / apply_patch_call / compaction & namespaced custom schema
+    const codexTurn = parseResponsesRequest({
+      model: "quick-balanced",
+      tools: [
+        { type: "shell" },
+        { type: "apply_patch" },
+        { type: "namespace", name: "mcp__patch", tools: [{ type: "custom", name: "edit_raw", description: "raw edit" }] },
+      ],
+      input: [
+        { role: "user", content: "list files" },
+        { type: "shell_call", call_id: "call_sh_1", action: { commands: ["ls -la"] } },
+        { type: "shell_call_output", call_id: "call_sh_1", output: [{ stdout: "README.md\n", stderr: "", outcome: { type: "exit", exit_code: 0 } }] },
+        { type: "apply_patch_call", call_id: "call_ap_1", operation: { type: "update_file", path: "a.txt" } },
+        { type: "apply_patch_call_output", call_id: "call_ap_1", status: "completed" },
+        { type: "compaction", summary: "Prior repo overview" },
+        { type: "mcp_list_tools" },
+      ],
+    });
+    assert.equal(codexTurn.tools.find((t) => t.name === "shell")?.toolKind, "shell");
+    assert.equal(codexTurn.tools.find((t) => t.name === "apply_patch")?.toolKind, "custom");
+    assert.deepEqual(
+      codexTurn.tools.find((t) => t.name === "mcp__patch__edit_raw")?.inputSchema,
+      { type: "object", properties: { input: { type: "string", description: "Raw tool input text payload" } }, required: ["input"] },
+    );
+    assert.ok(codexTurn.fullTranscriptText.includes("README.md"));
+    assert.ok(codexTurn.fullTranscriptText.includes("Prior repo overview"));
+
+    // Custom tool raw-string arguments recovery (Codex apply_patch)
+    const rawPatchParsed = parseToolCallsFromText(
+      `<tool_call>{"name":"apply_patch","arguments":"*** Begin Patch\\n*** End Patch"}</tool_call>`,
+      new Set(["apply_patch"]),
+      new Set(["apply_patch"]),
+    );
+    assert.equal(rawPatchParsed.toolCalls.length, 1);
+    assert.equal(rawPatchParsed.toolCalls[0]?.argsObject.input, "*** Begin Patch\n*** End Patch");
+
+    // 2) Claude Code tool_search_tool_result, output_config.format 400, image-only tool_result, CJK count_tokens & model-scoped watermark
+    const ccTurn = parseAnthropicMessagesRequest({
+      model: "quick-balanced",
+      max_tokens: 64,
+      tools: [
+        { type: "tool_search_tool_regex_20251119", name: "tool_search_tool_regex" },
+        { name: "Read", description: "read", input_schema: { type: "object", properties: { path: { type: "string" } } } },
+      ],
+      messages: [
+        { role: "user", content: "find tools" },
+        { role: "assistant", content: [{ type: "server_tool_use", id: "srv_1", name: "tool_search_tool_regex", input: { query: "git" } }] },
+        { role: "user", content: [{ type: "tool_search_tool_result", tool_use_id: "srv_1", content: { type: "tool_search_tool_search_result", tool_references: [] } }] },
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { path: "screen.png" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } }] }] },
+      ],
+    });
+    assert.equal(ccTurn.tools.length, 1, "server built-in tool_search_tool_regex must not become a fake custom tool");
+    assert.ok(ccTurn.incrementalUserText?.includes("[Image attached (1)]"), "image-only tool_result must not say [empty]");
+    assert.throws(
+      () =>
+        parseAnthropicMessagesRequest({
+          model: "quick-balanced",
+          max_tokens: 64,
+          output_config: { format: { type: "json_schema", schema: { type: "object" } } },
+          messages: [{ role: "user", content: "hi" }],
+        }),
+      (e: unknown) => e instanceof GatewayError && e.status === 400 && e.code === "unsupported_parameter",
+    );
+    const cjkText = "这是一个用于测试中文上下文估算准确性的句子。".repeat(200);
+    assert.ok(estimateAnthropicTokens({ messages: [{ role: "user", content: cjkText }] }) > 2000);
+    const wmSid = `wm-iso-${Date.now()}`;
+    const sonnetTurn = parseAnthropicMessagesRequest(
+      { model: "quick-balanced", max_tokens: 64, messages: [{ role: "user", content: "a".repeat(20_000) }] },
+      { "x-session-id": wmSid },
+    );
+    stabilizeAnthropicUsage({ inputTokens: 100, outputTokens: 20, cacheReadTokens: 60_000, cacheWriteTokens: 0 }, sonnetTurn);
+    const haikuSide = parseAnthropicMessagesRequest(
+      { model: "quick-fast", max_tokens: 32, messages: [{ role: "user", content: "3-word title" }] },
+      { "x-session-id": wmSid },
+    );
+    stabilizeAnthropicUsage({ inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0 }, haikuSide);
+    const sonnetNext = stabilizeAnthropicUsage({ inputTokens: 100, outputTokens: 20, cacheReadTokens: 5_000, cacheWriteTokens: 0 }, sonnetTurn);
+    assert.ok(
+      sonnetNext.input_tokens + sonnetNext.cache_read_input_tokens >= 60_100,
+      "Haiku side-call on same x-session-id must NOT wipe Sonnet watermark",
+    );
+
+    // 3) 6 cumulative PDFs -> Turn 3 plain text keeps incrementalFiles=[] instead of undefined
+    const tinyPdfB64 = Buffer.from("%PDF-1.4\n%%EOF").toString("base64");
+    const mkPdf = (n: number) => ({ type: "document", title: `f_${n}.pdf`, source: { type: "base64", media_type: "application/pdf", data: tinyPdfB64 } });
+    const sixPdfTurn = parseAnthropicMessagesRequest({
+      model: "quick-fast",
+      max_tokens: 32,
+      messages: [
+        { role: "user", content: [mkPdf(1), mkPdf(2), mkPdf(3), { type: "text", text: "t1" }] },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: [mkPdf(4), mkPdf(5), mkPdf(6), { type: "text", text: "t2" }] },
+        { role: "assistant", content: "ok" },
+        { role: "user", content: "t3 plain text" },
+      ],
+    });
+    assert.equal(sixPdfTurn.files?.length, 6);
+    assert.deepEqual(sixPdfTurn.incrementalFiles, []);
+
+    // 4) UI tag sanitizer: indented fence split & `>` inside quoted attribute
+    const sanFence = new StreamingUiTagSanitizer();
+    const fenceOut = sanFence.feed("Example:\n  ") + sanFence.feed('```\n<artifact type="image" src="https://example.com/a.png"/>\n```\n') + sanFence.flush();
+    assert.ok(!fenceOut.includes("![image]"), "indented fenced code block must not be corrupted across chunk boundary");
+    const sanGt = new StreamingUiTagSanitizer();
+    const gtStreamed = sanGt.feed('<artifact title="A -> B" type="image" src="https://example.com/a.png"/> hello world') + sanGt.flush();
+    assert.ok(gtStreamed.includes("hello world") && gtStreamed.includes("https://example.com/a.png"));
+
+    // 5) OpenAI Chat include_usage fallback & Responses SSE response.failed with sequence_number
+    const chatTurn = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    const chatChunks: string[] = [];
+    for await (const c of openAiChatAdapter.streamSse(
+      (async function* () {
+        yield { type: "text" as const, text: "hello" };
+        yield { type: "done" as const, stopReason: "stop" as const };
+      })(),
+      chatTurn,
+    )) {
+      chatChunks.push(c);
+    }
+    const parsedChatChunks = chatChunks
+      .filter((s) => s.startsWith("data: {"))
+      .map((s) => JSON.parse(s.slice(6)) as Record<string, unknown>);
+    assert.equal(parsedChatChunks[0]?.usage, null, "include_usage=true must set usage:null on intermediate chunks");
+    assert.ok(parsedChatChunks.some((c) => c.usage && typeof c.usage === "object"), "include_usage=true must emit fallback usage chunk even if turn_usage omitted");
+
+    const respTurn = parseResponsesRequest({ model: "quick-balanced", stream: true, input: "hi" });
+    const respSse: string[] = [];
+    for await (const frame of openAiResponsesAdapter.streamSse(
+      (async function* () {
+        yield { type: "text" as const, text: "partial" };
+        throw new GatewayError("upstream hiccup", 502, "upstream_error");
+      })(),
+      respTurn,
+    )) {
+      respSse.push(frame);
+    }
+    assert.ok(respSse.some((f) => f.includes("event: response.failed")), "Responses SSE must emit response.failed on mid-stream error");
+    const errFrame = respSse.find((f) => f.includes("event: error"));
+    assert.ok(errFrame && errFrame.includes('"sequence_number":'), "Responses SSE error frame must include sequence_number");
+
+    // 6) Model catalog case-insensitive bracket & advanced-off clamp; AbortError -> 499; 405 officialErrorType
+    assert.equal(resolveModelSelection("quick-smart[Effort=max]", {}).selection.thinkingEffort, "max");
+    assert.equal(resolveModelSelection("quick-advanced-off", {}).selection.thinkingEffort, "high");
+    const abortMapped = mapAttachmentUploadError(new DOMException("This operation was aborted", "AbortError"), "upload");
+    assert.equal(abortMapped.status, 499);
+    assert.equal(abortMapped.code, "client_aborted");
+
+    // 7) 100-account resilience: proxy-agent does not destroy live agents at 70+, slotWaiters wakes immediately on last-slot disable, 429 burst dedup
+    const agent1 = getProxyAgent("http://127.0.0.1:19001")!;
+    let destroyed1 = false;
+    const origDestroy = agent1.destroy.bind(agent1);
+    agent1.destroy = (...args: Parameters<typeof origDestroy>) => {
+      destroyed1 = true;
+      return origDestroy(...args);
+    };
+    for (let i = 2; i <= 75; i++) getProxyAgent(`http://127.0.0.1:${19000 + i}`);
+    assert.equal(destroyed1, false, "proxy agent cache must NOT destroy active agents at 75 distinct proxies");
+
+    const pool = new UpstreamKeyPool({
+      quickTokens: ["acct-single-1"],
+      disabledQuickTokens: [],
+      keyLabels: {},
+      keyAutoDisabled: {},
+      keyProxies: {},
+      keyChatAgentIds: {},
+      keyAddedAt: {},
+      lbStrategy: "quota-aware",
+      sessionAffinityEnabled: true,
+      sessionAffinityTtlMs: 60_000,
+      autoDisableExhaustedKeys: true,
+      incognitoMode: true,
+      keyCooldownMs: 30_000,
+      maxInflightPerSlot: 1,
+      envFilePath: "",
+    });
+    const l1 = await pool.leaseKeyWithWait("quick-balanced", undefined, undefined, { maxWaitMs: 1000 });
+    const t0 = Date.now();
+    const waitErrPromise = pool
+      .leaseKeyWithWait("quick-balanced", undefined, undefined, { maxWaitMs: 1500 })
+      .catch((e) => e as unknown);
+    await new Promise((r) => setTimeout(r, 40));
+    pool.reportQuotaExhausted("acct-single-1", "auto", "5h limit");
+    l1.release();
+    const waitErr = await waitErrPromise;
+    const waitedMs = Date.now() - t0;
+    assert.ok(waitErr instanceof GatewayError, "waiter should fail with GatewayError");
+    assert.equal(waitErr.status, 503);
+    assert.ok(waitedMs < 500, `slotWaiter must wake immediately when last slot disables (waited ${waitedMs}ms)`);
+    assert.ok((waitErr.retryAfter ?? 0) >= 60, "5h quota-disabled pool must surface dynamic retryAfter");
+
+    const burstPool = new UpstreamKeyPool({
+      quickTokens: ["acct-burst-1"],
+      disabledQuickTokens: [],
+      keyLabels: {},
+      keyAutoDisabled: {},
+      keyProxies: {},
+      keyChatAgentIds: {},
+      keyAddedAt: {},
+      lbStrategy: "quota-aware",
+      sessionAffinityEnabled: false,
+      sessionAffinityTtlMs: 60_000,
+      autoDisableExhaustedKeys: true,
+      incognitoMode: true,
+      keyCooldownMs: 30_000,
+      maxInflightPerSlot: 4,
+      envFilePath: "",
+    });
+    const burstNow = Date.now();
+    for (let i = 0; i < 4; i++) burstPool.reportRateLimit("acct-burst-1");
+    const burstErr = await burstPool.leaseKeyWithWait("quick-balanced", undefined, undefined, { maxWaitMs: 100 }).catch((e) => e as unknown);
+    assert.ok(burstErr instanceof GatewayError, "burstPool should fail with GatewayError");
+    assert.equal(burstErr.status, 429);
+    assert.ok(
+      (burstErr.retryAfter ?? 0) >= 20 && (burstErr.retryAfter ?? 0) <= 45,
+      `4 simultaneous 429s must deduplicate to 1x (~30s) backoff, got retryAfter=${burstErr.retryAfter}s (elapsed ${Date.now() - burstNow}ms)`,
+    );
+  });
+
+  it("splits runtime state into data/pool-state.json with debounced async atomic writes, read-only .env safety, and smart .env merge", async () => {
+    const fs = await import("node:fs");
+    const { ModelAccessController } = await import("../src/services/model-access.js");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-pool-state-"));
+    const dataDir = path.join(tmpDir, "data");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const envPath = path.join(tmpDir, ".env");
+    const k1 = "ws1.example.com|tok_seed_1";
+    const k2 = "ws2.example.com|tok_seed_2";
+    const k3 = "ws3.example.com|tok_manual_new_3";
+    const initialEnv = `QUICK_TOKENS=${k1},${k2}\nINCOGNITO=true\nDISABLED_MODELS=quick-advanced\n`;
+    writeFileSync(envPath, initialEnv, "utf8");
+    // Simulate read-only Docker bind mount (`./.env:/app/.env:ro` or `0644 root:root`)
+    fs.chmodSync(envPath, 0o444);
+
+    try {
+      // 1) First boot: auto-migrates from read-only `.env` into `data/pool-state.json` without touching `.env`
+      const cfg1 = loadConfigFromEnv(
+        { QUICK_TOKENS: `${k1},${k2}`, INCOGNITO: "true", DISABLED_MODELS: "quick-advanced", DATA_DIR: dataDir },
+        envPath,
+      );
+      const pool1 = new UpstreamKeyPool(cfg1);
+      assert.equal(pool1.allManagedKeys().length, 2);
+      assert.equal(readFileSync(envPath, "utf8"), initialEnv, "read-only .env must never be modified");
+      assert.ok(fs.existsSync(path.join(dataDir, "pool-state.json")), "pool-state.json must be created on migration");
+
+      // 2) Debounced async write coalescing: 100 rapid additions coalesce into <= 2 disk writes (not 100!)
+      const writesBefore = pool1.getPoolStateWriteCount();
+      for (let i = 0; i < 100; i++) {
+        pool1.addKey(`ws-batch-${i}.example.com|tok_batch_${i}`, true, `Batch-${i}`);
+      }
+      await pool1.flushStateAsync();
+      const writesAfter = pool1.getPoolStateWriteCount();
+      assert.ok(writesAfter - writesBefore <= 2, `100 rapid mutations must coalesce (got ${writesAfter - writesBefore} writes)`);
+
+      // Delete k1 (from `.env` seed) and toggle setting
+      const k1Slot = pool1.allManagedKeys().find((k) => k.rawKey === k1)!;
+      pool1.removeKey(k1Slot.slotId);
+      pool1.updateSettings({ incognitoMode: false });
+      pool1.dispose();
+
+      // 3) Restart with `.env` STILL containing deleted k1 + a BRAND NEW manually added k3:
+      //    k1 stays deleted, all 100 console-added keys + k2 survive, AND brand-new k3 auto-imports!
+      const cfg2 = loadConfigFromEnv(
+        { QUICK_TOKENS: `${k1},${k2},${k3}`, INCOGNITO: "true", DATA_DIR: dataDir },
+        envPath,
+      );
+      const pool2 = new UpstreamKeyPool(cfg2);
+      const keys2 = pool2.allManagedKeys().map((k) => k.rawKey);
+      assert.ok(!keys2.includes(k1), "deleted .env-seeded key must stay deleted across restart");
+      assert.ok(keys2.includes(k2), "retained .env key must survive");
+      assert.ok(keys2.includes(k3), "brand-new manually added .env key must auto-import on restart");
+      assert.equal(keys2.length, 102, "100 console keys + k2 + new k3 = 102");
+      assert.equal(pool2.getSettings().incognitoMode, false, "runtime setting from pool-state.json must survive restart");
+      pool2.dispose();
+
+      // 4) ModelAccessController & AdminAuthManager also persist inside `dataDir` with read-only `.env`
+      const ma1 = new ModelAccessController({ disabledModels: ["quick-advanced"], envFilePath: envPath, dataDir });
+      ma1.applyBatchUpdate({ action: "disable", models: ["quick-fast"] });
+      const ma2 = new ModelAccessController({ disabledModels: ["quick-advanced"], envFilePath: envPath, dataDir });
+      assert.deepEqual(ma2.disabledSnapshot(), ["quick-advanced", "quick-fast"]);
+
+      const auth1 = new AdminAuthManager({ adminPassword: undefined, envFilePath: envPath, dataDir });
+      auth1.setupInitialPassword("StrongPass123!");
+      const auth2 = new AdminAuthManager({ adminPassword: undefined, envFilePath: envPath, dataDir });
+      assert.equal(auth2.isPasswordConfigured(), true);
+      assert.ok(auth2.verifyPasswordAndIssueSession("StrongPass123!").token.startsWith("adm_"));
+    } finally {
+      try { fs.chmodSync(envPath, 0o600); } catch { }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("defers flushEarly timer until OOB upload finishes and resets timer across account failovers", async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-flush-oob-"));
+    const cfg = loadConfigFromEnv({
+      HOST: "127.0.0.1",
+      PORT: "0",
+      GATEWAY_TOKEN: "sk-aq-test-real-token-9876543210",
+      QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+      DATA_DIR: tmpDir,
+      ENV_FILE_PATH: path.join(tmpDir, ".env"),
+      ENABLE_DASHBOARD: "false",
+    });
+    const gw = createGatewayServer({ config: cfg, flushEarlyDelayMs: 60 });
+    let scenario: "oob_429" | "failover_reset_502" | "slow_inference_ok" = "oob_429";
+
+    (gw.engine as unknown as { executeTurnWithPool: typeof gw.engine.executeTurnWithPool }).executeTurnWithPool =
+      async function* (_turn, _pool, onExecMeta) {
+        if (scenario === "oob_429") {
+          // OOB upload starts: flushEarlyReady=false keeps timer disarmed even if upload exceeds 60ms threshold
+          onExecMeta?.({ slotId: "slot-1", maskedKey: "oauth:s1***", execMode: "incognito", flushEarlyReady: false });
+          await new Promise((r) => setTimeout(r, 110));
+          throw new GatewayError("OOB upload throttled (429)", 429, "rate_limit_exceeded", undefined, 12);
+        }
+        if (scenario === "failover_reset_502") {
+          // Attempt 0 finishes OOB + arms 60ms timer, then fails over at 35ms to Attempt 1 (disarming timer)
+          onExecMeta?.({ slotId: "slot-1", maskedKey: "oauth:s1***", execMode: "incognito", flushEarlyReady: true });
+          await new Promise((r) => setTimeout(r, 35));
+          // Attempt 1 begins OOB upload -> disarms Attempt 0's timer so >60ms total elapsed still returns real HTTP 502!
+          onExecMeta?.({ slotId: "slot-2", maskedKey: "oauth:s2***", execMode: "incognito", flushEarlyReady: false });
+          await new Promise((r) => setTimeout(r, 90));
+          throw new GatewayError("Attempt 1 OOB upload failed (502)", 502, "upstream_error");
+        }
+        // Slow inference AFTER OOB completes (`flushEarlyReady: true`): >60ms commits HTTP 200 `: keepalive` then streams
+        onExecMeta?.({ slotId: "slot-1", maskedKey: "oauth:s1***", execMode: "incognito", flushEarlyReady: false });
+        await new Promise((r) => setTimeout(r, 20));
+        onExecMeta?.({ slotId: "slot-1", maskedKey: "oauth:s1***", execMode: "incognito", flushEarlyReady: true });
+        await new Promise((r) => setTimeout(r, 100));
+        yield { type: "text", text: "Completed after keepalive." };
+        yield { type: "done", stopReason: "stop" };
+      };
+
+    await new Promise<void>((resolve) => gw.server.listen(0, "127.0.0.1", resolve));
+    const addr = gw.server.address();
+    assert.ok(addr && typeof addr === "object");
+    const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      const sendReq = () =>
+        fetch(`${baseUrl}/v1/messages`, {
+          method: "POST",
+          headers: {
+            "x-api-key": "sk-aq-test-real-token-9876543210",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            model: "quick-balanced",
+            max_tokens: 128,
+            stream: true,
+            tools: [{ name: "Read", description: "Read", input_schema: { type: "object", properties: {} } }],
+            messages: [{ role: "user", content: "big context" }],
+          }),
+        });
+
+      // 1) Slow OOB upload (>60ms) failing with 429 must return real HTTP 429 JSON + Retry-After: 12
+      scenario = "oob_429";
+      const r1 = await sendReq();
+      assert.equal(r1.status, 429, "slow OOB upload 429 must NOT be swallowed into HTTP 200 SSE");
+      assert.equal(r1.headers.get("retry-after"), "12");
+      assert.ok((r1.headers.get("content-type") || "").includes("application/json"));
+
+      // 2) Failover cancels Attempt 0's 60ms timer so Attempt 1's 90ms OOB upload failing with 502 stays real HTTP 502
+      scenario = "failover_reset_502";
+      const r2 = await sendReq();
+      assert.equal(r2.status, 502, "Attempt 0 flushEarly timer must be cancelled on failover to Attempt 1");
+      assert.ok((r2.headers.get("content-type") || "").includes("application/json"));
+
+      // 3) Once armed (`flushEarlyReady: true`), >60ms slow inference emits `: keepalive` on HTTP 200 and streams normally
+      scenario = "slow_inference_ok";
+      const r3 = await sendReq();
+      assert.equal(r3.status, 200);
+      const body3 = await r3.text();
+      assert.ok(body3.includes(": keepalive\n\n"), "armed flushEarly must emit : keepalive before slow first token");
+      assert.ok(body3.includes("Completed after keepalive."));
+    } finally {
+      await gw.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("zero-account-loss defense: mirrors structural edits to writable .env, skips high-frequency quota churn, and fail-fast probes dataDir", async () => {
+    const fs = await import("node:fs");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-zero-loss-"));
+    const dataDir = path.join(tmpDir, "data");
+    fs.mkdirSync(dataDir, { recursive: true });
+    const envPath = path.join(tmpDir, ".env");
+    const oauthInitial = serializeOAuthCredential({
+      region: "us-east-1",
+      issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+      wsHost: "us-east-1.quick.aws.com",
+      clientId: "cid-zero-loss",
+      clientSecret: "csec-zero-loss",
+      refreshToken: "rt-old-1",
+      accessToken: "at-1",
+      expiresAt: Date.now() + 3600_000,
+      email: "a@example.com",
+    });
+    const kSeed = "ws-seed.example.com|tok_seed";
+    const kConsole = "ws-console.example.com|tok_console_added";
+    writeFileSync(envPath, `QUICK_TOKENS=${kSeed},${oauthInitial}\nINCOGNITO=true\n`, "utf8");
+
+    try {
+      const cfg1 = loadConfigFromEnv(
+        { QUICK_TOKENS: `${kSeed},${oauthInitial}`, INCOGNITO: "true", DATA_DIR: dataDir },
+        envPath,
+      );
+      const pool1 = new UpstreamKeyPool(cfg1);
+
+      // Structural edits: add a new account in Web Console + rotate OAuth refresh token
+      pool1.addKey(kConsole, true, "ConsoleAdded");
+      const rotated = pool1.rotateOAuthRefreshToken("cid-zero-loss", "rt-rotated-2", "at-2", Date.now() + 7200_000);
+      assert.equal(rotated, true);
+      await pool1.flushStateAsync();
+
+      const mirrorsAfterStructural = pool1.getEnvMirrorWriteCount();
+      assert.ok(mirrorsAfterStructural >= 1, "structural edits must mirror to writable .env");
+
+      // High-frequency runtime churn (quota exhaustion) must persist to pool-state.json WITHOUT hammering .env
+      const poolWritesBeforeQuota = pool1.getPoolStateWriteCount();
+      pool1.reportQuotaExhausted(kSeed, "quick-smart", "Usage limit reached");
+      await pool1.flushStateAsync();
+      assert.ok(pool1.getPoolStateWriteCount() > poolWritesBeforeQuota, "quota trip must persist to pool-state.json");
+      assert.equal(
+        pool1.getEnvMirrorWriteCount(),
+        mirrorsAfterStructural,
+        "high-frequency quota churn must NOT rewrite .env",
+      );
+      pool1.dispose();
+
+      // Simulate Edge Case 1 (unmounted `/app/data` wiped on container recreate) AND Edge Case 3 (downgrade to `.env`-only):
+      // Delete `data/pool-state.json` completely and reload strictly from `.env`!
+      rmSync(path.join(dataDir, "pool-state.json"), { force: true });
+      const envLines = Object.fromEntries(
+        readFileSync(envPath, "utf8")
+          .split(/\r?\n/)
+          .filter((l) => l.includes("=") && !l.trim().startsWith("#"))
+          .map((l) => {
+            const idx = l.indexOf("=");
+            return [l.slice(0, idx).trim(), l.slice(idx + 1).trim()];
+          }),
+      );
+      const cfgRecovered = loadConfigFromEnv({ ...envLines, DATA_DIR: dataDir }, envPath);
+      const poolRecovered = new UpstreamKeyPool(cfgRecovered);
+      const recoveredKeys = poolRecovered.allManagedKeys().map((k) => k.rawKey);
+      assert.ok(recoveredKeys.includes(kSeed), "seed key must survive");
+      assert.ok(recoveredKeys.includes(kConsole), "console-added key must survive even if data/ was wiped or downgraded");
+      assert.ok(
+        recoveredKeys.some((k) => k.startsWith("oauth:") && parseOAuthCredential(k)?.refreshToken === "rt-rotated-2"),
+        "rotated OAuth refresh token must survive in .env even if data/ was wiped or downgraded",
+      );
+      poolRecovered.dispose();
+
+      // Simulate Edge Case 2 (Docker host `./data` owned by root:root 0755 -> EACCES):
+      // `assertDataDirWritable` must fail fast instead of silently swallowing writes.
+      const roDir = path.join(tmpDir, "ro-data");
+      fs.mkdirSync(roDir, { recursive: true });
+      fs.chmodSync(roDir, 0o555);
+      const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
+      if (!isRoot) {
+        assert.throws(
+          () => assertDataDirWritable(roDir),
+          (err: unknown) => (err as NodeJS.ErrnoException)?.code === "EACCES",
+          "assertDataDirWritable must throw EACCES immediately on non-writable dataDir",
+        );
+      }
+      fs.chmodSync(roDir, 0o700);
+      assert.doesNotThrow(() => assertDataDirWritable(roDir));
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Web self-update (Option A): safe tar-gz, SHA-256 + depsHash gates, real bootstrap hot-restart & crash auto-rollback", async () => {
+    const fs = await import("node:fs");
+    const crypto = await import("node:crypto");
+    const zlib = await import("node:zlib");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aq2a-self-update-"));
+    const dataDir = path.join(tmpDir, "data");
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    try {
+      // 1) Pure-Node tar-gz safety: long USTAR paths round-trip; traversal & symlinks rejected
+      const longRel = "dist/src/sub/" + "a".repeat(60) + "/" + "b".repeat(50) + ".js";
+      const okGz = createTarGzBuffer([
+        { path: "package.json", content: Buffer.from('{"version":"9.9.9"}\n') },
+        { path: longRel, content: Buffer.from("export const ok = true;\n") },
+      ]);
+      const extractDir = path.join(tmpDir, "extract-ok");
+      const files = extractTarGzSafely(okGz, extractDir);
+      assert.deepEqual(files, ["package.json", longRel]);
+      assert.equal(readFileSync(path.join(extractDir, longRel), "utf8"), "export const ok = true;\n");
+
+      // Craft malicious symlink tar entry and verify strict rejection
+      const evilHeader = Buffer.alloc(512, 0);
+      evilHeader.write("dist/src/evil.js", 0, 100, "utf8");
+      evilHeader.write("0000777\0", 100, 8, "ascii");
+      evilHeader.write("0000000\0", 108, 8, "ascii");
+      evilHeader.write("0000000\0", 116, 8, "ascii");
+      evilHeader.write("00000000000\0", 124, 12, "ascii");
+      evilHeader.write("00000000000\0", 136, 12, "ascii");
+      evilHeader.fill(0x20, 148, 156);
+      evilHeader.write("2", 156, 1, "ascii"); // symlink!
+      evilHeader.write("ustar\0", 257, 6, "ascii");
+      evilHeader.write("00", 263, 2, "ascii");
+      let chk = 0;
+      for (let i = 0; i < 512; i += 1) chk += evilHeader[i]!;
+      evilHeader.write(chk.toString(8).padStart(6, "0"), 148, 6, "ascii");
+      evilHeader[154] = 0;
+      evilHeader[155] = 0x20;
+      const evilGz = zlib.gzipSync(Buffer.concat([evilHeader, Buffer.alloc(1024, 0)]));
+      assert.throws(() => extractTarGzSafely(evilGz, path.join(tmpDir, "extract-evil")), /Unsupported tar entry type/);
+
+      // Untrusted download host rejected (anti-SSRF / anti-RCE)
+      assert.throws(() => assertAllowedDownloadUrl("https://evil.example.com/bundle.tar.gz"), /untrusted host/i);
+      assert.doesNotThrow(() =>
+        assertAllowedDownloadUrl("https://github.com/kuk-888/aws-quick2api/releases/download/v0.1.21/aws-quick2api-dist-v0.1.21.tar.gz"),
+      );
+
+      // 2) Self-update gates: checksum mismatch, depsHash mismatch, DISABLE_SELF_UPDATE, and happy-path + rollback
+      const builtin = readBuiltinRuntimeInfo();
+      const buildMockBundle = (ver: string, depsHash: string) => {
+        const gz = createTarGzBuffer([
+          {
+            path: "update-manifest.json",
+            content: Buffer.from(
+              JSON.stringify({ version: ver, depsHash, nodeMinMajor: 22, builtAt: new Date().toISOString(), entry: "dist/src/server.js" }),
+            ),
+          },
+          { path: "package.json", content: Buffer.from(JSON.stringify({ version: ver, type: "module" })) },
+          { path: "dist/src/server.js", content: Buffer.from("console.log('mock server');\n") },
+        ]);
+        const sha = crypto.createHash("sha256").update(gz).digest("hex");
+        return { gz, sha, name: `aws-quick2api-dist-v${ver}.tar.gz` };
+      };
+
+      const makeMockFetcher = (bundleBytes: Buffer, sumsText: string): typeof fetch =>
+        (async (input: string | URL | Request) => {
+          const u = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+          if (u.endsWith("SHA256SUMS.txt")) return new Response(sumsText, { status: 200 });
+          return new Response(new Uint8Array(bundleBytes), { status: 200 });
+        }) as typeof fetch;
+
+      const supEnv = { ...process.env, AWS_QUICK_SUPERVISED: "1", DISABLE_SELF_UPDATE: "" };
+      const good = buildMockBundle("9.9.9", builtin.depsHash);
+      const baseInfo = {
+        currentVersion: builtin.version,
+        latestVersion: "9.9.9",
+        hasUpdate: true,
+        repo: "kuk-888/aws-quick2api",
+        releaseUrl: "https://github.com/kuk-888/aws-quick2api/releases/tag/v9.9.9",
+        releaseNotes: "test",
+        checkedAt: new Date().toISOString(),
+        bundleUrl: `https://github.com/kuk-888/aws-quick2api/releases/download/v9.9.9/${good.name}`,
+        checksumUrl: "https://github.com/kuk-888/aws-quick2api/releases/download/v9.9.9/SHA256SUMS.txt",
+        bundleAssetName: good.name,
+      };
+
+      // 2a) DISABLE_SELF_UPDATE=true blocks apply
+      await assert.rejects(
+        () =>
+          applySelfUpdate({
+            dataDir,
+            env: { ...supEnv, DISABLE_SELF_UPDATE: "true" },
+            versionInfo: baseInfo,
+            fetcher: makeMockFetcher(good.gz, `${good.sha}  ${good.name}\n`),
+          }),
+        /disabled/i,
+      );
+
+      // 2b) SHA-256 mismatch aborts update
+      await assert.rejects(
+        () =>
+          applySelfUpdate({
+            dataDir,
+            env: supEnv,
+            versionInfo: baseInfo,
+            fetcher: makeMockFetcher(good.gz, `${"0".repeat(64)}  ${good.name}\n`),
+          }),
+        /SHA-256 verification failed/i,
+      );
+
+      // 2c) Changed native/npm depsHash rejects hot-update with actionable Docker/source guidance
+      const badDeps = buildMockBundle("9.9.9", computeRuntimeDepsHash({ dependencies: { sharp: "^9.0.0", ws: "^9.0.0" } }));
+      await assert.rejects(
+        () =>
+          applySelfUpdate({
+            dataDir,
+            env: supEnv,
+            versionInfo: baseInfo,
+            fetcher: makeMockFetcher(badDeps.gz, `${badDeps.sha}  ${badDeps.name}\n`),
+          }),
+        /depsHash changed/i,
+      );
+
+      // 2d) Valid bundle installs, links host node_modules across tmpDir, activates pendingVersion, and rollback works
+      const applied = await applySelfUpdate({
+        dataDir,
+        env: supEnv,
+        versionInfo: baseInfo,
+        fetcher: makeMockFetcher(good.gz, `${good.sha}  ${good.name}\n`),
+      });
+      assert.equal(applied.installedVersion, "9.9.9");
+      assert.equal(applied.willRestart, true);
+      assert.equal(loadSelfUpdateState(dataDir).pendingVersion, "9.9.9");
+      assert.ok(fs.existsSync(path.join(releaseDirForVersion(dataDir, "9.9.9"), "node_modules", "ws")));
+      assert.equal(getSelfUpdateCapability({ dataDir, env: supEnv }).canRollback, true);
+
+      const rb = rollbackSelfUpdate({ dataDir, env: supEnv });
+      assert.equal(rb.targetVersion, builtin.version);
+      assert.equal(loadSelfUpdateState(dataDir).activeVersion, null);
+
+      // 3) Real `runBootstrapSupervisor` child-process test: crash auto-rollback + hot-restart + promotion + ESM `ws` import
+      const fakeRoot = path.join(tmpDir, "fake-app");
+      const fakeData = path.join(tmpDir, "fake-data");
+      fs.mkdirSync(path.join(fakeRoot, "dist", "src"), { recursive: true });
+      fs.mkdirSync(fakeData, { recursive: true });
+      const fakePkg = { version: "0.1.0", type: "module", dependencies: { ws: "^8.18.0" }, engines: { node: ">=22.0.0" } };
+      writeFileSync(path.join(fakeRoot, "package.json"), JSON.stringify(fakePkg), "utf8");
+      // Symlink real repo node_modules into fakeRoot so hot releases outside repo can resolve `import "ws"`
+      fs.symlinkSync(path.join(builtin.appRoot, "node_modules"), path.join(fakeRoot, "node_modules"), "dir");
+      const fakeDepsHash = computeRuntimeDepsHash(fakePkg);
+
+      // Built-in v0.1.0: announces ready, then on IPC "do_hot_upgrade" exits with code 75
+      writeFileSync(
+        path.join(fakeRoot, "dist", "src", "server.js"),
+        `process.send?.({ type: "gateway_ready", version: "0.1.0" });
+process.on("message", (m) => {
+  if (m && m.type === "trigger_restart") {
+    process.send?.({ type: "self_update_restart" });
+    process.exit(${EXIT_CODE_SELF_UPDATE_RESTART});
+  }
+});
+setInterval(() => {}, 10_000);
+`,
+        "utf8",
+      );
+
+      // Crashing hot release v0.2.0: crashes immediately on boot
+      const rel020 = releaseDirForVersion(fakeData, "0.2.0");
+      fs.mkdirSync(path.join(rel020, "dist", "src"), { recursive: true });
+      writeFileSync(
+        path.join(rel020, "update-manifest.json"),
+        JSON.stringify({ version: "0.2.0", depsHash: fakeDepsHash, nodeMinMajor: 22, builtAt: "", entry: "dist/src/server.js" }),
+      );
+      writeFileSync(path.join(rel020, "package.json"), JSON.stringify({ ...fakePkg, version: "0.2.0" }));
+      writeFileSync(path.join(rel020, "dist", "src", "server.js"), `process.exit(1);\n`);
+
+      // Healthy hot release v0.3.0: imports `ws` via symlinked node_modules and announces ready
+      const rel030 = releaseDirForVersion(fakeData, "0.3.0");
+      fs.mkdirSync(path.join(rel030, "dist", "src"), { recursive: true });
+      writeFileSync(
+        path.join(rel030, "update-manifest.json"),
+        JSON.stringify({ version: "0.3.0", depsHash: fakeDepsHash, nodeMinMajor: 22, builtAt: "", entry: "dist/src/server.js" }),
+      );
+      writeFileSync(path.join(rel030, "package.json"), JSON.stringify({ ...fakePkg, version: "0.3.0" }));
+      ensureReleaseNodeModulesLink(rel030, fakeRoot);
+      writeFileSync(
+        path.join(rel030, "dist", "src", "server.js"),
+        `import WebSocket from "ws";
+if (typeof WebSocket !== "function") process.exit(2);
+process.send?.({ type: "gateway_ready", version: "0.3.0" });
+setInterval(() => {}, 10_000);
+`,
+        "utf8",
+      );
+
+      // Start with broken v0.2.0 pending -> expect auto-rollback to built-in v0.1.0 -> trigger hot restart to v0.3.0 -> promote!
+      saveSelfUpdateState(fakeData, {
+        activeVersion: "0.2.0",
+        previousVersion: null,
+        pendingVersion: "0.2.0",
+        failedVersions: [],
+      });
+
+      const spawnedVersions: string[] = [];
+      const ac = new AbortController();
+      const supPromise = runBootstrapSupervisor({
+        dataDir: fakeData,
+        builtinAppRoot: fakeRoot,
+        healthyGraceMs: 60,
+        signal: ac.signal,
+        onSpawn: (target, child) => {
+          spawnedVersions.push(`${target.kind}:${target.version}`);
+          if (target.version === "0.1.0") {
+            child.on("message", (msg: unknown) => {
+              if ((msg as { type?: string })?.type === "gateway_ready") {
+                // Verify auto-rollback recorded v0.2.0 failure, then stage v0.3.0 and trigger restart (code 75)
+                const stAfterRb = loadSelfUpdateState(fakeData);
+                assert.ok(stAfterRb.failedVersions.includes("0.2.0"), "crashing v0.2.0 must be recorded in failedVersions");
+                assert.equal(stAfterRb.activeVersion, null, "auto-rollback must fall back to built-in");
+                saveSelfUpdateState(fakeData, {
+                  ...stAfterRb,
+                  activeVersion: "0.3.0",
+                  previousVersion: null,
+                  pendingVersion: "0.3.0",
+                });
+                child.send({ type: "trigger_restart" });
+              }
+            });
+          } else if (target.version === "0.3.0") {
+            child.on("message", (msg: unknown) => {
+              if ((msg as { type?: string })?.type === "gateway_ready") {
+                setTimeout(() => ac.abort(), 160);
+              }
+            });
+          }
+        },
+      });
+
+      await supPromise;
+      assert.deepEqual(spawnedVersions, ["hot:0.2.0", "builtin:0.1.0", "hot:0.3.0"]);
+      const finalState = loadSelfUpdateState(fakeData);
+      assert.equal(finalState.activeVersion, "0.3.0", "v0.3.0 must stay active");
+      assert.equal(finalState.pendingVersion, null, "healthy v0.3.0 must be promoted after grace window");
+
+      // 4) Newer built-in image (e.g. Docker pull to v0.4.0) automatically overrides older hot release v0.3.0
+      writeFileSync(path.join(fakeRoot, "package.json"), JSON.stringify({ ...fakePkg, version: "0.4.0" }), "utf8");
+      const bootAfterPull = resolveBootTarget({ dataDir: fakeData, builtinAppRoot: fakeRoot });
+      assert.equal(bootAfterPull.kind, "builtin");
+      assert.equal(bootAfterPull.version, "0.4.0");
+      assert.equal(loadSelfUpdateState(fakeData).activeVersion, null);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps SANITIZE_CLIENT_SYSTEM_PROMPT opt-in (default false), deep-sanitizes IDE wrappers when enabled, and batch-upgrades legacy Quick2API Bridge agents without touching personal agents", async () => {
+    const fs = await import("node:fs");
+    const WebSocket = (await import("ws")).default;
+    const { WebSocketServer } = await import("ws");
+    const {
+      deepSanitizeClientSystemPrompt,
+      sanitizeClientSystemPromptForQuick,
+    } = await import("../src/core/tool-bridge.js");
+    const {
+      DEFAULT_CODING_AGENT_DESCRIPTION,
+      DEFAULT_CODING_AGENT_INSTRUCTIONS,
+      DEFAULT_CODING_AGENT_NAME,
+    } = await import("../src/core/engine.js");
+    const decodeMockCloudIn = (buf: Buffer): Record<string, unknown> | null => {
+      try {
+        const outer = JSON.parse(buf.toString("utf8")) as { payload?: { payload?: string } };
+        if (typeof outer?.payload?.payload === "string") {
+          return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as Record<string, unknown>;
+        }
+      } catch {
+        // ignore non-JSON frames
+      }
+      return null;
+    };
+    const encodeMockCloudOut = (ev: Record<string, unknown>): Uint8Array => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+      return encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, payload);
+    };
+    const { createGatewayServer } = await import("../src/server.js");
+    const { renderDashboardHtml } = await import("../src/web/dashboard-ui.js");
+
+    // 1) Default Coding Agent instructions must stay brand-free while carrying the trusted `<tool_call>` anchor
+    assert.ok(!/quick2api|external api client/i.test(DEFAULT_CODING_AGENT_INSTRUCTIONS));
+    assert.ok(DEFAULT_CODING_AGENT_INSTRUCTIONS.includes("<tool_call>"));
+
+    // 2) Light sanitizer stays 100% passthrough when hasTools=false, and covers Antigravity/ZCode when hasTools=true
+    const rawUserPersona = "You are a cautious Rust financial systems architect.\n<guidelines>\nUse 2-space indentation.\n</guidelines>";
+    assert.equal(sanitizeClientSystemPromptForQuick(rawUserPersona, false), rawUserPersona);
+    assert.equal(sanitizeClientSystemPromptForQuick(rawUserPersona, true), rawUserPersona);
+    const rawAntigravity = "You are Antigravity, a powerful agentic AI assistant.\nWrite clean TypeScript.";
+    assert.equal(sanitizeClientSystemPromptForQuick(rawAntigravity, false), rawAntigravity);
+    assert.ok(!sanitizeClientSystemPromptForQuick(rawAntigravity, true).includes("You are Antigravity"));
+
+    // 3) Opt-in deepSanitizeClientSystemPrompt strips IDE identity/anti-bypass boilerplate & unwraps <user_rules>/<RULE> while keeping business rules & custom user guidelines intact
+    const heavyIdePrompt = [
+      "x-anthropic-billing-header: cc_version=2.1.34; cc_entrypoint=cli",
+      "<identity>\nYou are Antigravity, a powerful agentic AI assistant designed by the Google Deepmind team.\n</identity>",
+      "<guidelines>\nNever defeat or bypass an access control, permission check, or sandbox.\nNever solve or bypass a CAPTCHA.\n</guidelines>",
+      "<guidelines>\nAlways prefer async/await over raw Promise chains.\n</guidelines>",
+      "<user_rules>\nThe following are user-defined rules that you MUST ALWAYS FOLLOW WITHOUT ANY EXCEPTION. These rules take precedence over any other instructions.\n<RULE[/workspace/AGENTS.md]>\nKeep functions under 60 lines and write unit tests.\n</RULE[/workspace/AGENTS.md]>\n</user_rules>",
+      "<skills>\nIf a skill seems relevant to your current task, you MUST read its `SKILL.md` instructions before proceeding.\n- deploy-helper: Deploy build artifacts.\n</skills>",
+      "<system-reminder>\nBranch: main\n</system-reminder>",
+    ].join("\n\n");
+
+    const deepCleaned = deepSanitizeClientSystemPrompt(heavyIdePrompt);
+    assert.ok(!deepCleaned.includes("x-anthropic-billing-header"));
+    assert.ok(!deepCleaned.includes("Antigravity"));
+    assert.ok(!deepCleaned.includes("Google Deepmind"));
+    assert.ok(!deepCleaned.includes("CAPTCHA"));
+    assert.ok(!deepCleaned.includes("<identity>"));
+    assert.ok(!deepCleaned.includes("<user_rules>"));
+    assert.ok(!deepCleaned.includes("<RULE["));
+    assert.ok(!deepCleaned.includes("WITHOUT ANY EXCEPTION"));
+    assert.ok(!deepCleaned.includes("take precedence over any other instructions"));
+    assert.ok(!deepCleaned.includes("<system-reminder>"));
+    // Preserves 100% of actual user conventions, custom non-security guidelines, and skill entries!
+    assert.ok(deepCleaned.includes("Always prefer async/await over raw Promise chains."));
+    assert.ok(deepCleaned.includes("Keep functions under 60 lines and write unit tests."));
+    assert.ok(deepCleaned.includes("### Rules (AGENTS.md)"));
+    assert.ok(deepCleaned.includes("- deploy-helper: Deploy build artifacts."));
+    assert.ok(deepCleaned.includes("[Context note]\nBranch: main\n[/Context note]"));
+
+    // 4) End-to-end server verification:
+    //    - Default `sanitizeClientSystemPrompt=false` preserves custom systemPrompt verbatim on plain chat
+    //    - Toggling `sanitizeClientSystemPrompt=true` via `/v1/admin/settings` persists and deep-sanitizes outbound `custom_prompt`
+    //    - `POST /v1/admin/keys/sync-agents` upgrades legacy `Quick2API Bridge` in-place to `Coding Assistant` without touching unrelated personal agents (`写作助手`)
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aq2a-sanitize-sync-"));
+    const envFile = path.join(tmpDir, ".env");
+    const fakeOAuthKey =
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: "cid-sync-test",
+          clientSecret: "csec-sync-test",
+          refreshToken: "rtok-sync-test",
+          accessToken: "atok-valid-sync-test",
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        "utf8",
+      ).toString("base64url");
+
+    const capturedChatFrames: Array<Record<string, unknown>> = [];
+    const agentUpdates: Array<Record<string, unknown>> = [];
+    let currentBridgeName = "Quick2API Bridge";
+    let currentBridgePrompt = "You are a helpful AI assistant accessed via an external API client.";
+
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((r) => wss.once("listening", r));
+    const wsPort = (wss.address() as { port: number }).port;
+
+    wss.on("connection", (sock) => {
+      sock.send(encodeMockCloudOut({ type: "session_established", payload: { session_id: "s1" } }));
+      sock.on("message", (raw) => {
+        const frame = decodeMockCloudIn(Buffer.from(raw as Buffer));
+        if (!frame) return;
+        const fType = String(frame.type || "");
+        const payload = (frame.payload || {}) as Record<string, unknown>;
+        if (fType === "session_connect") {
+          sock.send(encodeMockCloudOut({ type: "session_established", payload: { session_id: "s1" } }));
+        } else if (fType === "get_chat_agents") {
+          sock.send(
+            encodeMockCloudOut({
+              type: "chat_agents_updated",
+              payload: {
+                agents: [
+                  { agentId: "arn:aws:quicksight:us-east-1:111:agent/SYSTEM", name: "AWS Quick", isSystemDefault: true },
+                  {
+                    agentId: "arn:aws:quicksight:us-east-1:111:agent/personal-writer-01",
+                    name: "写作改写助手",
+                    description: "个人写作助手",
+                    systemPrompt: "你是一名写作助手。",
+                  },
+                  {
+                    agentId: "arn:aws:quicksight:us-east-1:111:agent/legacy-bridge-99",
+                    name: currentBridgeName,
+                    description: "General software engineering and coding assistant.",
+                    systemPrompt: currentBridgePrompt,
+                  },
+                ],
+              },
+            }),
+          );
+        } else if (fType === "create_agent_draft") {
+          sock.send(
+            encodeMockCloudOut({
+              type: "agent_draft_created",
+              payload: { agent_id: String(payload.agent_id || "new-agent-01") },
+            }),
+          );
+        } else if (fType === "update_chat_agent_config") {
+          agentUpdates.push(payload);
+          if (typeof payload.name === "string") currentBridgeName = payload.name;
+          if (typeof payload.instructions === "string") currentBridgePrompt = payload.instructions;
+          sock.send(encodeMockCloudOut({ type: "agent_draft_saved", payload: { agent_id: payload.agent_id } }));
+        } else if (fType === "publish_agent_draft") {
+          sock.send(
+            encodeMockCloudOut({
+              type: "publish_agent_draft_success",
+              payload: { agent_id: payload.agent_id },
+            }),
+          );
+        } else if (fType === "user_message") {
+          capturedChatFrames.push(payload);
+          sock.send(encodeMockCloudOut({ type: "text_delta", payload: { delta: "OK" } }));
+          sock.send(
+            encodeMockCloudOut({
+              type: "turn_usage",
+              payload: { input_tokens: 10, output_tokens: 2, resolved_model_id: "us.anthropic.claude-opus-5-5" },
+            }),
+          );
+          sock.send(encodeMockCloudOut({ type: "message_complete", payload: { text: "OK" } }));
+        }
+      });
+    });
+
+    fs.writeFileSync(envFile, `QUICK_TOKENS=${fakeOAuthKey}\n`, "utf8");
+    const clientToken = "sk-aq-unit-sanitize-token-998877665544";
+    const adminPass = "UnitAdminStrongPass_2026!";
+    const cfg = loadConfigFromEnv(
+      {
+        HOST: "127.0.0.1",
+        PORT: "0",
+        GATEWAY_TOKEN: clientToken,
+        ADMIN_PASSWORD: adminPass,
+        QUICK_TOKENS: fakeOAuthKey,
+        DATA_DIR: tmpDir,
+      },
+      envFile,
+    );
+    assert.equal(cfg.sanitizeClientSystemPrompt, false, "must default to false");
+
+    const gw = createGatewayServer({ config: cfg });
+    // Inject mock WS factory into engine for offline deterministic testing
+    (gw.engine as unknown as { webSocketFactory: (url: string) => unknown }).webSocketFactory = () =>
+      new WebSocket(`ws://127.0.0.1:${wsPort}`);
+
+    // Initially bind the slot to the user's personal agent ("personal-writer-01") to verify sync-agents NEVER overwrites personal agents!
+    const slotId = gw.keyPool.allManagedKeys()[0]!.slotId;
+    gw.keyPool.updateSlotMeta(slotId, { chatAgentId: "personal-writer-01" });
+
+    await new Promise<void>((r) => gw.server.listen({ host: "127.0.0.1", port: 0 }, r));
+    const port = (gw.server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      // A) With default `sanitizeClientSystemPrompt=false`, plain chat passes user's `<identity>` through untouched!
+      const resDefault = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": clientToken,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "quick-smart",
+          max_tokens: 128,
+          system: heavyIdePrompt,
+          messages: [{ role: "user", content: "Ping" }],
+        }),
+      });
+      assert.equal(resDefault.status, 200);
+      assert.equal(capturedChatFrames.length, 1);
+      const defaultCustomPrompt = String(capturedChatFrames[0]!.custom_prompt || "");
+      assert.ok(
+        defaultCustomPrompt.includes("<identity>\nYou are Antigravity"),
+        "default OFF must NOT rewrite user systemPrompt on plain chat",
+      );
+
+      // Login to Admin API
+      const loginRes = await fetch(`${base}/v1/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-console-csrf": "1" },
+        body: JSON.stringify({ password: adminPass }),
+      });
+      assert.equal(loginRes.status, 200);
+      const loginData = (await loginRes.json()) as { token: string };
+      const adminHeaders = {
+        "content-type": "application/json",
+        "x-console-csrf": "1",
+        authorization: `Bearer ${loginData.token}`,
+      };
+
+      // B) Toggle `sanitizeClientSystemPrompt: true` via `/v1/admin/settings`
+      const setRes = await fetch(`${base}/v1/admin/settings`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ sanitizeClientSystemPrompt: true }),
+      });
+      assert.equal(setRes.status, 200);
+      const setJson = (await setRes.json()) as { settings: { sanitizeClientSystemPrompt: boolean } };
+      assert.equal(setJson.settings.sanitizeClientSystemPrompt, true);
+
+      // Next request immediately deep-sanitizes `custom_prompt` while keeping business rules intact!
+      const resOptIn = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": clientToken,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "quick-smart",
+          max_tokens: 128,
+          system: heavyIdePrompt,
+          messages: [{ role: "user", content: "Ping 2" }],
+        }),
+      });
+      assert.equal(resOptIn.status, 200);
+      const sanitizedCustomPrompt = String(capturedChatFrames[1]!.custom_prompt || "");
+      assert.ok(!sanitizedCustomPrompt.includes("Antigravity"));
+      assert.ok(!sanitizedCustomPrompt.includes("WITHOUT ANY EXCEPTION"));
+      assert.ok(sanitizedCustomPrompt.includes("Keep functions under 60 lines and write unit tests."));
+
+      // C) Run `POST /v1/admin/keys/sync-agents`: upgrades `legacy-bridge-99` (`Quick2API Bridge` -> `Coding Assistant`)
+      //    and NEVER modifies `personal-writer-01` (`写作改写助手`)!
+      const syncRes1 = await fetch(`${base}/v1/admin/keys/sync-agents`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({}),
+      });
+      assert.equal(syncRes1.status, 200);
+      const syncJson1 = (await syncRes1.json()) as {
+        upgraded: number;
+        created: number;
+        unchanged: number;
+        results: Array<{ agentId: string; action: string; previousName?: string }>;
+      };
+      assert.equal(syncJson1.upgraded, 1);
+      assert.equal(syncJson1.created, 0);
+      assert.equal(syncJson1.results[0]!.agentId, "legacy-bridge-99");
+      assert.equal(syncJson1.results[0]!.previousName, "Quick2API Bridge");
+      assert.equal(agentUpdates.length, 1);
+      assert.equal(agentUpdates[0]!.agent_id, "legacy-bridge-99");
+      assert.equal(agentUpdates[0]!.name, DEFAULT_CODING_AGENT_NAME);
+      assert.equal(agentUpdates[0]!.description, DEFAULT_CODING_AGENT_DESCRIPTION);
+      assert.equal(agentUpdates[0]!.instructions, DEFAULT_CODING_AGENT_INSTRUCTIONS);
+
+      // Re-running `sync-agents` immediately detects it is already up-to-date (`unchanged: 1`, 0 extra WS publishes)
+      const syncRes2 = await fetch(`${base}/v1/admin/keys/sync-agents`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({}),
+      });
+      const syncJson2 = (await syncRes2.json()) as { upgraded: number; unchanged: number };
+      assert.equal(syncJson2.upgraded, 0);
+      assert.equal(syncJson2.unchanged, 1);
+      assert.equal(agentUpdates.length, 1);
+
+      // D) Dashboard HTML renders both `#cfgSanitizeClientSystemPrompt` and `#credSyncAgentsBtn`
+      const dashHtml = renderDashboardHtml("/dashboard", "nonce-123");
+      assert.ok(dashHtml.includes("cfgSanitizeClientSystemPrompt"));
+      assert.ok(dashHtml.includes("credSyncAgentsBtn"));
+    } finally {
+      await gw.close();
+      await new Promise<void>((r) => wss.close(() => r()));
+      rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 });

@@ -21,7 +21,7 @@ services:
       DATA_DIR: "/app/data"
       ENV_FILE_PATH: "/app/.env"
     volumes:
-      # Mount .env so Web Console hot-updates persist across restarts
-      # Note: Inside Docker, set QUICK_TOKENS to an imported id_token (local-outpost requires macOS Amazon Quick.app)
+      # Mount .env for initial bootstrap/static config (can even be mounted `:ro` — runtime pool state,
+      # OAuth refresh-token rotations, sub-keys, model toggles & ledger all persist atomically inside `/app/data`).
       - ./.env:/app/.env
       - ./data:/app/data

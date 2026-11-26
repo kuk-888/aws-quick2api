@@ -47,7 +47,7 @@ export const DEFAULT_CODING_AGENT_NAME = "Coding Assistant";
 export const LEGACY_CODING_AGENT_NAMES = ["Coding Assistant", "Quick2API Bridge", "Quick2API Coding Bridge"];
 export const DEFAULT_CODING_AGENT_DESCRIPTION = "General software engineering and coding assistant.";
 export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
-  "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly.";
+  "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly. When structured <tool_call> schemas are provided in context, emit matching <tool_call> blocks directly when appropriate.";
 
 export type QuickWebSocketFactory = (url: string, options?: Record<string, unknown>) => WebSocket;
 export type QuickFrameEncoder = (frame: Record<string, unknown>) => Uint8Array | string;
@@ -93,6 +93,7 @@ export async function dialQuickWebSocket(params: {
     if (beforeDial) await beforeDial();
     const ws = new WebSocket(conn.url, conn.protocols, {
       headers: conn.headers,
+      handshakeTimeout: 15_000,
       ...(wsAgent ? { agent: wsAgent } : {}),
     });
     return {
@@ -121,6 +122,7 @@ export async function dialQuickWebSocket(params: {
       `&channel=prod`;
     if (beforeDial) await beforeDial();
     const oauthWsOpts: Record<string, unknown> = {
+      handshakeTimeout: 15_000,
       headers: {
         "User-Agent": QUICK_DESKTOP_USER_AGENT,
         Authorization: `Bearer ${accessToken}`,
@@ -173,6 +175,7 @@ export async function dialQuickWebSocket(params: {
     `&channel=prod`;
   if (beforeDial) await beforeDial();
   const ws = new WebSocket(wsUrl, {
+    handshakeTimeout: 15_000,
     headers: {
       "User-Agent": QUICK_DESKTOP_USER_AGENT,
       Authorization: `Bearer ${session.jwt}`,

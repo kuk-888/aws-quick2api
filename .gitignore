@@ -1,6 +1,7 @@
 # Dependencies & build output
 node_modules/
 dist/
+release-assets/
 
 # Local secrets & runtime state (NEVER commit!)
 .env
@@ -8,6 +9,10 @@ dist/
 !.env.example
 gateway-keys.json
 usage-ledger.json
+pool-state.json
+model-access.json
+admin-password.json
+account-identities.json
 admin-session.key
 *.key
 data/

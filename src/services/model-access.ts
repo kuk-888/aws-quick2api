@@ -1,3 +1,5 @@
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
 import type { SDKModel } from "../aws-quick/types.js";
 import { persistDisabledModelsToEnvFile } from "../core/config.js";
 import { classifyModelQuotaPool } from "../core/key-pool.js";
@@ -30,12 +32,33 @@ export function normalizeBaseModelId(rawModel: string | undefined): string {
 export class ModelAccessController {
   private readonly disabledSet = new Set<string>();
   private readonly envFilePath?: string;
+  private readonly stateFilePath?: string;
 
-  constructor(config: Pick<GatewayConfig, "disabledModels" | "envFilePath">) {
+  constructor(config: Pick<GatewayConfig, "disabledModels" | "envFilePath"> & Partial<Pick<GatewayConfig, "dataDir">>) {
     this.envFilePath = config.envFilePath;
-    for (const m of config.disabledModels) {
-      const norm = normalizeBaseModelId(m);
-      if (norm) this.disabledSet.add(norm);
+    this.stateFilePath = config.dataDir ? path.join(config.dataDir, "model-access.json") : undefined;
+    let loadedFromState = false;
+    if (this.stateFilePath && existsSync(this.stateFilePath)) {
+      try {
+        const parsed = JSON.parse(readFileSync(this.stateFilePath, "utf8")) as { disabledModels?: unknown };
+        if (Array.isArray(parsed?.disabledModels)) {
+          loadedFromState = true;
+          for (const m of parsed.disabledModels) {
+            if (typeof m === "string") {
+              const norm = normalizeBaseModelId(m);
+              if (norm) this.disabledSet.add(norm);
+            }
+          }
+        }
+      } catch {
+        // Fall back to env bootstrap on parse error
+      }
+    }
+    if (!loadedFromState) {
+      for (const m of config.disabledModels) {
+        const norm = normalizeBaseModelId(m);
+        if (norm) this.disabledSet.add(norm);
+      }
     }
   }
 
@@ -126,7 +149,21 @@ export class ModelAccessController {
     }
 
     const sorted = [...this.disabledSet].sort();
-    persistDisabledModelsToEnvFile(this.envFilePath, sorted);
+    if (this.stateFilePath) {
+      const dir = path.dirname(this.stateFilePath);
+      const tmp = `${this.stateFilePath}.${process.pid}.tmp`;
+      try {
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        writeFileSync(tmp, `${JSON.stringify({ version: 1, disabledModels: sorted, updatedAt: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 });
+        try { chmodSync(tmp, 0o600); } catch { }
+        renameSync(tmp, this.stateFilePath);
+      } catch (err) {
+        try { unlinkSync(tmp); } catch { }
+        console.warn("[model-access] Failed to persist model-access.json:", err instanceof Error ? err.message : String(err));
+      }
+    } else {
+      persistDisabledModelsToEnvFile(this.envFilePath, sorted);
+    }
     return { disabledCount: sorted.length, disabledModels: sorted };
   }
 

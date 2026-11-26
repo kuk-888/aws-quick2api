@@ -242,9 +242,11 @@ export class StreamingUiTagSanitizer {
         const partialIdx = findTrailingTagPrefixStart(this.buf);
         const nlLast = this.buf.lastIndexOf("\n");
         const tailAfterNl = nlLast === -1 ? this.buf : this.buf.slice(nlLast + 1);
-        const partialFenceIdx = /^[ \t]*[`~]{1,2}$/.test(tailAfterNl)
-          ? (nlLast === -1 ? 0 : nlLast + 1)
-          : -1;
+        const partialFenceIdx =
+          /^[ \t]*[`~]{1,2}$/.test(tailAfterNl) ||
+            ((nlLast !== -1 || this.atLineStart) && /^[ \t]+$/.test(tailAfterNl))
+            ? (nlLast === -1 ? 0 : nlLast + 1)
+            : -1;
 
         let holdIdx = -1;
         if (partialIdx !== -1 && partialFenceIdx !== -1) holdIdx = Math.min(partialIdx, partialFenceIdx);
@@ -269,8 +271,9 @@ export class StreamingUiTagSanitizer {
       }
 
       // Now this.buf starts right at the watched tag! Wait for its closing tag.
+      // Attribute pattern skips `>` inside quoted values (e.g. title="A -> B").
       if (matchKind === "decisions") {
-        const m = /^<decisions\b[^>]*>([\s\S]*?)<\/decisions>/i.exec(this.buf);
+        const m = /^<decisions\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/decisions>/i.exec(this.buf);
         if (!m) {
           if (this.buf.length > MAX_TAG_BUFFER_CHARS) {
             out += this.advanceNormalText(this.buf);
@@ -284,7 +287,7 @@ export class StreamingUiTagSanitizer {
       }
 
       if (matchKind === "decision") {
-        const m = /^<decision\b([^>]*)>([\s\S]*?)(?:<\/decision>|<\/invoke>)/i.exec(this.buf);
+        const m = /^<decision\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)(?:<\/decision>|<\/invoke>)/i.exec(this.buf);
         if (!m) {
           if (this.buf.length > MAX_TAG_BUFFER_CHARS) {
             out += this.advanceNormalText(this.buf);
@@ -298,13 +301,13 @@ export class StreamingUiTagSanitizer {
       }
 
       if (matchKind === "artifact") {
-        const selfClose = /^<artifact\b([^>]*)\/>/i.exec(this.buf);
+        const selfClose = /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/>/i.exec(this.buf);
         if (selfClose) {
           out += this.advanceNormalText(renderArtifactBlock(selfClose[1] || "", null));
           this.buf = this.buf.slice(selfClose[0].length);
           continue;
         }
-        const paired = /^<artifact\b([^>]*)>([\s\S]*?)<\/artifact>/i.exec(this.buf);
+        const paired = /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/artifact>/i.exec(this.buf);
         if (paired) {
           out += this.advanceNormalText(renderArtifactBlock(paired[1] || "", paired[2] || ""));
           this.buf = this.buf.slice(paired[0].length);

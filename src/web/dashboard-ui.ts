@@ -1115,6 +1115,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               <div style="display:flex;gap:6px;flex-wrap:wrap;">
                 <button type="button" id="credBatchRecheckBtn">批量检测</button>
                 <button type="button" id="credClearSessionsBtn">清理会话</button>
+                <button type="button" id="credSyncAgentsBtn" title="一键将旧版 Quick2API Bridge 或过期编程 Agent 热升级为最新无指纹 Coding Assistant 模板">同步 Agent</button>
                 <button type="button" id="credBatchImportBtn">导入 JSON</button>
                 <input type="file" id="credBatchImportFile" accept=".json,application/json" style="display:none;" />
                 <button type="button" id="credExportBtn">导出 JSON</button>
@@ -1327,6 +1328,14 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                 <button type="button" class="btn-xs" id="editAgentPromptBtn">编辑模板</button>
                 <label class="switch"><input type="checkbox" id="cfgAutoEnsureCodingAgent" checked /><span class="slider"></span></label>
               </div>
+            </div>
+
+            <div class="setting-row">
+              <div class="setting-info">
+                <h3>深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)</h3>
+                <p>默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 &lt;user_rules&gt;/&lt;system-reminder&gt; 转为中性标题（完整保留业务规则正文）。</p>
+              </div>
+              <label class="switch"><input type="checkbox" id="cfgSanitizeClientSystemPrompt" /><span class="slider"></span></label>
             </div>
 
             <div class="setting-row">
@@ -1729,6 +1738,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "对齐 CPA 生产级路由机制，修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist to .env",
       "保存路由配置": "Save Routing",
       "内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto Defensive Rephrase on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
+      "深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)": "Deep-Sanitize Heavy Client Framework System Prompts (SANITIZE_CLIENT_SYSTEM_PROMPT)",
+      "默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 <user_rules>/<system-reminder> 转为中性标题（完整保留业务规则正文）。": "Off by default (user-supplied system prompts pass through untouched). Recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive smart blocks or refuse local tool calls: softens conflicting AI identities, strips IDE anti-bypass boilerplate, and unwraps <user_rules>/<system-reminder> tags while preserving all workspace rule content.",
+      "同步 Agent": "Sync Agents",
       "默认关闭。开启后，仅当上游返回 content_filtered 且尚未向客户端输出正文时，由辅助模型将最后一条用户提问自动重述为防御性工程措辞，并死守用户请求的原模型重试 1 次（热会话优先使用原生 edit_message 分支保留前文缓存，绝不降级偷换主回答模型）。": "Off by default. When enabled, ONLY if upstream returns content_filtered before any answer text is emitted, a lightweight helper model rephrases the latest user prompt into defensive engineering phrasing and retries once on the exact same user-requested model (using native edit_message on warm threads; never downgrading the answering model).",
       "防御性重述提示词模板与辅助模型 (CONTENT_FILTER_REPHRASE_PROMPT)": "Defensive Rephrase Prompt Template & Helper Model (CONTENT_FILTER_REPHRASE_PROMPT)",
       "仅用于重述被误拦的提问本身，绝不替代最终回答模型；留空或点击「恢复默认」将使用内置模板。": "Used strictly to rephrase the blocked prompt, never to replace the answering model. Leave empty or click Reset to use the built-in template.",
@@ -2868,6 +2880,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       window.__activeCustomAgentPrompt = settings.customAgentPrompt || "";
       window.__defaultContentFilterRephrasePrompt = settings.defaultContentFilterRephrasePrompt || "";
       window.__activeContentFilterRephrasePrompt = settings.contentFilterRephrasePrompt || "";
+      if ($("cfgSanitizeClientSystemPrompt")) {
+        $("cfgSanitizeClientSystemPrompt").checked = settings.sanitizeClientSystemPrompt === true;
+      }
       const rephraseOn = settings.autoRephraseOnContentFilter === true;
       if ($("cfgAutoRephraseOnContentFilter")) {
         $("cfgAutoRephraseOnContentFilter").checked = rephraseOn;
@@ -2992,6 +3007,13 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           : (filterActive
             ? tr("清理筛选会话 (" + filtered.length + ")", "Clear Filtered (" + filtered.length + ")")
             : tr("清理会话", "Clear Sessions"));
+      }
+      if ($("credSyncAgentsBtn") && !$("credSyncAgentsBtn").disabled) {
+        $("credSyncAgentsBtn").textContent = selectedCredIds.size > 0
+          ? tr("同步所选 Agent (" + selectedCredIds.size + ")", "Sync Agents (" + selectedCredIds.size + ")")
+          : (filterActive
+            ? tr("同步筛选 Agent (" + filtered.length + ")", "Sync Filtered (" + filtered.length + ")")
+            : tr("同步 Agent", "Sync Agents"));
       }
       if ($("credSelectAllCb")) {
         $("credSelectAllCb").checked = filtered.length > 0 && filtered.every((s) => selectedCredIds.has(s.slotId));
@@ -4244,9 +4266,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           const badgeHtml = isBound
             ? '<span class="ag-pill ok">● ' + esc(tr("当前使用", "Active")) + '</span>'
             : '<span class="ag-pill">' + esc(isSystem ? tr("切换默认", "Use Default") : tr("点击选用", "Select")) + '</span>';
+          const isLegacyBridgeName = !isSystem && /^quick2api\b/i.test(String(a.name || "").trim());
           const tagHtml = isSystem
             ? '<span class="ag-pill">' + esc(tr("官方默认", "SYSTEM")) + '</span>'
-            : '<span class="ag-pill">' + esc(tr("自定义", "Custom")) + '</span>';
+            : '<span class="ag-pill">' + esc(tr("自定义", "Custom")) + '</span>' +
+              (isLegacyBridgeName ? '<span class="ag-pill" style="color:var(--warn);">' + esc(tr("旧版名称 · 建议同步", "Legacy Name")) + '</span>' : '');
           btn.innerHTML =
             '<div style="min-width:0;flex:1;">' +
               '<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">' +
@@ -4345,8 +4369,16 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         const origText = ensureBtn.textContent;
         ensureBtn.textContent = tr("处理中…", "Working...");
         try {
-          const data = await api("/v1/admin/keys/" + slotId + "/agents/ensure", { method: "POST", body: JSON.stringify({}) });
-          notify(tr("已自动绑定编程 Agent: ", "Auto-bound coding agent: ") + data.chatAgentId);
+          const data = await api("/v1/admin/keys/" + slotId + "/agents/ensure", {
+            method: "POST",
+            body: JSON.stringify({ upgrade: true })
+          });
+          const actMsg = data.action === "upgraded"
+            ? tr("已升级并绑定标准 Coding Assistant: ", "Upgraded & bound Coding Assistant: ")
+            : data.action === "created"
+              ? tr("已新建并绑定 Coding Assistant: ", "Created & bound Coding Assistant: ")
+              : tr("已校验绑定最新 Coding Assistant: ", "Verified Coding Assistant: ");
+          notify(actMsg + data.chatAgentId);
           close();
           await loadConsoleData("");
         } catch (e) {
@@ -4850,6 +4882,71 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    if ($("credSyncAgentsBtn")) {
+      $("credSyncAgentsBtn").onclick = async () => {
+        const btn = $("credSyncAgentsBtn");
+        const ids = [...selectedCredIds];
+        const filterActive = ids.length === 0 && isCredFilterActive();
+        const filteredIds = filterActive ? getFilteredCreds().map((s) => s.slotId) : [];
+        const explicitIds = ids.length > 0 ? ids : (filterActive ? filteredIds : []);
+        const defaultEnabledSlots = poolSlotsCache.filter((s) => s.enabled);
+        const totalCount = explicitIds.length > 0 ? explicitIds.length : (filterActive ? 0 : defaultEnabledSlots.length);
+        if (!totalCount) {
+          return notify(
+            filterActive
+              ? tr("当前筛选结果为空，没有可同步 Agent 的账号。", "No matching accounts to sync agents.")
+              : tr("当前没有已启用的账号可同步 Agent。", "No enabled accounts available to sync agents."),
+            true
+          );
+        }
+        const ok = await uiConfirm({
+          title: tr("一键同步 / 升级编程 Agent", "Batch Sync / Upgrade Coding Agents"),
+          desc: tr(
+            "将检测目标 " + totalCount + " 个账号：把旧版 Quick2API Bridge 或过期编程 Agent 原地热升级为最新无指纹 Coding Assistant 模板（含 <tool_call> 授权锚点），缺失时自动创建并绑定；账号下您自建的其他个人智能体不会被修改。确认执行吗？",
+            "Inspect " + totalCount + " target account(s): upgrade legacy Quick2API Bridge or outdated Coding Assistants in-place to the latest Coding Assistant template (with <tool_call> anchor), or create & bind one if missing. Unrelated custom agents are untouched. Proceed?"
+          ),
+          okText: tr("开始同步", "Sync Now")
+        });
+        if (!ok) return;
+        btn.disabled = true;
+        btn.textContent = tr("同步中...", "Syncing...");
+        const targetIds = explicitIds.length > 0 ? explicitIds : defaultEnabledSlots.map((s) => s.slotId);
+        targetIds.forEach((id) => busySyncIds.add(id));
+        setCredPanelLoading();
+        renderCredTable();
+        try {
+          const r = await api("/v1/admin/keys/sync-agents", {
+            method: "POST",
+            body: JSON.stringify(explicitIds.length > 0 ? { slotIds: explicitIds } : {})
+          });
+          const upgraded = Number(r.upgraded || 0);
+          const created = Number(r.created || 0);
+          const unchanged = Number(r.unchanged || 0);
+          const failedCount = Number(r.failedCount || 0);
+          if (failedCount === 0) {
+            notify(tr(
+              "Agent 同步完成：升级 " + upgraded + " 个，新建 " + created + " 个，已是最新 " + unchanged + " 个。",
+              "Agents synced: " + upgraded + " upgraded, " + created + " created, " + unchanged + " already up-to-date."
+            ));
+          } else {
+            const firstErr = String((Array.isArray(r.results) ? r.results.find((x) => x.status === "error")?.error : "") || tr("未知错误", "Unknown error")).slice(0, 120);
+            notify(tr(
+              "Agent 同步：升级 " + upgraded + " / 新建 " + created + " / 最新 " + unchanged + "，失败 " + failedCount + " 个（" + firstErr + "）",
+              "Agents synced: " + upgraded + " upgraded, " + created + " created, " + failedCount + " failed (" + firstErr + ")"
+            ), true);
+          }
+          await loadConsoleData("");
+        } catch (e) {
+          notify(tr("同步 Agent 失败: ", "Agent sync failed: ") + e.message, true);
+        } finally {
+          targetIds.forEach((id) => busySyncIds.delete(id));
+          setCredPanelLoading();
+          btn.disabled = false;
+          renderCredTable();
+        }
+      };
+    }
+
     if ($("cfgIncognitoMode")) {
       $("cfgIncognitoMode").onchange = async () => {
         const wantOn = $("cfgIncognitoMode").checked;
@@ -4962,6 +5059,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
             incognitoMode: $("cfgIncognitoMode") ? $("cfgIncognitoMode").checked : true,
             autoEnsureCodingAgent: $("cfgAutoEnsureCodingAgent") ? $("cfgAutoEnsureCodingAgent").checked : true,
             customAgentPrompt: isBuiltInDefault ? "" : promptVal,
+            sanitizeClientSystemPrompt: $("cfgSanitizeClientSystemPrompt")
+              ? $("cfgSanitizeClientSystemPrompt").checked
+              : false,
             autoRephraseOnContentFilter: $("cfgAutoRephraseOnContentFilter")
               ? $("cfgAutoRephraseOnContentFilter").checked
               : false,
@@ -5169,6 +5269,55 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       heroHtml += '</div></div>';
       parts.push(heroHtml);
 
+      // 1.5 One-click verified hot-update card (works for both Docker & Host when supervised by bootstrap.js)
+      const su = v.selfUpdate || null;
+      const canHotApply = Boolean(hasUpd && su && su.canApply && v.bundleUrl && v.checksumUrl);
+      const canRollback = Boolean(su && su.canRollback);
+      if (su && (hasUpd || canRollback || su.lastRollbackReason)) {
+        let suHtml = '<div class="upd-sec" id="selfUpdateSection"><div class="upd-sec-hdr"><span>' +
+          esc(tr("网页一键热更新", "One-Click Self-Update")) + '</span>' +
+          '<span class="upd-sec-hint">' + esc(tr("SHA-256 校验 · 崩溃自动回滚 · 零丢号", "SHA-256 verified · Auto-rollback · Lossless")) + '</span></div>' +
+          '<div style="padding:11px 13px;border-radius:8px;border:1px solid var(--border);background:var(--subtle);display:flex;flex-direction:column;gap:9px;">';
+        if (su.lastRollbackReason) {
+          suHtml += '<div style="padding:7px 10px;border-radius:6px;border:1px solid rgba(245,158,11,0.35);background:rgba(245,158,11,0.10);font-size:12px;color:var(--warn, #d97706);line-height:1.45;">' +
+            '<strong>' + esc(tr("上次更新已自动回滚：", "Last update rolled back: ")) + '</strong>' + esc(su.lastRollbackReason) + '</div>';
+        }
+        if (canHotApply) {
+          suHtml += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">' +
+            '<div style="font-size:12px;color:var(--fg-muted);line-height:1.45;">' +
+              esc(tr("自动下载并校验官方热更包，平滑保存所有账号与账本后原地重启（约 2–5 秒）。", "Downloads and SHA-256 verifies the official bundle, flushes all state, and restarts in-place (~2–5s).")) +
+            '</div>' +
+            '<button type="button" class="btn-solid" id="applySelfUpdateBtn">' +
+              esc(tr("一键更新至 v" + v.latestVersion + " 并重启", "Update to v" + v.latestVersion + " & Restart")) +
+            '</button></div>';
+        } else if (hasUpd) {
+          let hintText = "";
+          if (!su.enabled) {
+            hintText = tr("已通过 DISABLE_SELF_UPDATE=true 关闭网页一键更新，请使用下方终端命令升级。", "One-click update is disabled via DISABLE_SELF_UPDATE=true. Use the manual commands below.");
+          } else if (!su.supervised) {
+            hintText = tr("当前未通过引导器运行。使用 npm start / node dist/src/bootstrap.js 或拉取最新 Docker 镜像后，即可在后续版本开启网页一键更新。", "Not running under the bootstrap supervisor yet. Switch to npm start / node dist/src/bootstrap.js or pull the latest Docker image once to enable one-click updates.");
+          } else if (!v.bundleUrl || !v.checksumUrl) {
+            hintText = tr("v" + v.latestVersion + " 未附带热更新包（或为旧版 Release），请使用下方 Docker / 源码命令升级。", "v" + v.latestVersion + " does not include a hot-update bundle. Use the Docker or source commands below.");
+          }
+          if (hintText) {
+            suHtml += '<div style="font-size:12px;color:var(--fg-muted);line-height:1.45;">' + esc(hintText) + '</div>';
+          }
+        }
+        if (canRollback) {
+          const rbTarget = su.previousVersion || su.builtinVersion;
+          suHtml += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding-top:6px;border-top:1px solid var(--border);flex-wrap:wrap;">' +
+            '<span style="font-size:11.5px;color:var(--fg-muted);">' +
+              esc(tr("当前运行热更版本 v" + su.currentVersion + "（内置底包 v" + su.builtinVersion + "）", "Running hot-updated v" + su.currentVersion + " (built-in v" + su.builtinVersion + ")")) +
+            '</span>' +
+            '<button type="button" class="btn-xs" id="rollbackSelfUpdateBtn">' +
+              esc(tr("回滚至 v" + rbTarget, "Rollback to v" + rbTarget)) +
+            '</button></div>';
+        }
+        suHtml += '<div id="selfUpdateProgressBox" style="display:none;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);font-size:12px;line-height:1.5;"></div>';
+        suHtml += '</div></div>';
+        parts.push(suHtml);
+      }
+
       // 2. Rendered release notes
       if (v.releaseNotes) {
         parts.push('<div class="upd-sec"><div class="upd-sec-hdr"><span>' + esc(tr("更新日志", "Release Notes")) + '</span>' +
@@ -5226,6 +5375,104 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       }
       if ($("copySourceUpgradeBtn")) {
         $("copySourceUpgradeBtn").onclick = () => void copyCmd($("copySourceUpgradeBtn"), sourceCmd, tr("源码", "Source"));
+      }
+
+      const pollUntilRestarted = async (expectedVersion, progEl) => {
+        const deadline = Date.now() + 45000;
+        let sawDowntime = false;
+        await new Promise((r) => setTimeout(r, 900));
+        while (Date.now() < deadline) {
+          try {
+            const headers = Object.assign({ "X-Console-Lang": currentLang }, sessionBearer ? { Authorization: "Bearer " + sessionBearer } : {});
+            const resp = await fetch(basePath + "/v1/admin/version", { cache: "no-store", credentials: "same-origin", headers });
+            if (resp.ok) {
+              const data = await resp.json().catch(() => ({}));
+              const liveVer = data && data.currentVersion ? String(data.currentVersion) : "";
+              if ((expectedVersion && liveVer === expectedVersion) || (sawDowntime && liveVer)) {
+                if (progEl) {
+                  progEl.style.color = "var(--ok)";
+                  progEl.innerHTML = esc(tr("重启完成，当前已运行 v" + (liveVer || expectedVersion) + "，正在刷新控制台...", "Restarted on v" + (liveVer || expectedVersion) + ". Reloading console..."));
+                }
+                setTimeout(() => { window.location.reload(); }, 900);
+                return;
+              }
+            } else if (resp.status === 401 && sawDowntime) {
+              if (progEl) {
+                progEl.style.color = "var(--ok)";
+                progEl.innerHTML = esc(tr("服务已重启完成，正在刷新页面...", "Gateway restarted. Reloading page..."));
+              }
+              setTimeout(() => { window.location.reload(); }, 900);
+              return;
+            } else if (resp.status >= 500) {
+              sawDowntime = true;
+            }
+          } catch {
+            sawDowntime = true;
+          }
+          await new Promise((r) => setTimeout(r, 900));
+        }
+        if (progEl) {
+          progEl.style.color = "var(--warn, #d97706)";
+          progEl.innerHTML = esc(tr("等待重启超时，请手动刷新页面查看最新版本号。", "Restart wait timed out. Refresh the page to check the running version."));
+        }
+      };
+
+      const runSelfUpdateAction = async (endpoint, targetVer, triggerBtn, busyLabel) => {
+        const progEl = $("selfUpdateProgressBox");
+        const applyBtn = $("applySelfUpdateBtn");
+        const rbBtn = $("rollbackSelfUpdateBtn");
+        if (applyBtn) applyBtn.disabled = true;
+        if (rbBtn) rbBtn.disabled = true;
+        if (triggerBtn) triggerBtn.innerHTML = '<span class="inline-spin"></span> ' + esc(busyLabel);
+        if (progEl) {
+          progEl.style.display = "block";
+          progEl.style.color = "var(--fg)";
+          progEl.innerHTML = '<span class="inline-spin"></span> ' + esc(busyLabel);
+        }
+        try {
+          const res = await api(endpoint, { method: "POST", body: JSON.stringify({}) });
+          const nextVer = (res && (res.installedVersion || res.targetVersion)) || targetVer || "";
+          if (progEl) {
+            progEl.style.color = "var(--ok)";
+            progEl.innerHTML = '<span class="inline-spin"></span> ' + esc(tr("已切换至 v" + nextVer + "，正在优雅保存数据并重启网关...", "Switched to v" + nextVer + ". Flushing state and restarting gateway..."));
+          }
+          await pollUntilRestarted(nextVer, progEl);
+        } catch (err) {
+          const msg = err && err.message ? err.message : String(err);
+          if (progEl) {
+            progEl.style.color = "var(--err, #dc2626)";
+            progEl.textContent = tr("操作失败：", "Failed: ") + msg;
+          }
+          notify(msg, true);
+          if (applyBtn) {
+            applyBtn.disabled = false;
+            applyBtn.textContent = tr("一键更新至 v" + (v.latestVersion || "") + " 并重启", "Update to v" + (v.latestVersion || "") + " & Restart");
+          }
+          if (rbBtn) {
+            rbBtn.disabled = false;
+            const rbTgt = (v.selfUpdate && (v.selfUpdate.previousVersion || v.selfUpdate.builtinVersion)) || "";
+            rbBtn.textContent = tr("回滚至 v" + rbTgt, "Rollback to v" + rbTgt);
+          }
+        }
+      };
+
+      if ($("applySelfUpdateBtn")) {
+        $("applySelfUpdateBtn").onclick = () => {
+          const msg = tr(
+            "确认立即下载并更新至 v" + v.latestVersion + "？服务将在数据落盘后平滑重启（约 2–5 秒）。",
+            "Download and apply v" + v.latestVersion + " now? The gateway will flush state and restart (~2–5s)."
+          );
+          if (!window.confirm(msg)) return;
+          void runSelfUpdateAction("/v1/admin/update/apply", v.latestVersion, $("applySelfUpdateBtn"), tr("正在下载并校验更新包...", "Downloading & verifying bundle..."));
+        };
+      }
+      if ($("rollbackSelfUpdateBtn")) {
+        $("rollbackSelfUpdateBtn").onclick = () => {
+          const rbTgt = (v.selfUpdate && (v.selfUpdate.previousVersion || v.selfUpdate.builtinVersion)) || "";
+          const msg = tr("确认回滚至 v" + rbTgt + " 并立即重启服务？", "Rollback to v" + rbTgt + " and restart now?");
+          if (!window.confirm(msg)) return;
+          void runSelfUpdateAction("/v1/admin/update/rollback", rbTgt, $("rollbackSelfUpdateBtn"), tr("正在准备回滚并重启...", "Preparing rollback & restart..."));
+        };
       }
     }
     async function checkAppVersion(force) {

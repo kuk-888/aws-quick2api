@@ -285,6 +285,7 @@ export async function prepareHighResImageForOutOfBand(
         fit: "inside",
         withoutEnlargement: true,
       })
+      .flatten({ background: { r: 255, g: 255, b: 255 } })
       .jpeg({ quality: 92, mozjpeg: true })
       .toBuffer();
     return { buf: outBuf, mimeType: "image/jpeg" };
@@ -371,6 +372,12 @@ export async function buildQuickImageAttachments(
 
 export function mapAttachmentUploadError(err: unknown, contextLabel: string): GatewayError {
   if (err instanceof GatewayError) return err;
+  if (
+    err instanceof Error &&
+    (err.name === "AbortError" || /this operation was aborted|the operation was aborted/i.test(err.message))
+  ) {
+    return new GatewayError("Request aborted by client.", 499, "client_aborted");
+  }
   const raw = err instanceof Error ? err.message : String(err || "unknown");
   const reason = redactSecrets(raw);
   if (/blocked by aws quick dlp policy/i.test(reason)) {

@@ -10,10 +10,12 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/src/server.js",
-    "dev": "npm run build && node dist/src/server.js",
+    "start": "node dist/src/bootstrap.js",
+    "start:direct": "node dist/src/server.js",
+    "dev": "npm run build && node dist/src/bootstrap.js",
     "test": "npm run build && node --test dist/test/*.test.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "package:update": "npm run build && node scripts/build-update-bundle.mjs",
     "preflight": "node scripts/preflight-review.mjs",
     "ai-review": "node scripts/preflight-review.mjs --ai"
   },

@@ -1,8 +1,17 @@
+import { realpathSync } from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { SDKModel } from "./aws-quick/types.js";
 import { closeAllOAuthServers } from "./aws-quick/oauth-client.js";
-import { findInsecurePlaceholderConfig, isPlaceholderSecret, loadConfigFromEnv, loadDotEnv } from "./core/config.js";
+import {
+  assertDataDirWritable,
+  findInsecurePlaceholderConfig,
+  isDockerDataDirMounted,
+  isPlaceholderSecret,
+  loadConfigFromEnv,
+  loadDotEnv,
+} from "./core/config.js";
 import { QuickExecutionEngine, mapSdkError, type AgentFactory } from "./core/engine.js";
 import { UpstreamKeyPool } from "./core/key-pool.js";
 import { GatewayError, type GatewayConfig, type GatewayStreamEvent } from "./core/types.js";
@@ -22,6 +31,7 @@ import { ModelAccessController } from "./services/model-access.js";
 import { formatOpenAiModelList, listLiveModels, resolveKnownModelId } from "./services/model-catalog.js";
 import { fetchAllAccountQuotas } from "./services/quota-service.js";
 import { RequestTraceLogger, type RequestProtocolTag } from "./services/request-logger.js";
+import { EXIT_CODE_SELF_UPDATE_RESTART } from "./services/self-updater.js";
 import { readPackageVersion } from "./services/update-checker.js";
 import { UsageLedger } from "./services/usage-ledger.js";
 import { UsageTracker } from "./services/usage-tracker.js";
@@ -37,6 +47,12 @@ export interface GatewayServerOptions {
   quotaHttpFetcher?: typeof fetch;
   sessionRpcFetcher?: typeof fetch;
   meFetcher?: NonNullable<Parameters<typeof fetchAllAccountQuotas>[1]>["meFetcher"];
+  /** Optional override for the 15s delayed SSE keepalive threshold (primarily for deterministic tests). */
+  flushEarlyDelayMs?: number;
+  /** Optional callback triggered after a verified Web Console self-update/rollback requests process restart. */
+  requestSelfUpdateRestart?: () => void;
+  /** Optional custom fetch used by Web Console self-update downloads (primarily for tests). */
+  selfUpdateFetcher?: typeof fetch;
 }
 
 export interface GatewayServerInstance {
@@ -180,7 +196,12 @@ function sendJson(
     "content-length": Buffer.byteLength(body),
     "cache-control": "no-store",
     ...SECURITY_HEADERS,
-    ...(opts.allowCors ? { "access-control-allow-origin": "*" } : {}),
+    ...(opts.allowCors
+      ? {
+        "access-control-allow-origin": "*",
+        "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
+      }
+      : {}),
     ...opts.extraHeaders
   });
   res.end(body);
@@ -223,7 +244,14 @@ async function pipeSseStream(
   chunks: AsyncIterable<string>,
   onErrorChunk: (err: GatewayError) => string,
   extraHeaders: Record<string, string> = {},
-  opts: { flushEarly?: boolean; flushEarlyAfter?: Promise<void>; postStartKeepAliveFrame?: string } = {}
+  opts: {
+    flushEarly?: boolean;
+    flushEarlyDelayMs?: number;
+    flushEarlyController?: {
+      subscribe(cb: (armed: boolean) => void): () => void;
+    };
+    postStartKeepAliveFrame?: string;
+  } = {}
 ): Promise<void> {
   const iterator = chunks[Symbol.asyncIterator]();
   let headersCommitted = false;
@@ -236,6 +264,7 @@ async function pipeSseStream(
       connection: "keep-alive",
       "x-accel-buffering": "no",
       "access-control-allow-origin": "*",
+      "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
       ...SECURITY_HEADERS,
       ...extraHeaders
     });
@@ -259,10 +288,12 @@ async function pipeSseStream(
   };
 
   let first: IteratorResult<string>;
-  if (opts.flushEarly && opts.flushEarlyAfter) {
-    // Wait for lease acquisition AND give upstream 15s to either emit the first chunk or return
-    // a real post-lease HTTP error (400/401/403/429/502). Only if upstream is genuinely slow (>15s)
-    // do we commit HTTP 200 + `: keepalive\n\n` so Cloudflare (100s 524) never drops the stream.
+  if (opts.flushEarly && opts.flushEarlyController) {
+    // Wait until OOB attachment uploads + WS dial complete (`armed = true`), then give upstream 15s
+    // to emit the first chunk or return a real HTTP error (400/401/403/429/502). On account failover
+    // (`armed = false`), cancel any prior attempt's timer so the new attempt starts with a fresh 15s
+    // window. Only if upstream inference is genuinely slow (>15s) do we commit HTTP 200 + `: keepalive`.
+    const delayMs = Math.max(10, opts.flushEarlyDelayMs ?? 15_000);
     let settled = false;
     let delayedFlushTimer: NodeJS.Timeout | null = null;
     const clearDelayedFlush = () => {
@@ -272,9 +303,9 @@ async function pipeSseStream(
       }
     };
     res.once("close", clearDelayedFlush);
-    const nextPromise = iterator.next();
-    void opts.flushEarlyAfter.then(() => {
-      if (settled || headersCommitted || res.writableEnded || res.destroyed) return;
+    const unsubscribe = opts.flushEarlyController.subscribe((armed) => {
+      clearDelayedFlush();
+      if (!armed || settled || headersCommitted || res.writableEnded || res.destroyed) return;
       delayedFlushTimer = setTimeout(() => {
         delayedFlushTimer = null;
         if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
@@ -282,16 +313,19 @@ async function pipeSseStream(
           res.write(": keepalive\n\n");
           startKeepAlive();
         }
-      }, 15_000);
+      }, delayMs);
       delayedFlushTimer.unref?.();
     });
+    const nextPromise = iterator.next();
     try {
       first = await nextPromise;
       settled = true;
+      unsubscribe();
       clearDelayedFlush();
       res.off("close", clearDelayedFlush);
     } catch (err) {
       settled = true;
+      unsubscribe();
       clearDelayedFlush();
       res.off("close", clearDelayedFlush);
       if (keepAlive) clearInterval(keepAlive);
@@ -435,7 +469,11 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         else if (ev.type === "tool_calls") traceLogger.recordToolCalls(traceId, ev.calls);
         else if (ev.type === "usage") {
           traceLogger.recordUsage(traceId, ev.metrics);
-          clientKeys.recordUsage(clientKeyId, ev.metrics.inputTokens + ev.metrics.cacheReadTokens, ev.metrics.outputTokens);
+          clientKeys.recordUsage(
+            clientKeyId,
+            ev.metrics.inputTokens + ev.metrics.cacheReadTokens + ev.metrics.cacheWriteTokens,
+            ev.metrics.outputTokens,
+          );
         } else if (ev.type === "done") doneReason = ev.stopReason;
         yield ev;
       }
@@ -584,6 +622,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       } else {
         res.writeHead(204, {
           "access-control-allow-origin": "*",
+          "access-control-expose-headers": "x-gateway-ignored-params, retry-after",
           "access-control-allow-methods": "GET, POST, OPTIONS",
           "access-control-allow-headers":
             "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, openai-project, x-session-id, session-id, x-conversation-id, openai-conversation-id, x-session-affinity, x-stainless-lang, x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method",
@@ -651,6 +690,8 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           modelListFetcher: options.modelListFetcher,
           sessionRpcFetcher: options.sessionRpcFetcher,
           onDemandFetcher: options.quotaHttpFetcher,
+          selfUpdateFetcher: options.selfUpdateFetcher,
+          requestSelfUpdateRestart: options.requestSelfUpdateRestart,
           syncKeyQuotas,
           tapStreamWithTrace,
           extractClientCredential,
@@ -717,7 +758,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       // 4. Standard Protocol Layer: Anthropic Token Estimation (`POST /v1/messages/count_tokens`)
       if ((route === "/v1/messages/count_tokens" || route === "/messages/count_tokens") && req.method === "POST") {
         const clientAuth = authenticateProtocolClient(req, { checkQuotaCap: false });
-        const body = await readJsonBody(req, res, Math.min(config.maxBodyBytes, 4 * 1024 * 1024));
+        const body = await readJsonBody(req, res, config.maxBodyBytes);
         const rawCountModel =
           body && typeof body === "object" && "model" in body
             ? (body as { model?: unknown }).model
@@ -727,15 +768,6 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           await assertModelExists(canonicalModelId);
           modelAccess.assertModelAllowed(canonicalModelId);
           clientKeys.assertModelPermitted(clientAuth, canonicalModelId);
-        }
-        if (clientAuth.kind === "gateway_key") {
-          const limit = clientKeys.concurrencyLimitFor(clientAuth.keyId, config.clientKeyMaxConcurrent);
-          if (limit > 0 && (activeByClientKey.get(clientAuth.keyId) ?? 0) >= limit) {
-            throw Object.assign(
-              new GatewayError(`Too many concurrent requests for this API key (limit ${limit}).`, 429, "concurrency_limit_exceeded"),
-              { retryAfter: 2 }
-            );
-          }
         }
         sendJson(res, 200, { input_tokens: estimateAnthropicTokens(body) }, { allowCors: true });
         return;
@@ -791,16 +823,27 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           throw gwErr;
         }
         const ledgerMeta = { account: "", execMode: "", usedProxy: false, startedAt: Date.now() };
-        let resolveLeaseReady!: () => void;
-        const leaseReadyPromise = new Promise<void>((r) => {
-          resolveLeaseReady = r;
-        });
+        let flushEarlyArmed = false;
+        let flushEarlyListener: ((armed: boolean) => void) | null = null;
+        const setFlushEarlyArmed = (armed: boolean) => {
+          flushEarlyArmed = armed;
+          flushEarlyListener?.(armed);
+        };
+        const flushEarlyController = {
+          subscribe(cb: (armed: boolean) => void) {
+            flushEarlyListener = cb;
+            if (flushEarlyArmed) cb(true);
+            return () => {
+              if (flushEarlyListener === cb) flushEarlyListener = null;
+            };
+          },
+        };
         const rawEvents = engine.executeTurnWithPool(turn, keyPool, (meta) => {
           traceLogger.bindExecutionMeta(traceId, meta);
           ledgerMeta.account = meta.accountLabel || meta.maskedKey;
           ledgerMeta.execMode = meta.execMode;
           ledgerMeta.usedProxy = Boolean(meta.usedProxy);
-          resolveLeaseReady();
+          setFlushEarlyArmed(meta.flushEarlyReady !== false);
         });
         const events = tapStreamWithLedger(
           tapStreamWithTrace(rawEvents, traceId, clientKeyId),
@@ -831,7 +874,12 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             ignoredParamsHeader(turn.rawBody),
             {
               flushEarly,
-              ...(flushEarly ? { flushEarlyAfter: leaseReadyPromise } : {}),
+              ...(flushEarly
+                ? {
+                    flushEarlyController,
+                    ...(options.flushEarlyDelayMs !== undefined ? { flushEarlyDelayMs: options.flushEarlyDelayMs } : {}),
+                  }
+                : {}),
               ...(protocolEntry.tag === "anthropic-messages"
                 ? { postStartKeepAliveFrame: 'event: ping\ndata: {"type":"ping"}\n\n' }
                 : {}),
@@ -870,8 +918,10 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           allowCors: !adminSurface,
           extraHeaders: {
             ...(gwErr.status === 429
-              ? { "retry-after": String((gwErr as { retryAfter?: number }).retryAfter ?? (gwErr.code === "api_key_quota_exceeded" ? 3600 : 5)) }
-              : {}),
+              ? { "retry-after": String(gwErr.retryAfter ?? (gwErr.code === "api_key_quota_exceeded" ? 3600 : 5)) }
+              : gwErr.status === 503 && gwErr.retryAfter
+                ? { "retry-after": String(gwErr.retryAfter) }
+                : {}),
             ...((gwErr as { allow?: string }).allow ? { allow: (gwErr as { allow?: string }).allow! } : {})
           }
         }
@@ -897,19 +947,28 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       await engine.disposeAll();
       server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      keyPool.dispose();
       clientKeys.flushStatsToDisk();
       usageLedger.flush();
     }
   };
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+const isMain = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(process.argv[1]);
+  } catch {
+    return path.resolve(fileURLToPath(import.meta.url)) === path.resolve(process.argv[1]);
+  }
+})();
 if (isMain) {
   let envFilePath: string | undefined;
   let config: GatewayConfig;
   try {
     envFilePath = loadDotEnv();
     config = loadConfigFromEnv(process.env, envFilePath);
+    assertDataDirWritable(config.dataDir);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     console.error(
@@ -917,11 +976,20 @@ if (isMain) {
         event: "gateway_refused_to_start",
         reason: err instanceof Error ? err.message : String(err),
         ...(code === "EACCES"
-          ? { hint: "Permission denied reading .env/data. If upgrading Docker to v0.1.16+ (non-root uid 1000), run: chown -R 1000:1000 data .env" }
+          ? { hint: "Permission denied reading/writing .env or data directory. If upgrading Docker to v0.1.16+ (non-root uid 1000), run: chown -R 1000:1000 data .env" }
           : {}),
       }),
     );
     process.exit(1);
+  }
+  if (!isDockerDataDirMounted(config.dataDir)) {
+    console.warn(
+      JSON.stringify({
+        event: "data_dir_not_mounted_warning",
+        dataDir: config.dataDir,
+        note: "Running inside Docker without a persistent volume mounted at DATA_DIR. Structural account edits will best-effort mirror to .env when writable, but sub-keys, usage ledger, and quota state will reset on container recreate. Mount `-v ./data:/app/data` (or use docker-compose.yml).",
+      }),
+    );
   }
   const insecureIssues = findInsecurePlaceholderConfig(config);
   if (insecureIssues.length > 0) {
@@ -935,8 +1003,27 @@ if (isMain) {
     process.exit(1);
   }
   let instance: ReturnType<typeof createGatewayServer>;
+  let selfUpdateRestartScheduled = false;
+  const triggerSelfUpdateRestart = () => {
+    if (selfUpdateRestartScheduled) return;
+    selfUpdateRestartScheduled = true;
+    console.log(JSON.stringify({ event: "gateway_self_update_restart" }));
+    try {
+      process.send?.({ type: "self_update_restart" });
+    } catch {
+      // ignore if IPC channel closed
+    }
+    setTimeout(async () => {
+      try {
+        await instance.close();
+      } catch {
+        // ensure exit even if close throws
+      }
+      process.exit(EXIT_CODE_SELF_UPDATE_RESTART);
+    }, 250);
+  };
   try {
-    instance = createGatewayServer({ config });
+    instance = createGatewayServer({ config, requestSelfUpdateRestart: triggerSelfUpdateRestart });
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
     console.error(
@@ -969,7 +1056,21 @@ if (isMain) {
   }
   if (instance.clientKeys.listKeys().length === 0) {
     if (config.enableDashboard) {
-      instance.clientKeys.createKey({ name: "Default Key (Auto-Generated)" });
+      try {
+        instance.clientKeys.createKey({ name: "Default Key (Auto-Generated)" });
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        console.error(
+          JSON.stringify({
+            event: "gateway_refused_to_start",
+            reason: err instanceof Error ? err.message : String(err),
+            ...(code === "EACCES"
+              ? { hint: "Permission denied writing gateway-keys.json in data directory. If using Docker non-root uid 1000, run: chown -R 1000:1000 data" }
+              : {}),
+          }),
+        );
+        process.exit(1);
+      }
       console.log(
         JSON.stringify({
           event: "gateway_default_key_generated",
@@ -988,6 +1089,11 @@ if (isMain) {
   }
 
   instance.server.listen({ port: config.port, host: config.host, backlog: 512 }, () => {
+    try {
+      process.send?.({ type: "gateway_ready", version: readPackageVersion() });
+    } catch {
+      // Not supervised via IPC
+    }
     console.log(
       JSON.stringify({
         event: "gateway_listening",

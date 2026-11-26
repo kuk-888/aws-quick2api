@@ -379,6 +379,7 @@ export async function* runTurnStream(
     }
     let stopReason: "stop" | "tool_calls" = "stop";
     let emittedToolCalls: Array<{ id: string; name: string }> = [];
+    let pendingToolCalls: import("./types.js").NormalizedToolCall[] = [];
     if (toolFilter) {
       const { remainingText, toolCalls } = toolFilter.flush();
       const cleanRem = remainingText ? uiTagSanitizer.feed(remainingText) : remainingText;
@@ -388,8 +389,8 @@ export async function* runTurnStream(
         push({ type: "text", text: cleanRem });
       }
       if (toolCalls.length > 0) {
+        pendingToolCalls = toolCalls;
         emittedToolCalls = toolCalls.map((tc) => ({ id: tc.id, name: tc.name }));
-        push({ type: "tool_calls", calls: toolCalls });
         stopReason = "tool_calls";
       }
     }
@@ -398,6 +399,9 @@ export async function* runTurnStream(
       hasEmittedText = true;
       assistantOutputText += tailText;
       push({ type: "text", text: tailText });
+    }
+    if (pendingToolCalls.length > 0) {
+      push({ type: "tool_calls", calls: pendingToolCalls });
     }
     flushAggregatedTurnUsage();
     let parkedForReuse = false;
@@ -433,13 +437,13 @@ export async function* runTurnStream(
           rootThreadId: effectiveRootThreadId,
           ...(allowParkWs
             ? {
-                ws,
-                outpostId,
-                encodeFrame,
-                apiKey,
-                proxyUrl,
-                lastAckSeq: proto.getLastAckSequence(),
-              }
+              ws,
+              outpostId,
+              encodeFrame,
+              apiKey,
+              proxyUrl,
+              lastAckSeq: proto.getLastAckSequence(),
+            }
             : {}),
         });
       }
@@ -500,10 +504,29 @@ export async function* runTurnStream(
     sendChunkMessage(0);
   };
 
+  let missedPongs = 0;
+  let thinkingOnlyStartedAt = 0;
+  const maxThinkingOnlyMs = Math.max(120_000, Math.min(runIdleTimeoutMs || 300_000, 300_000));
+  const onWsPong = () => {
+    missedPongs = 0;
+  };
+  ws.on("pong", onWsPong);
+
   const startTurnPing = () => {
     clearPing();
+    missedPongs = 0;
     pingTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN && !ended) {
+        if (missedPongs >= 2) {
+          clearAllStreamTimers();
+          ended = true;
+          push({ type: "__error", error: new GatewayError("AWS Quick WebSocket heartbeat timed out (no pong).", 504, "timeout_error") });
+          try {
+            ws.terminate();
+          } catch { }
+          return;
+        }
+        missedPongs += 1;
         try {
           ws.ping();
           const ack = proto.getLastAckSequence();
@@ -515,6 +538,7 @@ export async function* runTurnStream(
   };
 
   const onWsMessage = (data: Buffer) => {
+    missedPongs = 0;
     let drainedMessages;
     try {
       recvBuf = appendWsRecvBuf(recvBuf, data);
@@ -580,7 +604,8 @@ export async function* runTurnStream(
       }
 
       if (evType === "keepalive" || evType === "status" || evType === "_transport_setup_ok") {
-        touchIdleTimer();
+        // Transport-level heartbeats confirm socket liveness (missedPongs already reset),
+        // but must NOT reset the content-progress idleTimer so silent upstream loops still time out.
         continue;
       }
 
@@ -632,7 +657,23 @@ export async function* runTurnStream(
         }
       }
 
-      const canEmitRoutedThinking = () => showRoutedModelInThinking && !emittedRoutedModel;
+      const rawThinkingObj =
+        turn.rawBody?.thinking && typeof turn.rawBody.thinking === "object"
+          ? (turn.rawBody.thinking as { type?: unknown })
+          : undefined;
+      const rawReasoningObj =
+        turn.rawBody?.reasoning && typeof turn.rawBody.reasoning === "object"
+          ? (turn.rawBody.reasoning as { effort?: unknown })
+          : undefined;
+      const explicitThinkingDisabled =
+        rawThinkingObj?.type === "disabled" ||
+        turn.rawBody?.enable_thinking === false ||
+        turn.rawBody?.reasoning_effort === "none" ||
+        turn.rawBody?.reasoning_effort === "off" ||
+        rawReasoningObj?.effort === "none" ||
+        rawReasoningObj?.effort === "off";
+      const canEmitRoutedThinking = () =>
+        showRoutedModelInThinking && !explicitThinkingDisabled && !emittedRoutedModel && !hasEmittedText;
       const emitOrDeferRoutedThinking = (modelName: string) => {
         emittedRoutedModel = true;
         const rephraseTag = isRephraseRetry ? " · rephrased" : "";
@@ -695,6 +736,7 @@ export async function* runTurnStream(
         }
       } else if (evType === "text_delta") {
         clearPostUsageTimer();
+        thinkingOnlyStartedAt = 0;
         touchIdleTimer();
         const delta = String(payload.delta || "");
         if (delta) {
@@ -702,8 +744,24 @@ export async function* runTurnStream(
           const emitText = afterTools ? uiTagSanitizer.feed(afterTools) : afterTools;
           if (emitText) emitGuardedText(emitText);
         }
+        if (proto.hasUsage() && !proto.hasActiveCloudTools()) {
+          const usageThreadId = String(ev.thread_id || threadId);
+          postUsageTimer = setTimeout(() => finalizeTurn(usageThreadId, false), 20_000);
+        }
       } else if (evType === "thinking_delta") {
         clearPostUsageTimer();
+        if (!hasEmittedText) {
+          if (!thinkingOnlyStartedAt) thinkingOnlyStartedAt = Date.now();
+          if (Date.now() - thinkingOnlyStartedAt > maxThinkingOnlyMs) {
+            clearAllStreamTimers();
+            ended = true;
+            push({ type: "__error", error: new GatewayError("AWS Quick thinking stream stalled without producing output.", 504, "timeout_error") });
+            try {
+              ws.terminate();
+            } catch { }
+            return;
+          }
+        }
         touchIdleTimer();
         const delta = String(payload.delta || "");
         if (delta) {
@@ -718,6 +776,10 @@ export async function* runTurnStream(
             push({ type: "text", text: flushed });
           }
           push({ type: "thinking", text: delta });
+        }
+        if (proto.hasUsage() && !proto.hasActiveCloudTools()) {
+          const usageThreadId = String(ev.thread_id || threadId);
+          postUsageTimer = setTimeout(() => finalizeTurn(usageThreadId, false), 20_000);
         }
       } else if (evType === "turn_usage") {
         touchIdleTimer();
@@ -857,34 +919,44 @@ export async function* runTurnStream(
   ws.once("error", onWsError);
   ws.once("close", onWsClose);
 
-  if (isReusedOpenWs && ws.readyState === WebSocket.OPEN) {
-    startTurnPing();
-    triggerInitialSend();
-  } else {
-    ws.once("open", () => {
-      ws.send(
-        encodeFrame({
-          type: "session_connect",
-          payload: {
-            ...(actorArn ? { actor_id: actorArn } : {}),
-            surfaceType,
-            outpostId,
-            appVersion,
-            ...DESKTOP_CAPABILITIES,
-            ...(isIncognito ? { incognito: true } : {}),
-          },
-        }),
-      );
-      if (!isWeb) {
-        ws.send(encodeFrame({ type: "federate_status", payload: {} }));
-      }
-      startTurnPing();
-      handshakeTimer = setTimeout(() => triggerInitialSend(), 200);
-      handshakeTimer.unref?.();
-    });
-  }
-
   try {
+    if (isReusedOpenWs && ws.readyState === WebSocket.OPEN) {
+      startTurnPing();
+      triggerInitialSend();
+    } else {
+      ws.once("open", () => {
+        try {
+          ws.send(
+            encodeFrame({
+              type: "session_connect",
+              payload: {
+                ...(actorArn ? { actor_id: actorArn } : {}),
+                surfaceType,
+                outpostId,
+                appVersion,
+                ...DESKTOP_CAPABILITIES,
+                ...(isIncognito ? { incognito: true } : {}),
+              },
+            }),
+          );
+          if (!isWeb) {
+            ws.send(encodeFrame({ type: "federate_status", payload: {} }));
+          }
+          startTurnPing();
+          handshakeTimer = setTimeout(() => {
+            try {
+              triggerInitialSend();
+            } catch (sendErr) {
+              onWsError(sendErr instanceof Error ? sendErr : new Error(String(sendErr)));
+            }
+          }, 200);
+          handshakeTimer.unref?.();
+        } catch (openSendErr) {
+          onWsError(openSendErr instanceof Error ? openSendErr : new Error(String(openSendErr)));
+        }
+      });
+    }
+
     while (true) {
       await waitNext();
       while (queue.length > 0) {
@@ -901,6 +973,7 @@ export async function* runTurnStream(
     clearTimeout(timer);
     chunkedAssembler.clear();
     turn.signal?.removeEventListener("abort", onAbort);
+    ws.off("pong", onWsPong);
     if (!wsParked && !wsHandedOff) {
       ws.off("message", onWsMessage);
       ws.off("error", onWsError);

@@ -2,13 +2,17 @@ export class GatewayError extends Error {
   readonly status: number;
   readonly code: string;
   readonly param?: string;
+  retryAfter?: number;
 
-  constructor(message: string, status = 500, code = "internal_error", param?: string) {
+  constructor(message: string, status = 500, code = "internal_error", param?: string, retryAfter?: number) {
     super(message);
     this.name = "GatewayError";
     this.status = status;
     this.code = code;
     this.param = param;
+    if (typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter > 0) {
+      this.retryAfter = Math.ceil(retryAfter);
+    }
   }
 }
 
@@ -19,11 +23,13 @@ export interface NormalizedTool {
   description?: string;
   inputSchema: Record<string, unknown>;
   /** OpenAI Responses API tool wire kind (defaults to `"function"`). */
-  toolKind?: "function" | "custom" | "local_shell";
+  toolKind?: "function" | "custom" | "local_shell" | "shell";
   /** OpenAI Responses API namespace (used by Codex CLI for MCP / grouped tools). */
   toolNamespace?: string;
   /** Original unqualified tool name when bridged under a namespace prefix. */
   wireName?: string;
+  /** Anthropic tool-search deferred tool flag (kept in whitelist, compacted in schema prompt). */
+  deferLoading?: boolean;
 }
 
 export type NormalizedImage =
@@ -152,6 +158,8 @@ export interface GatewayConfig {
   autoEnsureCodingAgent?: boolean;
   /** Optional default instructions template used when auto-creating custom agents (`CUSTOM_AGENT_PROMPT`). */
   customAgentPrompt?: string;
+  /** Optional: deeply sanitize heavy IDE/agent client framework wrappers in `systemPrompt` (`SANITIZE_CLIENT_SYSTEM_PROMPT`, default false so user system prompts stay untouched unless opted in). */
+  sanitizeClientSystemPrompt?: boolean;
   /** Optional: automatically rephrase the latest user prompt into defensive engineering wording on upstream `content_filtered` and retry on the SAME requested model (`AUTO_REPHRASE_ON_CONTENT_FILTER`, default false). */
   autoRephraseOnContentFilter?: boolean;
   /** Optional custom instruction template used when auto-rephrasing after `content_filtered` (`CONTENT_FILTER_REPHRASE_PROMPT`). */

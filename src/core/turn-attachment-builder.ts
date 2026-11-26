@@ -56,8 +56,15 @@ export async function buildPromptAndAttachmentsForTurn(
     reqAttCache,
   } = input;
 
-  const sourceImages = incremental ? (turn.incrementalImages ?? []) : turn.images;
-  const sourceFiles = incremental ? (turn.incrementalFiles ?? []) : (turn.files ?? []);
+  const rawSourceImages = incremental ? (turn.incrementalImages ?? []) : turn.images;
+  const rawSourceFiles = incremental ? (turn.incrementalFiles ?? []) : (turn.files ?? []);
+  // On cold replay / failover / 80% thread rotation, historical cumulative media can exceed
+  // per-turn attachment limits (10 images / 5 files). Keep the most recent items rather than
+  // permanently failing the entire conversation with HTTP 400.
+  const omittedImages = !incremental && rawSourceImages.length > 10 ? rawSourceImages.length - 10 : 0;
+  const omittedFiles = !incremental && rawSourceFiles.length > 5 ? rawSourceFiles.length - 5 : 0;
+  const sourceImages = omittedImages > 0 ? rawSourceImages.slice(-10) : rawSourceImages;
+  const sourceFiles = omittedFiles > 0 ? rawSourceFiles.slice(-5) : rawSourceFiles;
   const rawPromptSource =
     overridePromptText !== undefined
       ? overridePromptText
@@ -78,8 +85,8 @@ export async function buildPromptAndAttachmentsForTurn(
   if (sourceFiles.length > 0) {
     const resolvedFiles = reqAttCache
       ? await reqAttCache.getOrResolveFiles(`files:${cacheScope}`, sourceFiles, (items) =>
-          resolveNormalizedFiles(items, turn.signal),
-        )
+        resolveNormalizedFiles(items, turn.signal),
+      )
       : await resolveNormalizedFiles(sourceFiles, turn.signal);
     if ((isOAuthAccount && oauthCred) || (isWeb && webCred)) {
       const uploadTimeoutSignal = turn.signal
@@ -90,23 +97,23 @@ export async function buildPromptAndAttachmentsForTurn(
           const doUpload = () =>
             isOAuthAccount && oauthCred
               ? uploadOAuthBinaryAttachment(
-                  oauthCred,
-                  threadId,
-                  f.filename,
-                  f.buf,
-                  f.mimeType,
-                  effectiveProxy,
-                  uploadTimeoutSignal,
-                )
+                oauthCred,
+                threadId,
+                f.filename,
+                f.buf,
+                f.mimeType,
+                effectiveProxy,
+                uploadTimeoutSignal,
+              )
               : uploadWebBinaryAttachment(
-                  webCred!,
-                  f.buf,
-                  f.filename,
-                  f.mimeType,
-                  threadId,
-                  effectiveProxy,
-                  uploadTimeoutSignal,
-                );
+                webCred!,
+                f.buf,
+                f.filename,
+                f.mimeType,
+                threadId,
+                effectiveProxy,
+                uploadTimeoutSignal,
+              );
           return reqAttCache
             ? reqAttCache.getOrUploadAttachment(slotId, threadId, f.buf, doUpload)
             : doUpload();
@@ -138,8 +145,8 @@ export async function buildPromptAndAttachmentsForTurn(
     let uploadedHighRes = false;
     const resolvedImgs = reqAttCache
       ? await reqAttCache.getOrResolveImages(`imgs:${cacheScope}`, sourceImages, (items) =>
-          resolveRawImagePayloads(items, turn.signal),
-        )
+        resolveRawImagePayloads(items, turn.signal),
+      )
       : await resolveRawImagePayloads(sourceImages, turn.signal);
     if ((isOAuthAccount && oauthCred) || (isWeb && webCred)) {
       const totalRawImgBytes = resolvedImgs.reduce((sum, im) => sum + im.buf.byteLength, 0);
@@ -151,27 +158,28 @@ export async function buildPromptAndAttachmentsForTurn(
           const imgAtts = await mapWithConcurrency(resolvedImgs, 3, async (im, idx) => {
             const prepared = await prepareHighResImageForOutOfBand(im.buf, im.mimeType);
             const ext = extForImageMime(prepared.mimeType);
-            const filename = `user_image_${String(idx + 1).padStart(3, "0")}.${ext}`;
+            const imgTag = incremental ? `_${crypto.randomUUID().slice(0, 4)}` : "";
+            const filename = `user_image_${String(idx + 1).padStart(3, "0")}${imgTag}.${ext}`;
             const doUpload = () =>
               isOAuthAccount && oauthCred
                 ? uploadOAuthBinaryAttachment(
-                    oauthCred,
-                    threadId,
-                    filename,
-                    prepared.buf,
-                    prepared.mimeType,
-                    effectiveProxy,
-                    uploadTimeoutSignal,
-                  )
+                  oauthCred,
+                  threadId,
+                  filename,
+                  prepared.buf,
+                  prepared.mimeType,
+                  effectiveProxy,
+                  uploadTimeoutSignal,
+                )
                 : uploadWebBinaryAttachment(
-                    webCred!,
-                    prepared.buf,
-                    filename,
-                    prepared.mimeType,
-                    threadId,
-                    effectiveProxy,
-                    uploadTimeoutSignal,
-                  );
+                  webCred!,
+                  prepared.buf,
+                  filename,
+                  prepared.mimeType,
+                  threadId,
+                  effectiveProxy,
+                  uploadTimeoutSignal,
+                );
             return reqAttCache
               ? reqAttCache.getOrUploadAttachment(slotId, threadId, prepared.buf, doUpload)
               : doUpload();
@@ -198,11 +206,20 @@ export async function buildPromptAndAttachmentsForTurn(
     }
   }
 
+  const omissionBanner =
+    omittedImages > 0 || omittedFiles > 0
+      ? `[Note: ${[
+        omittedImages > 0 ? `${omittedImages} earlier image(s)` : "",
+        omittedFiles > 0 ? `${omittedFiles} earlier file(s)` : "",
+      ]
+        .filter(Boolean)
+        .join(" and ")} from prior turns were omitted during cold replay to fit per-turn attachment limits; the most recent attachments are included.]`
+      : "";
   const fileBanner =
     uploadedFileNames.length > 0
       ? `[Attached file(s) in workspace: ${uploadedFileNames.map((n) => `\`${n}\``).join(", ")}. Read the attached file(s) to answer the user's request.]`
       : "";
-  const combinedText = [fileBanner, ...inlineDocTexts, rawPromptText?.trim() || ""]
+  const combinedText = [omissionBanner, fileBanner, ...inlineDocTexts, rawPromptText?.trim() || ""]
     .filter(Boolean)
     .join("\n\n");
   const text = combinedText || (atts.length > 0 ? "Please analyze the attached file(s)/image(s)." : "");

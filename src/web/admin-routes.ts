@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type http from "node:http";
+import path from "node:path";
 import {
   buildOAuthDiscoveryUrl,
   completeOAuthPkceCallback,
@@ -27,6 +28,12 @@ import { listLiveModels, resolveKnownModelId } from "../services/model-catalog.j
 import type { UsageLedger, LedgerRange } from "../services/usage-ledger.js";
 import type { AccountQuotaReport } from "../services/quota-service.js";
 import type { RequestTraceLogger } from "../services/request-logger.js";
+import {
+  applySelfUpdate,
+  getSelfUpdateCapability,
+  isSelfUpdateInProgress,
+  rollbackSelfUpdate,
+} from "../services/self-updater.js";
 import { checkLatestVersion } from "../services/update-checker.js";
 import type { UsageTracker } from "../services/usage-tracker.js";
 import { AdminAuthManager, clientIpOf, isDirectLoopbackRequest } from "./admin-auth.js";
@@ -46,6 +53,8 @@ export interface WebAdminContext {
   modelListFetcher?: (apiKey: string) => Promise<SDKModel[]>;
   sessionRpcFetcher?: typeof fetch;
   onDemandFetcher?: typeof fetch;
+  selfUpdateFetcher?: typeof fetch;
+  requestSelfUpdateRestart?: () => void;
   syncKeyQuotas: (opts: {
     includeDisabled?: boolean;
     forceRefresh?: boolean;
@@ -179,7 +188,38 @@ export async function tryHandleWebAdminRoute(
     adminAuth.requireAdminAuth(req, extractClientCredential(req));
     const force = new URL(req.url || "/", "http://localhost").searchParams.get("force") === "1";
     const info = await checkLatestVersion(force);
-    sendJson(res, 200, { ok: true, ...info });
+    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    sendJson(res, 200, {
+      ok: true,
+      ...info,
+      selfUpdate: getSelfUpdateCapability({ dataDir: effectiveDataDir }),
+      updateInProgress: isSelfUpdateInProgress(),
+    });
+    return true;
+  }
+
+  if (route === "/v1/admin/update/apply" && req.method === "POST") {
+    adminAuth.requireAdminAuth(req, extractClientCredential(req));
+    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    const result = await applySelfUpdate({
+      dataDir: effectiveDataDir,
+      fetcher: ctx.selfUpdateFetcher,
+    });
+    sendJson(res, 200, result);
+    if (result.willRestart && ctx.requestSelfUpdateRestart) {
+      setImmediate(() => ctx.requestSelfUpdateRestart?.());
+    }
+    return true;
+  }
+
+  if (route === "/v1/admin/update/rollback" && req.method === "POST") {
+    adminAuth.requireAdminAuth(req, extractClientCredential(req));
+    const effectiveDataDir = config.dataDir || path.resolve(process.cwd(), "data");
+    const result = rollbackSelfUpdate({ dataDir: effectiveDataDir });
+    sendJson(res, 200, result);
+    if (result.willRestart && ctx.requestSelfUpdateRestart) {
+      setImmediate(() => ctx.requestSelfUpdateRestart?.());
+    }
     return true;
   }
 
@@ -187,10 +227,12 @@ export async function tryHandleWebAdminRoute(
     adminAuth.requireAdminAuth(req, extractClientCredential(req));
     const r = new URL(req.url || "/", "http://localhost").searchParams.get("range");
     const range: LedgerRange = r === "7d" || r === "30d" ? r : "today";
+    const persistenceError = keyPool.getPersistenceError();
     sendJson(res, 200, {
       object: "gateway.overview",
       ...ctx.usageLedger.overview(range),
       ipRecorded: config.recordClientIp !== false,
+      ...(persistenceError ? { storageWarning: persistenceError } : {}),
       keyPool: keyPool.statusSnapshot()
     });
     return true;
@@ -271,6 +313,10 @@ export async function tryHandleWebAdminRoute(
     if (typeof body.customAgentPrompt === "string") {
       patch.customAgentPrompt = body.customAgentPrompt;
     }
+    if (typeof body.sanitizeClientSystemPrompt === "boolean") {
+      patch.sanitizeClientSystemPrompt = body.sanitizeClientSystemPrompt;
+      config.sanitizeClientSystemPrompt = body.sanitizeClientSystemPrompt;
+    }
     if (typeof body.autoRephraseOnContentFilter === "boolean") {
       patch.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
       config.autoRephraseOnContentFilter = body.autoRephraseOnContentFilter;
@@ -288,6 +334,7 @@ export async function tryHandleWebAdminRoute(
     keyPool.updateSettings(patch);
     config.chatAgentId = keyPool.getSettings().chatAgentId;
     config.customAgentPrompt = keyPool.getSettings().customAgentPrompt;
+    config.sanitizeClientSystemPrompt = keyPool.getSettings().sanitizeClientSystemPrompt;
     config.autoRephraseOnContentFilter = keyPool.getSettings().autoRephraseOnContentFilter;
     config.contentFilterRephrasePrompt = keyPool.getSettings().contentFilterRephrasePrompt;
     config.contentFilterRephraseModel = keyPool.getSettings().contentFilterRephraseModel;
@@ -627,7 +674,7 @@ export async function tryHandleWebAdminRoute(
           const added = keyPool.addKey(serializeOAuthCredential(oauthCred), true, autoLabel);
           void ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
           scheduleEagerEnsureAgents([added.slotId]);
-        } catch {}
+        } catch { }
       },
     });
     sendJson(res, 200, { ok: true, ...disc });
@@ -668,7 +715,7 @@ export async function tryHandleWebAdminRoute(
           );
           void ctx.syncKeyQuotas({ includeDisabled: false }).catch(() => undefined);
           scheduleEagerEnsureAgents([added.slotId]);
-        } catch {}
+        } catch { }
       },
     });
     sendJson(res, 200, { ok: true, ...started });
@@ -756,12 +803,22 @@ export async function tryHandleWebAdminRoute(
     const targets = requestedIds.length > 0
       ? allKeys.filter((k) => requestedIds.includes(k.slotId))
       : allKeys;
-    const settled = await Promise.allSettled(
-      targets.map(async (target) => {
-        const r = await clearCloudForTarget(target);
-        return { slotId: target.slotId, label: target.label || target.slotId, ...r };
-      }),
-    );
+    const settled: Array<PromiseSettledResult<{ slotId: string; label: string; deleted: number; remaining: number }>> =
+      new Array(targets.length);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(4, targets.length) }, async () => {
+      while (cursor < targets.length) {
+        const idx = cursor++;
+        const target = targets[idx]!;
+        try {
+          const r = await clearCloudForTarget(target);
+          settled[idx] = { status: "fulfilled", value: { slotId: target.slotId, label: target.label || target.slotId, ...r } };
+        } catch (reason) {
+          settled[idx] = { status: "rejected", reason };
+        }
+      }
+    });
+    await Promise.all(workers);
     let totalDeleted = 0;
     let okCount = 0;
     let failedCount = 0;
@@ -809,7 +866,7 @@ export async function tryHandleWebAdminRoute(
     const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
     if (!target) throw new GatewayError("Key slot not found.", 404, "not_found");
     keyPool.recheckSlot(slotId);
-    const reports = await ctx.syncKeyQuotas({ includeDisabled: false, forceRefresh: true }).catch(() => [] as AccountQuotaReport[]);
+    const reports = await ctx.syncKeyQuotas({ includeDisabled: false, forceRefresh: true, slotIds: [slotId] }).catch(() => [] as AccountQuotaReport[]);
     const masked = keyPool.statusSnapshot().find((s) => s.slotId === slotId)?.maskedKey;
     const mine = reports.find((r) => r.maskedKey === masked);
     // A rejected key is tripped again right away so the console shows the real reason instead of "enabled".
@@ -822,6 +879,88 @@ export async function tryHandleWebAdminRoute(
     }
     const status = keyPool.statusSnapshot().find((s) => s.slotId === slotId);
     sendJson(res, 200, { ok: true, recovered: Boolean(status?.enabled), slot: status, keyPool: keyPool.statusSnapshot() });
+    return true;
+  }
+
+  if (route === "/v1/admin/keys/sync-agents" && req.method === "POST") {
+    const body = (await readJsonBody(req, config.maxBodyBytes).catch(() => ({}))) as { slotIds?: string[] };
+    const requestedIds = Array.isArray(body?.slotIds)
+      ? body.slotIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+    const allKeys = keyPool.allManagedKeys();
+    const targets =
+      requestedIds.length > 0
+        ? allKeys.filter((k) => requestedIds.includes(k.slotId))
+        : allKeys.filter((k) => k.enabled);
+
+    const settled: Array<
+      PromiseSettledResult<{
+        slotId: string;
+        label: string;
+        agentId: string;
+        action: "upgraded" | "created" | "unchanged";
+        previousName?: string;
+      }>
+    > = new Array(targets.length);
+
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(3, targets.length) }, async () => {
+      while (cursor < targets.length) {
+        const idx = cursor++;
+        const target = targets[idx]!;
+        try {
+          const synced = await engine.syncCodingAgentForKey(
+            target.rawKey,
+            target.slotId,
+            keyPool,
+            target.proxyUrl,
+          );
+          settled[idx] = {
+            status: "fulfilled",
+            value: {
+              slotId: target.slotId,
+              label: target.label || target.slotId,
+              ...synced,
+            },
+          };
+        } catch (reason) {
+          settled[idx] = { status: "rejected", reason };
+        }
+      }
+    });
+    await Promise.all(workers);
+
+    let upgraded = 0;
+    let created = 0;
+    let unchanged = 0;
+    let failedCount = 0;
+    const results = settled.map((item, idx) => {
+      const target = targets[idx]!;
+      if (item.status === "fulfilled") {
+        if (item.value.action === "upgraded") upgraded += 1;
+        else if (item.value.action === "created") created += 1;
+        else unchanged += 1;
+        return { ...item.value, status: "ok" as const };
+      }
+      failedCount += 1;
+      return {
+        slotId: target.slotId,
+        label: target.label || target.slotId,
+        status: "error" as const,
+        error: item.reason instanceof Error ? item.reason.message : String(item.reason),
+      };
+    });
+
+    sendJson(res, 200, {
+      ok: true,
+      total: targets.length,
+      upgraded,
+      created,
+      unchanged,
+      failedCount,
+      results,
+      keyPool: keyPool.statusSnapshot(),
+    });
     return true;
   }
 
@@ -846,6 +985,26 @@ export async function tryHandleWebAdminRoute(
     const target = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
     if (!target) throw new GatewayError(`Key slot '${slotId}' not found.`, 404, "not_found");
     const body = await readJsonBody(req, 16_384).catch(() => ({}));
+    const upgrade = isRecord(body) && body.upgrade === true;
+    if (upgrade) {
+      const synced = await engine.syncCodingAgentForKey(
+        target.rawKey,
+        slotId,
+        keyPool,
+        target.proxyUrl,
+      );
+      const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
+      sendJson(res, 200, {
+        ok: true,
+        slotId,
+        chatAgentId: synced.agentId,
+        action: synced.action,
+        ...(synced.previousName ? { previousName: synced.previousName } : {}),
+        agents,
+        keyPool: keyPool.statusSnapshot(),
+      });
+      return true;
+    }
     const forceCreate = isRecord(body) && body.forceCreate === true;
     const chatAgentId = await engine.ensureCodingAgentForKey(
       target.rawKey,

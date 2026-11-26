@@ -7,7 +7,7 @@ const WARM_THREAD_TTL_MS = 30 * 60 * 1000;
 const PARKED_WS_IDLE_TTL_MS = 15 * 60 * 1000;
 const PARKED_WS_TOKEN_REFRESH_MS = 12 * 60 * 1000;
 const MAX_WARM_THREADS = 256;
-const MAX_PARKED_WS = 32;
+const MIN_PARKED_WS = 64;
 // AWS Quick enforces a hard limit of 5 active WebSockets per account (`LimitExceededException`).
 // Keep at most 2 idle parked sockets per slot so burst concurrency + retries always have headroom.
 export const MAX_PARKED_WS_PER_SLOT = 2;
@@ -47,12 +47,15 @@ export interface WarmLookupResult {
  */
 export class WarmSessionPool {
   private readonly maxWarmSessions: number;
+  private readonly maxParkedWs: number;
   private readonly warmSessionTtlMs: number;
   private readonly warmThreads = new Map<string, WarmThreadEntry>();
   private readonly activeWsBySlot = new Map<string, number>();
+  private readonly evictSettlingUntilBySlot = new Map<string, number>();
 
   constructor(opts: { maxWarmSessions?: number; warmSessionTtlMs?: number }) {
     this.maxWarmSessions = opts.maxWarmSessions || MAX_WARM_THREADS;
+    this.maxParkedWs = Math.max(MIN_PARKED_WS, Math.floor(this.maxWarmSessions / 2));
     this.warmSessionTtlMs = opts.warmSessionTtlMs || WARM_THREAD_TTL_MS;
   }
 
@@ -144,7 +147,20 @@ export class WarmSessionPool {
       if (existing.isIncognito) this.removeEntry(existing, false);
       evicted += 1;
     }
+    if (evicted > 0) {
+      this.evictSettlingUntilBySlot.set(slotId, Math.max(this.evictSettlingUntilBySlot.get(slotId) || 0, Date.now() + 150));
+    }
     return evicted;
+  }
+
+  getEvictSettlingRemainingMs(slotId: string): number {
+    const until = this.evictSettlingUntilBySlot.get(slotId) || 0;
+    const rem = until - Date.now();
+    if (rem <= 0) {
+      this.evictSettlingUntilBySlot.delete(slotId);
+      return 0;
+    }
+    return rem;
   }
 
   lookup(
@@ -271,7 +287,7 @@ export class WarmSessionPool {
       while (this.countParkedWsForSlot(slotId) >= MAX_PARKED_WS_PER_SLOT) {
         if (this.evictParkedWsForSlot(slotId, 1) === 0) break;
       }
-      while (this.countParkedWs() >= MAX_PARKED_WS) {
+      while (this.countParkedWs() >= this.maxParkedWs) {
         let evicted = false;
         for (const existing of new Set(this.warmThreads.values())) {
           if (existing.parkedWs) {

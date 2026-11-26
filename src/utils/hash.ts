@@ -236,6 +236,6 @@ export function computeDialogPrefixHashes(params: {
     currentInputPrefixHash: runningHash,
     ...(incrementalUserText !== undefined ? { incrementalUserText } : {}),
     ...(incrementalImages ? { incrementalImages } : {}),
-    ...(incrementalFiles && incrementalFiles.length > 0 ? { incrementalFiles } : {}),
+    ...(incrementalFiles ? { incrementalFiles } : {}),
   };
 }

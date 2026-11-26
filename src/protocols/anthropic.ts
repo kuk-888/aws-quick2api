@@ -11,6 +11,8 @@ import {
 } from "../core/types.js";
 import { computeDialogPrefixHashes, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
+import { estimatePromptTokens } from "../core/media-utils.js";
+import { resolveKnownModelId } from "../services/model-catalog.js";
 import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
 function flattenAnthropicSystem(system: unknown): string | undefined {
@@ -40,7 +42,19 @@ function parseAnthropicImageBlock(block: Record<string, unknown>): NormalizedIma
 }
 
 /** Block types that are safe to drop: they carry no user-visible input the model must see. */
-const IGNORABLE_BLOCK_TYPES = new Set(["thinking", "redacted_thinking", "server_tool_use", "web_search_tool_result", "web_fetch_tool_result"]);
+const IGNORABLE_BLOCK_TYPES = new Set([
+  "thinking",
+  "redacted_thinking",
+  "server_tool_use",
+  "web_search_tool_result",
+  "web_fetch_tool_result",
+  "tool_search_tool_result",
+  "code_execution_tool_result",
+  "bash_code_execution_tool_result",
+  "text_editor_code_execution_tool_result",
+  "mcp_tool_use",
+  "mcp_tool_result",
+]);
 
 const PLAIN_TEXT_DOC_MIMES = new Set([
   "application/json",
@@ -188,12 +202,27 @@ export function parseAnthropicTools(rawTools: unknown): {
       nativeSet.add("webFetch");
       continue;
     }
+    if (rawType.startsWith("web_fetch")) {
+      nativeSet.add("webFetch");
+      continue;
+    }
+    if (
+      rawType.startsWith("tool_search_tool") ||
+      rawType.startsWith("code_execution") ||
+      (!isRecord(item.input_schema) &&
+        (rawType.startsWith("bash_202") ||
+          rawType.startsWith("text_editor_202") ||
+          rawType.startsWith("computer_202")))
+    ) {
+      continue;
+    }
     const name = typeof item.name === "string" ? item.name.trim() : "";
     if (!name) continue;
     customTools.push({
       name,
       ...(typeof item.description === "string" && item.description ? { description: item.description } : {}),
-      inputSchema: isRecord(item.input_schema) ? item.input_schema : { type: "object", properties: {} }
+      inputSchema: isRecord(item.input_schema) ? item.input_schema : { type: "object", properties: {} },
+      ...(item.defer_loading === true ? { deferLoading: true } : {}),
     });
   }
   return { customTools, nativeSdkTools: [...nativeSet] };
@@ -214,10 +243,14 @@ export function estimateAnthropicTokens(body: unknown): number {
   if (!isRecord(body)) return 1;
   let images = 0;
   // Replace every image/base64-document block (including ones nested in tool_result content) so the base64
-  // payload is not counted as text; each attachment is charged a flat estimate instead.
+  // payload is not counted as text, and omit ignored thinking blocks; estimate text with the bilingual CJK/ASCII
+  // estimator so Chinese/Japanese/Korean prompts are not underestimated 4-6x.
   const serialized = JSON.stringify(
     { system: body.system ?? "", messages: body.messages ?? [], tools: body.tools ?? [] },
     (_key, value) => {
+      if (isRecord(value) && (value.type === "thinking" || value.type === "redacted_thinking")) {
+        return undefined;
+      }
       if (isRecord(value) && value.type === "image") {
         images += 1;
         return { type: "image" };
@@ -229,7 +262,7 @@ export function estimateAnthropicTokens(body: unknown): number {
       return value;
     }
   );
-  return Math.max(1, Math.ceil(serialized.length / 4)) + estimateImageTokens(images);
+  return Math.max(1, estimatePromptTokens(serialized)) + estimateImageTokens(images);
 }
 
 interface AnthropicTurnLine extends HashableDialogItem {
@@ -252,6 +285,15 @@ export function parseAnthropicMessagesRequest(
   }
   if (typeof body.max_tokens !== "number" || !Number.isInteger(body.max_tokens) || body.max_tokens < 1) {
     throw new GatewayError("`max_tokens` must be a positive integer.", 400, "invalid_request_error", "max_tokens");
+  }
+  if (isRecord(body.output_config) && isRecord(body.output_config.format) && body.output_config.format.type !== undefined && body.output_config.format.type !== "text") {
+    const kind = typeof body.output_config.format.type === "string" ? body.output_config.format.type : typeof body.output_config.format.type;
+    throw new GatewayError(
+      `\`output_config.format\` of type '${kind}' is not supported. Structured outputs cannot be enforced by AWS Quick; describe the schema in the prompt (or use a tool) and validate client-side.`,
+      400,
+      "unsupported_parameter",
+      "output_config.format",
+    );
   }
 
   const rawBody: Record<string, unknown> = { ...body };
@@ -323,7 +365,13 @@ export function parseAnthropicMessagesRequest(
         msgFiles.push(...files);
         allFiles.push(...files);
         toolImagesByUseId.set(toolUseId, images);
-        toolResultLines.push(`[TOOL_RESULT id=${toolUseId}${isError ? " error=true" : ""}]:\n${text || "[empty]"}`);
+        const toolFallback =
+          images.length > 0
+            ? `[Image attached (${images.length})]`
+            : files.length > 0
+              ? `[File attached: ${files.map((f) => f.filename).join(", ")}]`
+              : "[empty]";
+        toolResultLines.push(`[TOOL_RESULT id=${toolUseId}${isError ? " error=true" : ""}]:\n${text || toolFallback}`);
         if (toolUseId) {
           msgToolResults.push({ toolCallId: toolUseId, content: text, isError, ...(images.length ? { images } : {}) });
         }
@@ -442,9 +490,16 @@ const ANTHROPIC_USAGE_WATERMARKS = new Map<
 const MAX_USAGE_WATERMARK_ENTRIES = 512;
 const USAGE_WATERMARK_TTL_MS = 60 * 60 * 1000;
 
+function watermarkKeyForTurn(turn: ParsedProtocolTurn): string | undefined {
+  const convKey = turn.conversationKey?.trim();
+  if (!convKey) return undefined;
+  const canonicalModel = resolveKnownModelId(turn.requestedModel) ?? turn.requestedModel.trim().toLowerCase();
+  return `${convKey}|${canonicalModel}`;
+}
+
 function peekAnthropicStartInputTokens(turn: ParsedProtocolTurn): number {
   const estimated = Math.max(1, Math.floor(turn.estimatedInputTokens || 0));
-  const convKey = turn.conversationKey?.trim();
+  const convKey = watermarkKeyForTurn(turn);
   if (!convKey) return estimated;
   const prev = ANTHROPIC_USAGE_WATERMARKS.get(convKey);
   if (!prev || Date.now() - prev.updatedAt > USAGE_WATERMARK_TTL_MS) return estimated;
@@ -474,7 +529,7 @@ export function stabilizeAnthropicUsage(
   const upstreamTotal = rawInput + cacheRead + cacheWrite;
 
   let floorTotal = estimated;
-  const convKey = turn.conversationKey?.trim();
+  const convKey = watermarkKeyForTurn(turn);
   const now = Date.now();
   if (convKey) {
     const prev = ANTHROPIC_USAGE_WATERMARKS.get(convKey);
@@ -619,7 +674,7 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
             yield sse("content_block_start", {
               type: "content_block_start",
               index: blockIndex,
-              content_block: { type: "thinking", thinking: "" }
+              content_block: { type: "thinking", thinking: "", signature: "" }
             });
           }
           yield sse("content_block_delta", {
@@ -648,7 +703,10 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
         } else if (ev.type === "tool_calls") {
           hasEmittedTextOrTool = true;
           yield* closeOpenBlock();
-          for (const tc of ev.calls) {
+          const rawTc = isRecord(turn.rawBody?.tool_choice) ? turn.rawBody.tool_choice : undefined;
+          const disableParallel = rawTc?.disable_parallel_tool_use === true;
+          const calls = disableParallel ? ev.calls.slice(0, 1) : ev.calls;
+          for (const tc of calls) {
             blockIndex += 1;
             emittedAnyBlock = true;
             yield sse("content_block_start", {
@@ -693,6 +751,15 @@ export const anthropicMessagesAdapter: ProtocolAdapter = {
       }
       if (!emittedDone) {
         yield* closeOpenBlock();
+        if (!emittedAnyBlock) {
+          blockIndex += 1;
+          yield sse("content_block_start", {
+            type: "content_block_start",
+            index: blockIndex,
+            content_block: { type: "text", text: "" }
+          });
+          yield sse("content_block_stop", { type: "content_block_stop", index: blockIndex });
+        }
         yield sse("message_delta", {
           type: "message_delta",
           delta: { stop_reason: "end_turn", stop_sequence: null },

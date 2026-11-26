@@ -1,4 +1,16 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import fsPromises from "node:fs/promises";
 import path from "node:path";
 import type { AutoDisabledState, GatewayConfig, LbStrategy } from "./types.js";
 
@@ -185,6 +197,7 @@ export function loadConfigFromEnv(
     customAgentPrompt: env.CUSTOM_AGENT_PROMPT
       ? env.CUSTOM_AGENT_PROMPT.replace(/\\n/g, "\n").trim() || undefined
       : undefined,
+    sanitizeClientSystemPrompt: parseBoolEnv(env.SANITIZE_CLIENT_SYSTEM_PROMPT, false),
     autoRephraseOnContentFilter: parseBoolEnv(env.AUTO_REPHRASE_ON_CONTENT_FILTER, false),
     contentFilterRephrasePrompt: env.CONTENT_FILTER_REPHRASE_PROMPT
       ? env.CONTENT_FILTER_REPHRASE_PROMPT.replace(/\\n/g, "\n").trim() || undefined
@@ -275,8 +288,8 @@ function writeEnvFileAtomic(envFilePath: string, content: string): void {
   }
 }
 
-export function persistPoolConfigToEnvFile(
-  envFilePath: string | undefined,
+export function buildUpdatedPoolEnvContent(
+  content: string,
   state: {
     activeKeys: string[];
     disabledKeys: string[];
@@ -293,13 +306,12 @@ export function persistPoolConfigToEnvFile(
     incognitoMode?: boolean;
     autoEnsureCodingAgent?: boolean;
     customAgentPrompt?: string;
+    sanitizeClientSystemPrompt?: boolean;
     autoRephraseOnContentFilter?: boolean;
     contentFilterRephrasePrompt?: string;
     contentFilterRephraseModel?: string;
-  }
-): void {
-  if (!envFilePath || !existsSync(envFilePath)) return;
-  const content = readFileSync(envFilePath, "utf8");
+  },
+): string {
   const updates: Record<string, string> = {
     QUICK_TOKENS: stripEnvNewlines(state.activeKeys.join(",")),
     DISABLED_QUICK_TOKENS: stripEnvNewlines(state.disabledKeys.join(",")),
@@ -321,6 +333,9 @@ export function persistPoolConfigToEnvFile(
       : {}),
     ...(typeof state.customAgentPrompt === "string"
       ? { CUSTOM_AGENT_PROMPT: stripEnvNewlines(state.customAgentPrompt.replace(/\r?\n/g, "\\n")) }
+      : {}),
+    ...(typeof state.sanitizeClientSystemPrompt === "boolean"
+      ? { SANITIZE_CLIENT_SYSTEM_PROMPT: String(state.sanitizeClientSystemPrompt) }
       : {}),
     ...(typeof state.autoRephraseOnContentFilter === "boolean"
       ? { AUTO_REPHRASE_ON_CONTENT_FILTER: String(state.autoRephraseOnContentFilter) }
@@ -351,9 +366,133 @@ export function persistPoolConfigToEnvFile(
     if (!seen.has(k)) lines.push(`${k}=${v}`);
   }
 
-  const cleaned = lines.filter((l, idx, arr) => !(l === "" && arr[idx - 1] === "")).join("\n").trimEnd() + "\n";
+  return lines.filter((l, idx, arr) => !(l === "" && arr[idx - 1] === "")).join("\n").trimEnd() + "\n";
+}
+
+export function persistPoolConfigToEnvFile(
+  envFilePath: string | undefined,
+  state: Parameters<typeof buildUpdatedPoolEnvContent>[1]
+): void {
+  if (!envFilePath || !existsSync(envFilePath)) return;
+  const content = readFileSync(envFilePath, "utf8");
+  const cleaned = buildUpdatedPoolEnvContent(content, state);
   // Atomic replace: a crash mid-write must never leave a truncated .env (it holds the upstream keys).
   writeEnvFileAtomic(envFilePath, cleaned);
+}
+
+function isWritableEnvFileSync(envFilePath: string): boolean {
+  try {
+    accessSync(envFilePath, fsConstants.W_OK);
+    const st = statSync(envFilePath);
+    if ((st.mode & 0o222) === 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Synchronous best-effort mirror of pool state back to `.env` (used during graceful shutdown).
+ * Silently skips if `.env` is read-only (`0444`, `:ro`, `EACCES`, `EROFS`) so `pool-state.json`
+ * remains unaffected and read-only `.env` mounts are never touched.
+ */
+export function mirrorPoolConfigToEnvFileSyncBestEffort(
+  envFilePath: string | undefined,
+  state: Parameters<typeof buildUpdatedPoolEnvContent>[1],
+): boolean {
+  if (!envFilePath || !existsSync(envFilePath) || !isWritableEnvFileSync(envFilePath)) return false;
+  try {
+    const content = readFileSync(envFilePath, "utf8");
+    const cleaned = buildUpdatedPoolEnvContent(content, state);
+    if (cleaned === content) return true;
+    writeEnvFileAtomic(envFilePath, cleaned);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Non-blocking best-effort async mirror of pool state back to `.env`.
+ * Protects users who mounted only `.env` (without `/app/data`) or who later downgrade to `<= v0.1.20`.
+ * Silently no-ops if `.env` is mounted read-only (`0444`, `:ro`, `EACCES`, `EROFS`), since
+ * `${DATA_DIR}/pool-state.json` is already the authoritative atomic store.
+ */
+export async function mirrorPoolConfigToEnvFileAsync(
+  envFilePath: string | undefined,
+  state: Parameters<typeof buildUpdatedPoolEnvContent>[1],
+): Promise<boolean> {
+  if (!envFilePath || !existsSync(envFilePath)) return false;
+  const tmpPath = `${envFilePath}.${process.pid}.${Date.now()}.mirror.tmp`;
+  try {
+    await fsPromises.access(envFilePath, fsConstants.W_OK);
+    const st = await fsPromises.stat(envFilePath);
+    if ((st.mode & 0o222) === 0) return false;
+    const content = await fsPromises.readFile(envFilePath, "utf8");
+    const cleaned = buildUpdatedPoolEnvContent(content, state);
+    if (cleaned === content) return true;
+    await fsPromises.writeFile(tmpPath, cleaned, { encoding: "utf8", mode: 0o600 });
+    try { await fsPromises.chmod(tmpPath, 0o600); } catch { }
+    try {
+      await fsPromises.rename(tmpPath, envFilePath);
+      return true;
+    } catch (renameErr) {
+      try { await fsPromises.unlink(tmpPath); } catch { }
+      const code = (renameErr as NodeJS.ErrnoException)?.code;
+      if (code === "EBUSY" || code === "EXDEV" || code === "EPERM") {
+        await fsPromises.writeFile(envFilePath, cleaned, { encoding: "utf8", mode: 0o600 });
+        try { await fsPromises.chmod(envFilePath, 0o600); } catch { }
+        return true;
+      }
+      return false;
+    }
+  } catch {
+    try { await fsPromises.unlink(tmpPath); } catch { }
+    return false;
+  }
+}
+
+/**
+ * Verifies that `dataDir` is writable at startup so non-root Docker containers with a root-owned
+ * `./data` bind mount fail fast with an actionable `chown` hint instead of silently dropping writes later.
+ */
+export function assertDataDirWritable(dataDir: string | undefined): void {
+  if (!dataDir) return;
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const probePath = path.join(dataDir, `.write-probe-${process.pid}-${Date.now()}.tmp`);
+  try {
+    writeFileSync(probePath, "ok\n", { mode: 0o600 });
+  } finally {
+    try {
+      unlinkSync(probePath);
+    } catch {
+      // Ignore if probe was never created
+    }
+  }
+}
+
+/**
+ * On Linux inside Docker (`/.dockerenv` present), checks `/proc/self/mountinfo` to detect whether
+ * `dataDir` is backed by a dedicated mount point (e.g. `-v ./data:/app/data`).
+ * Returns `false` only when running inside Docker AND `dataDir` sits on the ephemeral container rootfs.
+ */
+export function isDockerDataDirMounted(dataDir: string | undefined): boolean {
+  if (!dataDir || process.platform !== "linux" || !existsSync("/.dockerenv")) return true;
+  try {
+    const resolved = path.resolve(dataDir).replace(/\/+$/, "") || "/";
+    const mountinfo = readFileSync("/proc/self/mountinfo", "utf8");
+    for (const line of mountinfo.split("\n")) {
+      const parts = line.split(" ");
+      const mountPoint = parts[4];
+      if (!mountPoint || mountPoint === "/") continue;
+      if (resolved === mountPoint || resolved.startsWith(`${mountPoint}/`)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return true;
+  }
 }
 
 export function persistAdminPasswordToEnvFile(envFilePath: string | undefined, newPassword: string): void {
