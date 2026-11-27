@@ -24,7 +24,8 @@ export interface ResolvedRawImage {
 export class RequestAttachmentCache {
   private readonly rawFilesByKey = new Map<string, ResolvedRawFile[]>();
   private readonly rawImagesByKey = new Map<string, ResolvedRawImage[]>();
-  private readonly uploadedByScopeAndHash = new Map<string, QuickFileAttachment>();
+  private readonly preparedImagesByHash = new Map<string, Promise<ResolvedRawImage>>();
+  private readonly uploadedByScopeAndHash = new Map<string, Promise<QuickFileAttachment>>();
 
   async getOrResolveFiles(
     scopeKey: string,
@@ -50,6 +51,25 @@ export class RequestAttachmentCache {
     return resolved;
   }
 
+  async getOrPrepareHighResImage(
+    buf: Buffer,
+    mimeType: string,
+    preparer: () => Promise<ResolvedRawImage>,
+  ): Promise<ResolvedRawImage> {
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+    const key = `${mimeType}|${sha256}`;
+    const existing = this.preparedImagesByHash.get(key);
+    if (existing) return existing;
+    const inflight = preparer().catch((err) => {
+      if (this.preparedImagesByHash.get(key) === inflight) {
+        this.preparedImagesByHash.delete(key);
+      }
+      throw err;
+    });
+    this.preparedImagesByHash.set(key, inflight);
+    return inflight;
+  }
+
   async getOrUploadAttachment(
     slotId: string,
     threadId: string,
@@ -58,10 +78,15 @@ export class RequestAttachmentCache {
   ): Promise<QuickFileAttachment> {
     const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
     const key = `${slotId}|${threadId}|${sha256}`;
-    const cached = this.uploadedByScopeAndHash.get(key);
-    if (cached) return cached;
-    const uploaded = await uploader();
-    this.uploadedByScopeAndHash.set(key, uploaded);
-    return uploaded;
+    const existing = this.uploadedByScopeAndHash.get(key);
+    if (existing) return existing;
+    const inflight = uploader().catch((err) => {
+      if (this.uploadedByScopeAndHash.get(key) === inflight) {
+        this.uploadedByScopeAndHash.delete(key);
+      }
+      throw err;
+    });
+    this.uploadedByScopeAndHash.set(key, inflight);
+    return inflight;
   }
 }

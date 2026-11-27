@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import { fetchViaOptionalProxy } from "../utils/proxy-agent.js";
-import type { QuickFileAttachment } from "./oauth-client.js";
+import { normalizeOAuthUploadContentType, type QuickFileAttachment } from "./oauth-client.js";
 import type { CloudSessionMeta, QuickQuotaUsage } from "./types.js";
 
 export interface WebCookieCredential {
@@ -314,15 +314,26 @@ export async function uploadWebBinaryAttachment(
   signal?: AbortSignal,
 ): Promise<QuickFileAttachment> {
   const buf = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  if (buf.byteLength === 0) {
+    throw new Error("AWS Quick Web attachment upload rejected: empty file (0 bytes).");
+  }
   const contentSha256 = crypto.createHash("sha256").update(buf).digest("hex");
-  const normalizedMime = mimeType.trim().toLowerCase() || "application/octet-stream";
+  const normalizedMime = normalizeOAuthUploadContentType(mimeType, filename);
   const mbtcEnc = encodeURIComponent(cred.mbtc);
+  const acctEnc = encodeURIComponent(cred.accountId);
 
+  // Align 1:1 with official quick.aws.com web capture (`req-1431-presigned-url.json`):
+  // Operation=ConversationServiceFileAttachmentProxy, awsAccountId, name, contentType, contentLength, mbtc
+  // plus `x-amzn-target: api`, `x-amzn-web-client-version: 0.1.4`, and chat `Referer`.
   const uploadUrl =
-    `https://quick.aws.com/sn/account/${encodeURIComponent(cred.accountId)}` +
-    `/qbsproxy/qs-file-proxy/accounts/${encodeURIComponent(cred.accountId)}` +
-    `/attachments/presigned-url?Operation=ConversationSendMessage` +
-    `&filename=${encodeURIComponent(filename)}&mbtc=${mbtcEnc}`;
+    `https://quick.aws.com/sn/account/${acctEnc}` +
+    `/qbsproxy/qs-file-proxy/accounts/${acctEnc}` +
+    `/attachments/presigned-url?Operation=ConversationServiceFileAttachmentProxy` +
+    `&awsAccountId=${acctEnc}` +
+    `&name=${encodeURIComponent(filename)}` +
+    `&contentType=${encodeURIComponent(normalizedMime)}` +
+    `&contentLength=${buf.byteLength}` +
+    `&mbtc=${mbtcEnc}`;
 
   let upResp!: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -331,12 +342,15 @@ export async function uploadWebBinaryAttachment(
       {
         method: "POST",
         headers: {
+          Accept: "*/*",
           "Content-Type": normalizedMime,
           Origin: "https://quick.aws.com",
+          Referer: `https://quick.aws.com/sn/account/${acctEnc}/start/chat?conversationId=${encodeURIComponent(threadId)}`,
           Cookie: cred.cookie,
           "User-Agent": WEB_UA,
           "x-amzn-csrf-token": mbtcEnc,
-          "X-Quick-File-Name": encodeURIComponent(filename),
+          "x-amzn-target": "api",
+          "x-amzn-web-client-version": "0.1.4",
         },
         body: buf,
         ...(signal ? { signal } : {}),

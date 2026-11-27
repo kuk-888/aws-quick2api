@@ -4,6 +4,36 @@ import type { NormalizedTool, NormalizedToolCall, ToolChoiceMode } from "./types
 const TOOL_CALL_OPEN = "<tool_call>";
 const TOOL_CALL_CLOSE = "</tool_call>";
 const COMPACT_SCHEMA_TRIGGER_BYTES = 12_000;
+const SYSTEM_REMINDER_OPEN_RE = /<system-reminder>/i;
+const MAX_TOOL_SCHEMA_CACHE = 128;
+const MAX_SYS_PROMPT_CACHE = 64;
+
+const toolSchemaRefCache = new WeakMap<readonly NormalizedTool[], string>();
+const toolSchemaHashCache = new Map<string, string>();
+const sanitizedSysPromptCache = new Map<string, string>();
+
+function lruGet(cache: Map<string, string>, key: string): string | undefined {
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    cache.delete(key);
+    cache.set(key, hit);
+  }
+  return hit;
+}
+
+function lruSet(cache: Map<string, string>, key: string, value: string, maxSize: number): void {
+  if (cache.size >= maxSize) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, value);
+}
+
+function utf8ByteLengthExceeds(str: string, threshold: number): boolean {
+  if (str.length > threshold) return true;
+  if (str.length * 3 <= threshold) return false;
+  return Buffer.byteLength(str, "utf8") > threshold;
+}
 
 function trimText(text: string, maxLen: number): string {
   const clean = text.replace(/\s+/g, " ").trim();
@@ -22,9 +52,11 @@ function compactJsonSchema(
     return node.map((item) => compactJsonSchema(item, maxDescLen, depth + 1, requiredOnlyDescLen));
   }
   const obj = node as Record<string, unknown>;
-  const requiredSet = new Set(
-    Array.isArray(obj.required) ? obj.required.filter((r): r is string => typeof r === "string") : [],
-  );
+  const needRequiredSet =
+    maxDescLen === 0 && requiredOnlyDescLen > 0 && Array.isArray(obj.required) && obj.required.length > 0;
+  const requiredSet = needRequiredSet
+    ? new Set((obj.required as unknown[]).filter((r): r is string => typeof r === "string"))
+    : null;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (k === "$schema" || k === "$id" || k === "title" || k === "examples" || k === "default") continue;
@@ -38,7 +70,7 @@ function compactJsonSchema(
         const childDescLen =
           maxDescLen > 0
             ? maxDescLen
-            : requiredOnlyDescLen > 0 && requiredSet.has(pk)
+            : requiredSet && requiredSet.has(pk)
               ? requiredOnlyDescLen
               : 0;
         props[pk] = compactJsonSchema(pv, childDescLen, depth + 1, requiredOnlyDescLen);
@@ -71,11 +103,10 @@ export function stripHighRiskClientHeaders(text: string): string {
  * (never alters conversation prefix hashes).
  */
 export function normalizeSystemReminderTagsForUpstream(input: string): string {
-  if (!input) return input;
+  if (!input || !SYSTEM_REMINDER_OPEN_RE.test(input)) return input;
   const lower = input.toLowerCase();
   const openTag = "<system-reminder>";
   const closeTag = "</system-reminder>";
-  if (!lower.includes(openTag)) return input;
   let out = "";
   let pos = 0;
   while (pos < input.length) {
@@ -106,7 +137,14 @@ export function normalizeSystemReminderTagsForUpstream(input: string): string {
  */
 export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTools = true): string {
   if (!systemPrompt || !hasTools) return systemPrompt;
-  return stripHighRiskClientHeaders(systemPrompt)
+  const cacheKey = systemPrompt.length >= 256
+    ? `q:${crypto.createHash("sha256").update(systemPrompt).digest("hex")}`
+    : "";
+  if (cacheKey) {
+    const hit = lruGet(sanitizedSysPromptCache, cacheKey);
+    if (hit !== undefined) return hit;
+  }
+  const res = stripHighRiskClientHeaders(systemPrompt)
     .replace(
       /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|Hermes|Antigravity|ZCode|Windsurf|Aider|Augment|Trae)\b[^\n.]*\.?/gi,
       "You are assisting a developer through an external coding client.",
@@ -123,13 +161,24 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
       /\bYou are a coding agent running in[^\n.]*\.?/gi,
       "You are assisting a developer working in a local coding environment.",
     );
+  if (cacheKey) lruSet(sanitizedSysPromptCache, cacheKey, res, MAX_SYS_PROMPT_CACHE);
+  return res;
 }
+
+const PAIRED_XML_TAG_RES: Record<string, RegExp> = {
+  identity: /<identity>/i,
+  guidelines: /<guidelines>/i,
+  user_rules: /<user_rules>/i,
+  skills: /<skills>/i,
+};
 
 function replacePairedXmlBlockLinear(
   input: string,
   tagNameLower: string,
   replacer: (inner: string) => string,
 ): string {
+  const quickRe = PAIRED_XML_TAG_RES[tagNameLower];
+  if (quickRe && !quickRe.test(input)) return input;
   const lower = input.toLowerCase();
   const openTag = `<${tagNameLower}>`;
   const closeTag = `</${tagNameLower}>`;
@@ -155,17 +204,44 @@ function replacePairedXmlBlockLinear(
   return out;
 }
 
+const HIGH_RISK_SKILL_ENTRY_RE =
+  /\b(?:reverse(?:\s|-)?engineer(?:ing)?|js-reverse|deobfuscat\w*|xhr\s+intercept\w*|intercept(?:ion|ing)?|frame\s+capture|packet\s+capture|traffic\s+capture|script\s+source\s+dump\w*|memory\s+dump\w*|credential\s+vault|ops-vault|password\s+vault|secret\s+vault|aes-?256\s+encrypt\w*|decrypt\w*|bypass\w*|anti-?bot|captcha|exploit\w*|pentest\w*|cookie\s+(?:steal|extract|dump|capture))\b/i;
+
+function foldHighRiskSkillDescriptions(skillsInner: string): string {
+  return skillsInner
+    .split("\n")
+    .map((line) => {
+      const m = /^(\s*[-*]\s+[^:\n]+?):\s+(.+)$/.exec(line);
+      if (!m) return line;
+      const head = m[1]!;
+      const desc = m[2]!;
+      if (HIGH_RISK_SKILL_ENTRY_RE.test(head) || HIGH_RISK_SKILL_ENTRY_RE.test(desc)) {
+        return head.trimEnd();
+      }
+      return line;
+    })
+    .join("\n");
+}
+
 /**
  * Opt-in deep sanitization for heavy agent IDE system prompts (`SANITIZE_CLIENT_SYSTEM_PROMPT=true`,
  * OFF by default so user-authored `systemPrompt` text is never altered unless explicitly enabled).
  *
  * Neutralizes third-party `<identity>` blocks, IDE anti-jailbreak `<guidelines>` trigger word clusters,
- * `<user_rules>` / `<RULE[...]>` / `<skills>` / `<system-reminder>` XML wrappers, and canonical
- * prompt-injection override imperatives (`WITHOUT ANY EXCEPTION` / `take precedence over any other instructions`),
- * while preserving 100% of the user's actual workspace rules and skill descriptions.
+ * `<user_rules>` / `<RULE[...]>` / `<skills>` / `<system-reminder>` XML wrappers, folds high-risk
+ * reverse-engineering/interception/credential-vault descriptions inside `<skills>` (keeping skill name
+ * & `SKILL.md` path intact), and softens canonical prompt-injection override imperatives,
+ * while preserving 100% of the user's actual workspace rules and normal skill descriptions.
  */
 export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
   if (!systemPrompt) return systemPrompt;
+  const cacheKey = systemPrompt.length >= 256
+    ? `d:${crypto.createHash("sha256").update(systemPrompt).digest("hex")}`
+    : "";
+  if (cacheKey) {
+    const hit = lruGet(sanitizedSysPromptCache, cacheKey);
+    if (hit !== undefined) return hit;
+  }
   let text = normalizeSystemReminderTagsForUpstream(stripHighRiskClientHeaders(systemPrompt));
 
   // 1. Replace `<identity>...</identity>` persona blocks when they assert a third-party AI identity
@@ -200,9 +276,10 @@ export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
     })
     .replace(/<\/RULE(?:\[[^\]]*\])?>/gi, "");
 
-  // 4. Unwrap `<skills>` XML wrapper while keeping skill paths and descriptions intact
+  // 4. Unwrap `<skills>` XML wrapper, folding high-risk reverse/interception/vault descriptions
+  //    down to `name (SKILL.md path)` while keeping normal skill descriptions intact.
   text = replacePairedXmlBlockLinear(text, "skills", (inner) =>
-    inner ? `## Available Workspace Skills\n${inner}` : "",
+    inner ? `## Available Workspace Skills\n${foldHighRiskSkillDescriptions(inner)}` : "",
   );
 
   // 5. Soften standalone IDE identity lines and canonical prompt-injection override imperatives
@@ -218,7 +295,63 @@ export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
       "If a skill below is relevant to the current task, read its `SKILL.md` instructions before proceeding.",
     );
 
-  return text.replace(/\n{3,}/g, "\n\n").trim();
+  const out = text.replace(/\n{3,}/g, "\n\n").trim();
+  if (cacheKey) lruSet(sanitizedSysPromptCache, cacheKey, out, MAX_SYS_PROMPT_CACHE);
+  return out;
+}
+
+function serializeCompactedToolSchemas(tools: readonly NormalizedTool[]): string {
+  const refHit = toolSchemaRefCache.get(tools);
+  if (refHit !== undefined) return refHit;
+
+  const fullSpecs = tools.map((t) => ({
+    name: t.name,
+    ...(t.description ? { description: t.description } : {}),
+    parameters: t.inputSchema,
+  }));
+
+  let serialized = JSON.stringify(fullSpecs);
+  if (!utf8ByteLengthExceeds(serialized, COMPACT_SCHEMA_TRIGGER_BYTES)) {
+    toolSchemaRefCache.set(tools, serialized);
+    return serialized;
+  }
+
+  const hashKey = crypto.createHash("sha256").update(serialized).digest("hex");
+  const cached = lruGet(toolSchemaHashCache, hashKey);
+  if (cached !== undefined) {
+    toolSchemaRefCache.set(tools, cached);
+    return cached;
+  }
+
+  const compactSpecs = tools.map((t) => ({
+    name: t.name,
+    ...(t.description ? { description: trimText(t.description, 200) } : {}),
+    parameters: compactJsonSchema(t.inputSchema, 100),
+  }));
+  serialized = JSON.stringify(compactSpecs);
+
+  if (utf8ByteLengthExceeds(serialized, 28_000)) {
+    // Tier 3: preserve concise descriptions on required parameters so complex MCP tools stay callable.
+    const requiredOnlySpecs = tools.map((t) => ({
+      name: t.name,
+      ...(t.description ? { description: trimText(t.description, 100) } : {}),
+      parameters: compactJsonSchema(t.inputSchema, 0, 0, 48),
+    }));
+    serialized = JSON.stringify(requiredOnlySpecs);
+  }
+  if (utf8ByteLengthExceeds(serialized, 36_000)) {
+    // Tier 4 (extreme 40+ MCP tools): strip all parameter descriptions to stay safely under frame budget.
+    const minimalSpecs = tools.map((t) => ({
+      name: t.name,
+      ...(t.description ? { description: trimText(t.description, 80) } : {}),
+      parameters: compactJsonSchema(t.inputSchema, 0),
+    }));
+    serialized = JSON.stringify(minimalSpecs);
+  }
+
+  lruSet(toolSchemaHashCache, hashKey, serialized, MAX_TOOL_SCHEMA_CACHE);
+  toolSchemaRefCache.set(tools, serialized);
+  return serialized;
 }
 
 /**
@@ -232,39 +365,7 @@ export function buildToolBridgePrompt(
 ): string {
   if (!tools.length || toolChoice === "none") return "";
 
-  const fullSpecs = tools.map((t) => ({
-    name: t.name,
-    ...(t.description ? { description: t.description } : {}),
-    parameters: t.inputSchema,
-  }));
-
-  let serialized = JSON.stringify(fullSpecs);
-  if (Buffer.byteLength(serialized, "utf8") > COMPACT_SCHEMA_TRIGGER_BYTES) {
-    const compactSpecs = tools.map((t) => ({
-      name: t.name,
-      ...(t.description ? { description: trimText(t.description, 200) } : {}),
-      parameters: compactJsonSchema(t.inputSchema, 100),
-    }));
-    serialized = JSON.stringify(compactSpecs);
-  }
-  if (Buffer.byteLength(serialized, "utf8") > 28_000) {
-    // Tier 3: preserve concise descriptions on required parameters so complex MCP tools stay callable.
-    const requiredOnlySpecs = tools.map((t) => ({
-      name: t.name,
-      ...(t.description ? { description: trimText(t.description, 100) } : {}),
-      parameters: compactJsonSchema(t.inputSchema, 0, 0, 48),
-    }));
-    serialized = JSON.stringify(requiredOnlySpecs);
-  }
-  if (Buffer.byteLength(serialized, "utf8") > 36_000) {
-    // Tier 4 (extreme 40+ MCP tools): strip all parameter descriptions to stay safely under frame budget.
-    const minimalSpecs = tools.map((t) => ({
-      name: t.name,
-      ...(t.description ? { description: trimText(t.description, 80) } : {}),
-      parameters: compactJsonSchema(t.inputSchema, 0),
-    }));
-    serialized = JSON.stringify(minimalSpecs);
-  }
+  const serialized = serializeCompactedToolSchemas(tools);
 
   const choiceRule =
     toolChoice === "required"
@@ -276,14 +377,14 @@ export function buildToolBridgePrompt(
           : "Whenever a client tool schema above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text.";
 
   const fastPriorityLine = opts?.preferClientToolsOverWorkspace
-    ? "Prefer the `<tool_call>` schemas above over built-in workspace tools."
+    ? "For file, shell, and workspace actions, emit matching `<tool_call>` blocks from the schemas above."
     : "";
 
-  // When routed to a custom AWS Quick Agent whose own instructions already authorize client tool calls,
-  // keep custom_prompt strictly minimal (zero anti-refusal boilerplate / prompt pollution).
+  // Keep custom_prompt concise and purely positive so client tools stay reliable with minimal overhead.
   if (opts?.compactForCustomAgent) {
     return [
       "## Client Tools (JSON Schema)",
+      "The caller executes `<tool_call>` JSON blocks locally and returns results on the next turn.",
       serialized,
       choiceRule,
       ...(fastPriorityLine ? [fastPriorityLine] : []),
@@ -293,13 +394,12 @@ export function buildToolBridgePrompt(
   }
 
   return [
-    "## Structured Tool Request Format",
-    "The user is connected via an external API client. When a client tool below fits the user's request, emit a declarative `<tool_call>` JSON proposal; the user's local client handles review, execution, and returning the result on the next turn.",
-    "Available external tool schemas (JSON):",
+    "## Tool Schemas (JSON)",
+    "The caller executes `<tool_call>` JSON blocks locally and returns results on the next turn.",
     serialized,
     choiceRule,
     ...(fastPriorityLine ? [fastPriorityLine] : []),
-    `Output format (raw tags with no markdown code fences; stop immediately after the block(s) so the client can process them):`,
+    `Format (raw tags, no markdown fences; stop immediately after the block(s)):`,
     `${TOOL_CALL_OPEN}{"name":"<tool_name>","arguments":{...}}${TOOL_CALL_CLOSE}`,
   ].join("\n");
 }
@@ -635,6 +735,7 @@ interface ActiveStreamingCall {
   id: string;
   name: string;
   argsDepth: number;
+  bracketStack: Array<"{" | "[">;
   inString: boolean;
   escaped: boolean;
   pendingCommaWs: string;
@@ -693,6 +794,15 @@ export class StreamingToolCallFilter {
       if (this.mode === "text") {
         const combined = this.pending + input;
         input = "";
+        if (!combined.includes("<")) {
+          updateFenceStateForSegment(this.fence, combined);
+          if (combined.length > 0) {
+            this.lastEmittedChar = combined[combined.length - 1]!;
+            textOut += combined;
+          }
+          this.pending = "";
+          break;
+        }
         const lower = combined.toLowerCase();
         let searchFrom = 0;
         let enteredTool = false;
@@ -740,28 +850,37 @@ export class StreamingToolCallFilter {
       }
 
       if (this.mode === "header") {
+        const prevLen = this.blockBuf.length;
         this.blockBuf += input;
         input = "";
 
-        // If `</tool_call>` already arrived in this chunk, resolve the full block cleanly right away.
-        const closeIdx = findToolCallCloseOutsideJsonStrings(this.blockBuf, 0);
+        // O(1) tail pre-check prevents O(N^2) full-buffer rescans before `</tool_call>` arrives.
+        const tailMayClose = this.blockBuf
+          .slice(Math.max(0, prevLen - (TOOL_CALL_CLOSE.length - 1)))
+          .toLowerCase()
+          .includes(closeLower);
+        const closeIdx = tailMayClose ? findToolCallCloseOutsideJsonStrings(this.blockBuf, 0) : -1;
         if (closeIdx !== -1) {
           const rawBlock = this.blockBuf.slice(0, closeIdx).trim();
-          const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
           const parsed = tryParseJsonObject(rawBlock);
           const tc = parsed ? buildNormalizedToolCall(parsed, this.allowedToolNames, this.customToolNames) : null;
-          if (tc) {
-            this.emitBufferedToolCall(tc, events);
-          } else {
-            const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
-            textOut += rawText;
-            if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+          // If the first `<tool_call>` omitted `</tool_call>` and a second `<tool_call>` appeared
+          // before the closing tag in the same chunk, fall through to `STREAM_HEADER_RE` so both calls parse cleanly.
+          if (tc || !rawBlock.toLowerCase().includes(openLower)) {
+            const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+            if (tc) {
+              this.emitBufferedToolCall(tc, events);
+            } else {
+              const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
+              textOut += rawText;
+              if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+            }
+            this.blockBuf = "";
+            this.fence.linePrefix = "";
+            this.mode = "text";
+            input = after;
+            continue;
           }
-          this.blockBuf = "";
-          this.fence.linePrefix = "";
-          this.mode = "text";
-          input = after;
-          continue;
         }
 
         // Wait until we see a non-whitespace prefix; if fenced markdown, fall back to buffered block mode.
@@ -792,6 +911,7 @@ export class StreamingToolCallFilter {
               id,
               name: decodedName,
               argsDepth: 1,
+              bracketStack: ["{"],
               inString: false,
               escaped: false,
               pendingCommaWs: "",
@@ -870,9 +990,21 @@ export class StreamingToolCallFilter {
             deltaOut += ch;
           } else if (ch === "{") {
             call.argsDepth += 1;
+            call.bracketStack.push("{");
+            deltaOut += ch;
+          } else if (ch === "[") {
+            call.bracketStack.push("[");
+            deltaOut += ch;
+          } else if (ch === "]") {
+            if (call.bracketStack.length > 0 && call.bracketStack[call.bracketStack.length - 1] === "[") {
+              call.bracketStack.pop();
+            }
             deltaOut += ch;
           } else if (ch === "}") {
             call.argsDepth -= 1;
+            if (call.bracketStack.length > 0 && call.bracketStack[call.bracketStack.length - 1] === "{") {
+              call.bracketStack.pop();
+            }
             deltaOut += ch;
             if (call.argsDepth === 0) {
               finishedAt = i + 1;
@@ -910,9 +1042,20 @@ export class StreamingToolCallFilter {
       if (this.mode === "post_args") {
         this.blockBuf += input;
         input = "";
-        const closeIdx = this.blockBuf.toLowerCase().indexOf(closeLower);
-        if (closeIdx !== -1) {
+        const lowerBuf = this.blockBuf.toLowerCase();
+        const closeIdx = lowerBuf.indexOf(closeLower);
+        const nextOpenIdx = lowerBuf.indexOf(openLower);
+        if (closeIdx !== -1 && (nextOpenIdx === -1 || closeIdx < nextOpenIdx)) {
           const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+          this.blockBuf = "";
+          this.fence.linePrefix = "";
+          this.mode = "text";
+          input = after;
+          continue;
+        }
+        if (nextOpenIdx !== -1) {
+          // Model omitted `</tool_call>` before starting a second `<tool_call>`: recover cleanly without swallowing it.
+          const after = this.blockBuf.slice(nextOpenIdx);
           this.blockBuf = "";
           this.fence.linePrefix = "";
           this.mode = "text";
@@ -923,26 +1066,35 @@ export class StreamingToolCallFilter {
       }
 
       if (this.mode === "buffered_block") {
+        const prevLen = this.blockBuf.length;
         this.blockBuf += input;
         input = "";
-        const closeIdx = findToolCallCloseOutsideJsonStrings(this.blockBuf, 0);
+        const tailMayClose = this.blockBuf
+          .slice(Math.max(0, prevLen - (TOOL_CALL_CLOSE.length - 1)))
+          .toLowerCase()
+          .includes(closeLower);
+        const closeIdx = tailMayClose ? findToolCallCloseOutsideJsonStrings(this.blockBuf, 0) : -1;
         if (closeIdx !== -1) {
           const rawBlock = this.blockBuf.slice(0, closeIdx).trim();
-          const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
           const parsed = tryParseJsonObject(rawBlock);
           const tc = parsed ? buildNormalizedToolCall(parsed, this.allowedToolNames, this.customToolNames) : null;
-          if (tc) {
-            this.emitBufferedToolCall(tc, events);
-          } else {
-            const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
-            textOut += rawText;
-            if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+          // If the first `<tool_call>` omitted `</tool_call>` and a second `<tool_call>` appeared
+          // before the closing tag in the same chunk, fall through to `STREAM_HEADER_RE` so both calls parse cleanly.
+          if (tc || !rawBlock.toLowerCase().includes(openLower)) {
+            const after = this.blockBuf.slice(closeIdx + TOOL_CALL_CLOSE.length);
+            if (tc) {
+              this.emitBufferedToolCall(tc, events);
+            } else {
+              const rawText = `${TOOL_CALL_OPEN}${this.blockBuf.slice(0, closeIdx)}${TOOL_CALL_CLOSE}`;
+              textOut += rawText;
+              if (rawText.length > 0) this.lastEmittedChar = rawText[rawText.length - 1]!;
+            }
+            this.blockBuf = "";
+            this.fence.linePrefix = "";
+            this.mode = "text";
+            input = after;
+            continue;
           }
-          this.blockBuf = "";
-          this.fence.linePrefix = "";
-          this.mode = "text";
-          input = after;
-          continue;
         }
         break;
       }
@@ -970,7 +1122,11 @@ export class StreamingToolCallFilter {
         if (call.escaped) tail += "\\";
         tail += "\"";
       }
-      if (call.argsDepth > 0) {
+      if (call.bracketStack.length > 0) {
+        for (let bi = call.bracketStack.length - 1; bi >= 0; bi -= 1) {
+          tail += call.bracketStack[bi] === "[" ? "]" : "}";
+        }
+      } else if (call.argsDepth > 0) {
         tail += "}".repeat(call.argsDepth);
       }
       if (tail) {

@@ -14,10 +14,12 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import {
   parseRoutedModelThinkingMode,
+  parseSanitizeClientSystemPromptMode,
   type AutoDisabledState,
   type GatewayConfig,
   type LbStrategy,
   type RoutedModelThinkingMode,
+  type SanitizeClientSystemPromptMode,
 } from "./types.js";
 
 export function readDotEnvRaw(explicitPath?: string): {
@@ -220,7 +222,7 @@ export function loadConfigFromEnv(
     customAgentPrompt: env.CUSTOM_AGENT_PROMPT
       ? env.CUSTOM_AGENT_PROMPT.replace(/\\n/g, "\n").trim() || undefined
       : undefined,
-    sanitizeClientSystemPrompt: parseBoolEnv(env.SANITIZE_CLIENT_SYSTEM_PROMPT, false),
+    sanitizeClientSystemPrompt: parseSanitizeClientSystemPromptMode(env.SANITIZE_CLIENT_SYSTEM_PROMPT),
     showRoutedModelInThinking: parseRoutedModelThinkingMode(env.SHOW_ROUTED_MODEL_IN_THINKING),
     autoRephraseOnContentFilter: parseBoolEnv(env.AUTO_REPHRASE_ON_CONTENT_FILTER, false),
     contentFilterRephrasePrompt: env.CONTENT_FILTER_REPHRASE_PROMPT
@@ -242,7 +244,8 @@ export function loadConfigFromEnv(
     recordClientIp: parseBoolEnv(env.RECORD_CLIENT_IP, true),
     runIdleTimeoutMs: parseIntEnv(env.RUN_IDLE_TIMEOUT_MS, 10 * 60 * 1000) || 600_000,
     runMaxTimeoutMs: parseIntEnv(env.RUN_MAX_TIMEOUT_MS, 15 * 60 * 1000) || 900_000,
-    warmSessionTtlMs: parseIntEnv(env.WARM_SESSION_TTL_MS, 30 * 60 * 1000) || 1_800_000,
+    warmSessionTtlMs: parseIntEnv(env.WARM_SESSION_TTL_MS, 60 * 60 * 1000) || 3_600_000,
+    parkedWsIdleTtlMs: parseIntEnv(env.PARKED_WS_IDLE_TTL_MS, 60 * 60 * 1000) || 3_600_000,
     maxWarmSessions: Math.max(1, parseIntEnv(env.MAX_WARM_SESSIONS, 256)),
     keyCooldownMs: parseIntEnv(env.KEY_COOLDOWN_MS, 30 * 1000) || 30_000,
     clientKeyMaxConcurrent: Math.max(0, parseIntEnv(env.CLIENT_KEY_MAX_CONCURRENT, 0)),
@@ -330,7 +333,7 @@ export function buildUpdatedPoolEnvContent(
     incognitoMode?: boolean;
     autoEnsureCodingAgent?: boolean;
     customAgentPrompt?: string;
-    sanitizeClientSystemPrompt?: boolean;
+    sanitizeClientSystemPrompt?: SanitizeClientSystemPromptMode;
     showRoutedModelInThinking?: RoutedModelThinkingMode;
     autoRephraseOnContentFilter?: boolean;
     contentFilterRephrasePrompt?: string;
@@ -359,8 +362,8 @@ export function buildUpdatedPoolEnvContent(
     ...(typeof state.customAgentPrompt === "string"
       ? { CUSTOM_AGENT_PROMPT: stripEnvNewlines(state.customAgentPrompt.replace(/\r?\n/g, "\\n")) }
       : {}),
-    ...(typeof state.sanitizeClientSystemPrompt === "boolean"
-      ? { SANITIZE_CLIENT_SYSTEM_PROMPT: String(state.sanitizeClientSystemPrompt) }
+    ...(typeof state.sanitizeClientSystemPrompt === "string"
+      ? { SANITIZE_CLIENT_SYSTEM_PROMPT: state.sanitizeClientSystemPrompt }
       : {}),
     ...(typeof state.showRoutedModelInThinking === "string"
       ? { SHOW_ROUTED_MODEL_IN_THINKING: state.showRoutedModelInThinking }

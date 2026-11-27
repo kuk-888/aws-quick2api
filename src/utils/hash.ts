@@ -74,12 +74,18 @@ function stripTagBlocksLinear(
   matchesTagName: (lowerTagName: string) => boolean,
   replacement = "",
 ): string {
-  if (!input || !input.includes("<")) return input;
-  const lower = input.toLowerCase();
+  // Fast exit: balanced `<tag>...</tag>` cannot exist without `</`.
+  if (!input || !input.includes("</")) return input;
   const len = input.length;
+  let lower: string | null = null;
+  const getLower = (): string => {
+    if (lower === null) lower = input.toLowerCase();
+    return lower;
+  };
   const nextCloseCache = new Map<string, number>();
   const nextOpenCache = new Map<string, number>();
   let out = "";
+  let lastEmit = 0;
   let pos = 0;
 
   const isTagBoundaryChar = (code: number): boolean =>
@@ -90,7 +96,7 @@ function stripTagBlocksLinear(
     if (cached === -1) return -1;
     if (cached !== undefined && cached >= from) return cached;
     const needle = `</${tag}>`;
-    const idx = lower.indexOf(needle, from);
+    const idx = getLower().indexOf(needle, from);
     nextCloseCache.set(tag, idx);
     return idx;
   };
@@ -100,15 +106,16 @@ function stripTagBlocksLinear(
     if (cached === -1) return -1;
     if (cached !== undefined && cached >= from) return cached;
     const needle = `<${tag}`;
+    const low = getLower();
     let searchAt = from;
     while (searchAt < len) {
-      const idx = lower.indexOf(needle, searchAt);
+      const idx = low.indexOf(needle, searchAt);
       if (idx === -1) {
         nextOpenCache.set(tag, -1);
         return -1;
       }
       const after = idx + needle.length;
-      if (after < len && isTagBoundaryChar(lower.charCodeAt(after))) {
+      if (after < len && isTagBoundaryChar(low.charCodeAt(after))) {
         nextOpenCache.set(tag, idx);
         return idx;
       }
@@ -120,16 +127,14 @@ function stripTagBlocksLinear(
 
   while (pos < len) {
     const lt = input.indexOf("<", pos);
-    if (lt === -1) {
-      out += input.slice(pos);
-      break;
-    }
-    if (lt > pos) out += input.slice(pos, lt);
+    if (lt === -1) break;
 
-    // Parse tag name starting at lt + 1
+    // Parse tag name starting at lt + 1 with lazy ASCII lowercase folding (avoids full-string .toLowerCase() when no IDE tags match)
     let nameEnd = lt + 1;
+    let hasUpper = false;
     while (nameEnd < len) {
-      const ch = lower.charCodeAt(nameEnd);
+      const raw = input.charCodeAt(nameEnd);
+      const ch = raw >= 65 && raw <= 90 ? (hasUpper = true, raw | 32) : raw;
       const isNameChar =
         (ch >= 97 && ch <= 122) || // a-z
         (ch >= 48 && ch <= 57) || // 0-9
@@ -138,9 +143,13 @@ function stripTagBlocksLinear(
       if (!isNameChar) break;
       nameEnd += 1;
     }
-    const tag = nameEnd > lt + 1 ? lower.slice(lt + 1, nameEnd) : "";
-    if (!tag || nameEnd >= len || !isTagBoundaryChar(lower.charCodeAt(nameEnd)) || !matchesTagName(tag)) {
-      out += "<";
+    if (nameEnd === lt + 1 || nameEnd >= len || !isTagBoundaryChar(input.charCodeAt(nameEnd))) {
+      pos = lt + 1;
+      continue;
+    }
+    const rawTag = input.slice(lt + 1, nameEnd);
+    const tag = hasUpper ? rawTag.toLowerCase() : rawTag;
+    if (!matchesTagName(tag)) {
       pos = lt + 1;
       continue;
     }
@@ -157,14 +166,12 @@ function stripTagBlocksLinear(
       if (ch === 60 /* < */) break;
     }
     if (gt === -1) {
-      out += "<";
       pos = lt + 1;
       continue;
     }
 
     const closeIdx = findNextClose(tag, gt + 1);
     if (closeIdx === -1) {
-      out += "<";
       pos = lt + 1;
       continue;
     }
@@ -173,14 +180,18 @@ function stripTagBlocksLinear(
     // so only the innermost balanced IDE envelope is stripped.
     const innerOpen = findNextOpenSameTag(tag, gt + 1);
     if (innerOpen !== -1 && innerOpen < closeIdx) {
-      out += input.slice(lt, gt + 1);
       pos = gt + 1;
       continue;
     }
 
+    if (lt > lastEmit) out += input.slice(lastEmit, lt);
     if (replacement) out += replacement;
     pos = closeIdx + tag.length + 3; // skip `</${tag}>`
+    lastEmit = pos;
   }
+  // Zero-allocation fast return when no volatile IDE tags were stripped.
+  if (lastEmit === 0) return input;
+  if (lastEmit < len) out += input.slice(lastEmit);
   return out;
 }
 
@@ -205,11 +216,11 @@ function normalizeVolatileTimestamps(text: string): string {
  */
 export function normalizeUserTurnForHash(input: string): string {
   if (!input) return "";
-  const normalizedLf = input.replace(/\r\n/g, "\n");
+  const normalizedLf = input.includes("\r") ? input.replace(/\r\n/g, "\n") : input;
   const stripped = stripTagBlocksLinear(normalizedLf, (tag) => VOLATILE_IDE_TAG_NAME_RE.test(tag))
     .replace(VOLATILE_CLOCK_LINE_RE, "<TIME_LINE>")
     .trim();
-  const substantive = stripped.replace(/<TIME_LINE>/g, "").trim();
+  const substantive = stripped.includes("<TIME_LINE>") ? stripped.replace(/<TIME_LINE>/g, "").trim() : stripped;
   return substantive ? stripped : normalizedLf.trim();
 }
 
@@ -307,6 +318,8 @@ export interface HashableDialogItem {
 export interface ComputedDialogPrefix {
   priorPrefixHash?: string;
   currentInputPrefixHash?: string;
+  /** Number of completed assistant turns preceding the current user/tool input group. */
+  priorAssistantTurns?: number;
   incrementalUserText?: string;
   incrementalImages?: NormalizedImage[];
   incrementalFiles?: NormalizedFile[];
@@ -408,9 +421,12 @@ export function computeDialogPrefixHashes(params: {
     runningHash = computeConversationHash(hashParts);
   }
 
+  const priorAssistantTurns = groups.reduce((acc, g) => (g.kind === "assistant" ? acc + 1 : acc), 0);
+
   return {
     ...(priorPrefixHash ? { priorPrefixHash } : {}),
     currentInputPrefixHash: runningHash,
+    priorAssistantTurns,
     ...(incrementalUserText !== undefined ? { incrementalUserText } : {}),
     ...(incrementalImages ? { incrementalImages } : {}),
     ...(incrementalFiles ? { incrementalFiles } : {}),

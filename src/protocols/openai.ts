@@ -11,7 +11,7 @@ import {
 } from "../core/types.js";
 import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
-import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
+import { buildStructuredOutputBridgePrompt, officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
 function inferFileMimeFromName(filename: string): string {
   const lower = filename.trim().toLowerCase();
@@ -269,23 +269,20 @@ interface ChatTurnLine extends HashableDialogItem {
 }
 
 /**
- * Reject parameters whose absence would silently break the caller's own parsing logic.
- * (Pure sampling hints such as temperature / max_tokens / stop are accepted and ignored; see README.)
+ * Validates structured output & numeric options. Soft-bridges `response_format` / `text.format`
+ * (`json_object` and `json_schema`) into a strict JSON system instruction instead of hard-400ing
+ * clients like OpenWebUI, Cherry Studio, LangChain, and OpenAI SDK `.parse()`.
  */
-function assertNoUnsupportedStructuredOptions(body: Record<string, unknown>): void {
+function resolveStructuredOptionsAndValidate(body: Record<string, unknown>): string | null {
   const viaText = !isRecord(body.response_format) && isRecord(body.text) && isRecord(body.text.format);
-  const fmt = isRecord(body.response_format) ? body.response_format : viaText ? (body.text as Record<string, unknown>).format as Record<string, unknown> : undefined;
+  const fmt = isRecord(body.response_format)
+    ? body.response_format
+    : viaText
+      ? (body.text as Record<string, unknown>).format
+      : undefined;
   const param = viaText ? "text.format" : "response_format";
-  if (fmt && fmt.type !== undefined && fmt.type !== "text") {
-    const kind = typeof fmt.type === "string" ? fmt.type : typeof fmt.type;
-    const hint =
-      kind === "json_schema"
-        ? "JSON Schema structured outputs cannot be enforced by AWS Quick; describe the schema in the prompt (or use a tool whose parameters are the schema) and validate client-side."
-        : kind === "json_object"
-          ? "JSON mode cannot be enforced by AWS Quick; ask for JSON in the prompt and parse it client-side."
-          : "Only the default text format is supported.";
-    throw new GatewayError(`\`${param}\` of type '${kind}' is not supported. ${hint}`, 400, "unsupported_parameter", param);
-  }
+  const structuredPrompt = buildStructuredOutputBridgePrompt(fmt, param);
+
   if (body.n !== undefined && body.n !== null && body.n !== 1) {
     throw new GatewayError(
       "`n` must be 1: this gateway returns exactly one completion per request.",
@@ -302,6 +299,7 @@ function assertNoUnsupportedStructuredOptions(body: Record<string, unknown>): vo
       throw new GatewayError(`\`${key}\` must be a positive integer.`, 400, "invalid_request_error", key);
     }
   }
+  return structuredPrompt;
 }
 
 export function parseChatCompletionsRequest(
@@ -315,7 +313,7 @@ export function parseChatCompletionsRequest(
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new GatewayError("`messages` must be a non-empty array.", 400, "invalid_request_error", "messages");
   }
-  assertNoUnsupportedStructuredOptions(body);
+  const structuredPrompt = resolveStructuredOptionsAndValidate(body);
 
   const requestedModel = requireModelField(body);
   const { customTools: tools, nativeSdkTools } = parseOpenAiTools(body.tools);
@@ -326,6 +324,7 @@ export function parseChatCompletionsRequest(
   const toolChoice = parseOpenAiToolChoice(body.tool_choice);
 
   const systemParts: string[] = [];
+  if (structuredPrompt) systemParts.push(structuredPrompt);
   const items: ChatTurnLine[] = [];
   const allImages: NormalizedImage[] = [];
   const allFiles: NormalizedFile[] = [];
@@ -466,6 +465,7 @@ export function parseChatCompletionsRequest(
     rawBody: body,
     ...(conversationKey ? { conversationKey } : {}),
     ...(systemJoined ? { systemPrompt: systemJoined } : {}),
+    ...(structuredPrompt ? { structuredOutputPrompt: structuredPrompt } : {}),
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,
@@ -493,7 +493,7 @@ export function parseResponsesRequest(
     throw new GatewayError("Request body must be a JSON object.", 400, "invalid_request_error");
   }
 
-  assertNoUnsupportedStructuredOptions(body);
+  const structuredPrompt = resolveStructuredOptionsAndValidate(body);
   if (typeof body.previous_response_id === "string" && body.previous_response_id.trim()) {
     throw new GatewayError(
       "`previous_response_id` is not supported: this gateway does not store responses. Resend the full conversation in `input`.",
@@ -510,6 +510,7 @@ export function parseResponsesRequest(
   if (typeof body.instructions === "string" && body.instructions.trim()) {
     systemParts.push(body.instructions.trim());
   }
+  if (structuredPrompt) systemParts.push(structuredPrompt);
 
   const transcriptLines: string[] = [];
   const items: HashableDialogItem[] = [];
@@ -733,6 +734,7 @@ export function parseResponsesRequest(
     rawBody: body,
     ...(conversationKey ? { conversationKey } : {}),
     ...(systemJoined ? { systemPrompt: systemJoined } : {}),
+    ...(structuredPrompt ? { structuredOutputPrompt: structuredPrompt } : {}),
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,
@@ -817,7 +819,7 @@ export const openAiChatAdapter: ProtocolAdapter = {
         created,
         model: turn.requestedModel,
         ...(lastMetrics?.resolvedModel ? { system_fingerprint: lastMetrics.resolvedModel } : {}),
-        choices: Object.keys(delta).length === 0 && finishReason === null && usageObj
+        choices: usageObj !== undefined && finishReason === null && Object.keys(delta).length === 0
           ? []
           : [{ index: 0, delta, finish_reason: finishReason }]
       };

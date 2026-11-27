@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import WebSocket from "ws";
 import { appendWsRecvBuf } from "../core/media-utils.js";
 import { GatewayError } from "../core/types.js";
-import { getProxyAgent, resolveEffectiveProxyUrl } from "../utils/proxy-agent.js";
+import { getDirectWsAgent, getProxyAgent, resolveEffectiveProxyUrl } from "../utils/proxy-agent.js";
 import {
   ChunkedFrameAssembler,
   decodeCloudOutputFrame,
@@ -47,7 +47,7 @@ export const DEFAULT_CODING_AGENT_NAME = "Coding Assistant";
 export const LEGACY_CODING_AGENT_NAMES = ["Coding Assistant", "Quick2API Bridge", "Quick2API Coding Bridge"];
 export const DEFAULT_CODING_AGENT_DESCRIPTION = "General software engineering and coding assistant.";
 export const DEFAULT_CODING_AGENT_INSTRUCTIONS =
-  "You are a concise, accurate software engineering assistant. Follow the user's instructions and requested output format directly. When structured <tool_call> schemas are provided in context, emit matching <tool_call> blocks directly when appropriate.";
+  "You are a software engineering assistant. Follow the user's instructions directly; when <tool_call> schemas are provided, emit matching <tool_call> blocks for requested actions.";
 
 /**
  * Normalizes an AWS Quick agent identifier (full ARN `arn:aws:quicksight:...:agent/<id>` or short ID)
@@ -99,12 +99,12 @@ export async function dialQuickWebSocket(params: {
   if (isWeb && cred.web) {
     const conn = buildWebWsConnection(cred.web, workingSessionId);
     const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, conn.url);
-    const wsAgent = getProxyAgent(effectiveProxy);
+    const wsAgent = getProxyAgent(effectiveProxy) || getDirectWsAgent();
     if (beforeDial) await beforeDial();
     const ws = new WebSocket(conn.url, conn.protocols, {
       headers: conn.headers,
       handshakeTimeout: 15_000,
-      ...(wsAgent ? { agent: wsAgent } : {}),
+      agent: wsAgent,
     });
     return {
       ws,
@@ -131,7 +131,7 @@ export async function dialQuickWebSocket(params: {
       `&replayContext=${encodeURIComponent(replayContext)}` +
       `&channel=prod`;
     const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, wsUrl);
-    const wsAgent = getProxyAgent(effectiveProxy);
+    const wsAgent = getProxyAgent(effectiveProxy) || getDirectWsAgent();
     if (beforeDial) await beforeDial();
     const oauthWsOpts: Record<string, unknown> = {
       handshakeTimeout: 15_000,
@@ -144,7 +144,7 @@ export async function dialQuickWebSocket(params: {
         "X-Agent-Service-Type": "UNIFIED_QUICK",
         "X-Working-Session-Id": workingSessionId,
       },
-      ...(wsAgent ? { agent: wsAgent } : {}),
+      agent: wsAgent,
     };
     const ws = webSocketFactory ? webSocketFactory(wsUrl, oauthWsOpts) : new WebSocket(wsUrl, oauthWsOpts);
     return {
@@ -186,7 +186,7 @@ export async function dialQuickWebSocket(params: {
     `&replayContext=${encodeURIComponent(replayContext)}` +
     `&channel=prod`;
   const effectiveProxy = resolveEffectiveProxyUrl(proxyUrl, wsUrl);
-  const wsAgent = getProxyAgent(effectiveProxy);
+  const wsAgent = getProxyAgent(effectiveProxy) || getDirectWsAgent();
   if (beforeDial) await beforeDial();
   const ws = new WebSocket(wsUrl, {
     handshakeTimeout: 15_000,
@@ -199,7 +199,7 @@ export async function dialQuickWebSocket(params: {
       "X-Agent-Service-Type": "UNIFIED_QUICK",
       "X-Working-Session-Id": workingSessionId,
     },
-    ...(wsAgent ? { agent: wsAgent } : {}),
+    agent: wsAgent,
   });
   return {
     ws,

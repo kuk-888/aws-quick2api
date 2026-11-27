@@ -1049,9 +1049,9 @@ export function evaluateDlpPollResponse(dlpJson: {
   return { state: "pending" };
 }
 
-const MAX_DLP_POLL_ATTEMPTS = 40;
-const DLP_POLL_INTERVAL_MS = 1_500;
-const DLP_POLL_BACKOFF_SCHEDULE_MS = [250, 400, 600, 1_000, DLP_POLL_INTERVAL_MS] as const;
+const MAX_DLP_POLL_ATTEMPTS = 70;
+const DLP_POLL_DEADLINE_MS = 60_000;
+const DLP_POLL_BACKOFF_SCHEDULE_MS = [150, 200, 250, 350, 500, 750, 1_000] as const;
 
 function dlpPollDelayForAttempt(pollIndex: number): number {
   return DLP_POLL_BACKOFF_SCHEDULE_MS[Math.min(pollIndex, DLP_POLL_BACKOFF_SCHEDULE_MS.length - 1)]!;
@@ -1264,13 +1264,14 @@ export async function uploadOAuthBinaryAttachment(
     throw new Error("upload-attachment returned empty attachmentId");
   }
 
-  // Step 2: Poll DLP status (up to 40 × 1.5s = 60s; transient 429/5xx/network jitter retries;
-  // terminal FAILED/ERROR/BLOCK or timeout throws cleanly instead of proceeding unscanned).
+  // Step 2: Poll DLP status (fast initial ramp 150->1000ms capped by 60s wall-clock deadline;
+  // transient 429/5xx/network jitter retries; terminal FAILED/ERROR/BLOCK or timeout throws cleanly).
   const dlpUrl = `https://${cred.wsHost}/integration/quick-work/attachment-dlp-status?attachmentId=${encodeURIComponent(attachmentId)}`;
+  const dlpDeadline = Date.now() + DLP_POLL_DEADLINE_MS;
   let dlpReady = false;
   let refreshedOnDlp401 = false;
   let consecutiveNetErrs = 0;
-  for (let poll = 0; poll < MAX_DLP_POLL_ATTEMPTS; poll += 1) {
+  for (let poll = 0; poll < MAX_DLP_POLL_ATTEMPTS && Date.now() < dlpDeadline; poll += 1) {
     if (signal?.aborted) throw new Error("Attachment DLP poll aborted by client.");
     let dlpRes: Awaited<ReturnType<typeof fetchViaOptionalProxy>>;
     try {
@@ -1291,19 +1292,21 @@ export async function uploadOAuthBinaryAttachment(
       consecutiveNetErrs = 0;
     } catch (err) {
       consecutiveNetErrs += 1;
-      if (signal?.aborted || consecutiveNetErrs >= 3 || poll + 1 >= MAX_DLP_POLL_ATTEMPTS) throw err;
-      const jitterMs = 750 + Math.floor(Math.random() * 750);
-      await sleepWithAbort(jitterMs, signal);
+      if (signal?.aborted || consecutiveNetErrs >= 3 || poll + 1 >= MAX_DLP_POLL_ATTEMPTS || Date.now() >= dlpDeadline) throw err;
+      const delayMs = consecutiveNetErrs === 1 ? 100 : 750 + Math.floor(Math.random() * 750);
+      await sleepWithAbort(delayMs, signal);
       continue;
     }
 
     if (dlpRes.status === 401 && !refreshedOnDlp401) {
+      await dlpRes.text().catch(() => "");
       refreshedOnDlp401 = true;
       ({ accessToken } = await resolveOAuthAccessToken(cred, true, proxyUrl));
       continue;
     }
     if (dlpRes.status === 429 || dlpRes.status >= 500) {
-      if (poll + 1 >= MAX_DLP_POLL_ATTEMPTS) {
+      await dlpRes.text().catch(() => "");
+      if (poll + 1 >= MAX_DLP_POLL_ATTEMPTS || Date.now() >= dlpDeadline) {
         throw new Error(`attachment-dlp-status failed (${dlpRes.status})`);
       }
       const jitterMs = 750 + Math.floor(Math.random() * 750);
@@ -1311,6 +1314,7 @@ export async function uploadOAuthBinaryAttachment(
       continue;
     }
     if (!dlpRes.ok) {
+      await dlpRes.text().catch(() => "");
       throw new Error(`attachment-dlp-status failed (${dlpRes.status})`);
     }
     const dlpJson = (await dlpRes.json()) as {
@@ -1327,12 +1331,13 @@ export async function uploadOAuthBinaryAttachment(
       dlpReady = true;
       break;
     }
-    if (poll + 1 < MAX_DLP_POLL_ATTEMPTS) {
-      await sleepWithAbort(dlpPollDelayForAttempt(poll), signal);
+    const remainingMs = dlpDeadline - Date.now();
+    if (poll + 1 < MAX_DLP_POLL_ATTEMPTS && remainingMs > 0) {
+      await sleepWithAbort(Math.min(dlpPollDelayForAttempt(poll), remainingMs), signal);
     }
   }
   if (!dlpReady) {
-    throw new Error(`Attachment DLP scan timed out after ${Math.round((MAX_DLP_POLL_ATTEMPTS * DLP_POLL_INTERVAL_MS) / 1000)}s.`);
+    throw new Error(`Attachment DLP scan timed out after ${Math.round(DLP_POLL_DEADLINE_MS / 1000)}s.`);
   }
 
   // Step 3: Bind attachment to the session workspace via qbs-event `files/upload/{threadId}`

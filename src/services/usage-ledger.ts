@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 /**
@@ -72,6 +73,9 @@ export class UsageLedger {
   private recent: LedgerRecord[] = [];
   private dirty = false;
   private timer: NodeJS.Timeout | null = null;
+  private writeChain: Promise<void> = Promise.resolve();
+  private writeEpoch = 0;
+  private tmpSeq = 0;
 
   constructor(
     private readonly filePath: string | undefined,
@@ -194,11 +198,12 @@ export class UsageLedger {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.writeEpoch += 1;
     if (!this.dirty || !this.filePath) return;
     this.dirty = false;
     try {
       mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const tmp = `${this.filePath}.${process.pid}.tmp`;
+      const tmp = `${this.filePath}.${process.pid}.${++this.tmpSeq}.tmp`;
       writeFileSync(tmp, JSON.stringify({ v: 1, buckets: [...this.buckets.values()], recent: this.recent.slice(0, 30) }), { mode: 0o600 });
       renameSync(tmp, this.filePath);
     } catch {
@@ -206,12 +211,38 @@ export class UsageLedger {
     }
   }
 
+  private enqueueAsyncFlush(): void {
+    if (!this.dirty || !this.filePath) return;
+    this.dirty = false;
+    const filePath = this.filePath;
+    const epoch = ++this.writeEpoch;
+    const payload = JSON.stringify({ v: 1, buckets: [...this.buckets.values()], recent: this.recent.slice(0, 30) });
+    this.writeChain = this.writeChain
+      .then(async () => {
+        if (epoch !== this.writeEpoch) return;
+        const tmp = `${filePath}.${process.pid}.${++this.tmpSeq}.tmp`;
+        try {
+          await mkdir(path.dirname(filePath), { recursive: true });
+          await writeFile(tmp, payload, { mode: 0o600 });
+          if (epoch !== this.writeEpoch) {
+            await unlink(tmp).catch(() => { });
+            return;
+          }
+          await rename(tmp, filePath);
+        } catch {
+          await unlink(tmp).catch(() => { });
+          if (epoch === this.writeEpoch) this.dirty = true;
+        }
+      })
+      .catch(() => { });
+  }
+
   private markDirty(): void {
     this.dirty = true;
     if (this.timer || !this.filePath) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      this.flush();
+      this.enqueueAsyncFlush();
     }, 30_000);
     this.timer.unref?.();
   }

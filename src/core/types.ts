@@ -29,6 +29,17 @@ export function parseRoutedModelThinkingMode(raw: unknown): RoutedModelThinkingM
   return "true";
 }
 
+export type SanitizeClientSystemPromptMode = "false" | "true" | "strip";
+
+export function parseSanitizeClientSystemPromptMode(raw: unknown): SanitizeClientSystemPromptMode {
+  if (raw === true) return "true";
+  if (raw === false) return "false";
+  const val = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (val === "strip" || val === "drop") return "strip";
+  if (val === "true" || val === "1" || val === "yes" || val === "sanitize") return "true";
+  return "false";
+}
+
 export interface NormalizedTool {
   name: string;
   description?: string;
@@ -87,9 +98,13 @@ export interface ParsedProtocolTurn {
   /** Deterministic or header-derived conversation key for sticky session affinity. */
   conversationKey?: string;
   systemPrompt?: string;
+  /** Gateway-generated JSON/JSON-Schema constraint bridged from `response_format` / `text.format` / `output_config.format` (preserved even when `SANITIZE_CLIENT_SYSTEM_PROMPT=strip`). */
+  structuredOutputPrompt?: string;
   fullTranscriptText: string;
   priorPrefixHash?: string;
   currentInputPrefixHash?: string;
+  /** Number of completed assistant turns preceding the current user/tool input group. */
+  priorAssistantTurns?: number;
   incrementalUserText?: string;
   images: NormalizedImage[];
   incrementalImages?: NormalizedImage[];
@@ -173,8 +188,8 @@ export interface GatewayConfig {
   autoEnsureCodingAgent?: boolean;
   /** Optional default instructions template used when auto-creating custom agents (`CUSTOM_AGENT_PROMPT`). */
   customAgentPrompt?: string;
-  /** Optional: deeply sanitize heavy IDE/agent client framework wrappers in `systemPrompt` (`SANITIZE_CLIENT_SYSTEM_PROMPT`, default false so user system prompts stay untouched unless opted in). */
-  sanitizeClientSystemPrompt?: boolean;
+  /** Optional client `systemPrompt` handling (`SANITIZE_CLIENT_SYSTEM_PROMPT`, default `"false"`): `"false"` = untouched passthrough, `"true"` = soften IDE wrappers while preserving rules, `"strip"` = drop client system prompt keeping only tool schemas & JSON constraints. */
+  sanitizeClientSystemPrompt?: SanitizeClientSystemPromptMode;
   /** Emit routed model & thinking effort header in thinking/reasoning block (`SHOW_ROUTED_MODEL_IN_THINKING`, default `"true"`: `"true"` | `"always"` | `"false"`). */
   showRoutedModelInThinking?: RoutedModelThinkingMode;
   /** Optional: automatically rephrase the latest user prompt into defensive engineering wording on upstream `content_filtered` and retry on the SAME requested model (`AUTO_REPHRASE_ON_CONTENT_FILTER`, default false). */
@@ -207,6 +222,8 @@ export interface GatewayConfig {
   runIdleTimeoutMs: number;
   runMaxTimeoutMs: number;
   warmSessionTtlMs: number;
+  /** Max idle lifetime for a parked/shared WebSocket (default 30 min; `PARKED_WS_IDLE_TTL_MS`). */
+  parkedWsIdleTtlMs?: number;
   maxWarmSessions: number;
   keyCooldownMs: number;
   /** Default max in-flight requests per managed client key when the key has no own limit (0 = unlimited). */

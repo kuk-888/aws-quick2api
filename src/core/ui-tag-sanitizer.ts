@@ -160,6 +160,17 @@ export class StreamingUiTagSanitizer {
 
   feed(chunk: string): string {
     if (!chunk) return "";
+    // Zero-allocation O(1) fast-path for ordinary mid-line text deltas (95%+ of streaming tokens).
+    if (
+      this.buf.length === 0 &&
+      !this.inFence &&
+      !this.atLineStart &&
+      !chunk.includes("<") &&
+      !chunk.includes("\n")
+    ) {
+      return chunk;
+    }
+    const prevBufLen = this.buf.length;
     this.buf += chunk;
     let out = "";
 
@@ -203,30 +214,38 @@ export class StreamingUiTagSanitizer {
         }
       }
 
-      // Look for the earliest watched tag opening in the buffer
-      const lower = this.buf.toLowerCase();
+      // Look for the earliest watched tag opening in the buffer (skip lowercasing & tag regexes when `<` is absent)
+      const hasLt = this.buf.includes("<");
       let matchIdx = -1;
       let matchKind: "decisions" | "decision" | "artifact" | null = null;
 
-      const candidates: Array<{ idx: number; kind: "decisions" | "decision" | "artifact" }> = [];
-      const reDecisions = /<decisions(?:\s|>)/i.exec(lower);
-      if (reDecisions) candidates.push({ idx: reDecisions.index, kind: "decisions" });
-      const reDecision = /<decision(?:\s|>)/i.exec(lower);
-      if (reDecision) candidates.push({ idx: reDecision.index, kind: "decision" });
-      const reArtifact = /<artifact\s/i.exec(lower);
-      if (reArtifact) candidates.push({ idx: reArtifact.index, kind: "artifact" });
+      if (hasLt) {
+        const lower = this.buf.toLowerCase();
+        const reDecisions = /<decisions(?:\s|>)/.exec(lower);
+        if (reDecisions) {
+          matchIdx = reDecisions.index;
+          matchKind = "decisions";
+        }
+        const reDecision = /<decision(?:\s|>)/.exec(lower);
+        if (reDecision && (matchIdx === -1 || reDecision.index < matchIdx)) {
+          matchIdx = reDecision.index;
+          matchKind = "decision";
+        }
+        const reArtifact = /<artifact\s/.exec(lower);
+        if (reArtifact && (matchIdx === -1 || reArtifact.index < matchIdx)) {
+          matchIdx = reArtifact.index;
+          matchKind = "artifact";
+        }
+      }
 
       // Also check if a fenced code block starts BEFORE the earliest tag!
-      const fenceLineMatch = /(?:^|\n)[ \t]*(?:```|~~~)/.exec(this.buf);
+      const fenceLineMatch =
+        this.buf.includes("```") || this.buf.includes("~~~")
+          ? /(?:^|\n)[ \t]*(?:```|~~~)/.exec(this.buf)
+          : null;
       const fenceStartIdx = fenceLineMatch
         ? fenceLineMatch.index + (fenceLineMatch[0].startsWith("\n") ? 1 : 0)
         : -1;
-
-      if (candidates.length > 0) {
-        candidates.sort((a, b) => a.idx - b.idx);
-        matchIdx = candidates[0]!.idx;
-        matchKind = candidates[0]!.kind;
-      }
 
       if (fenceStartIdx !== -1 && (matchIdx === -1 || fenceStartIdx < matchIdx)) {
         // Flush everything up to the fence line so the next iteration enters fence mode cleanly
@@ -239,7 +258,7 @@ export class StreamingUiTagSanitizer {
 
       if (matchIdx === -1) {
         // No complete opening tag found; check for trailing partial tag prefix or trailing fence start
-        const partialIdx = findTrailingTagPrefixStart(this.buf);
+        const partialIdx = hasLt ? findTrailingTagPrefixStart(this.buf) : -1;
         const nlLast = this.buf.lastIndexOf("\n");
         const tailAfterNl = nlLast === -1 ? this.buf : this.buf.slice(nlLast + 1);
         const partialFenceIdx =
@@ -271,9 +290,12 @@ export class StreamingUiTagSanitizer {
       }
 
       // Now this.buf starts right at the watched tag! Wait for its closing tag.
-      // Attribute pattern skips `>` inside quoted values (e.g. title="A -> B").
+      // O(1) tail pre-check prevents O(N^2) regex rescans while buffering large (up to 32KB) blocks.
+      const tailSlice = prevBufLen > 0 ? this.buf.slice(Math.max(0, prevBufLen - 16)) : this.buf;
       if (matchKind === "decisions") {
-        const m = /^<decisions\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/decisions>/i.exec(this.buf);
+        const m = tailSlice.includes("</")
+          ? /^<decisions\b(?:"[^"]*"|'[^']*'|[^>"'])*>([\s\S]*?)<\/decisions>/i.exec(this.buf)
+          : null;
         if (!m) {
           if (this.buf.length > MAX_TAG_BUFFER_CHARS) {
             out += this.advanceNormalText(this.buf);
@@ -287,7 +309,9 @@ export class StreamingUiTagSanitizer {
       }
 
       if (matchKind === "decision") {
-        const m = /^<decision\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)(?:<\/decision>|<\/invoke>)/i.exec(this.buf);
+        const m = tailSlice.includes("</")
+          ? /^<decision\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)(?:<\/decision>|<\/invoke>)/i.exec(this.buf)
+          : null;
         if (!m) {
           if (this.buf.length > MAX_TAG_BUFFER_CHARS) {
             out += this.advanceNormalText(this.buf);
@@ -301,13 +325,17 @@ export class StreamingUiTagSanitizer {
       }
 
       if (matchKind === "artifact") {
-        const selfClose = /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/>/i.exec(this.buf);
+        const selfClose = tailSlice.includes("/>")
+          ? /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)\/>/i.exec(this.buf)
+          : null;
         if (selfClose) {
           out += this.advanceNormalText(renderArtifactBlock(selfClose[1] || "", null));
           this.buf = this.buf.slice(selfClose[0].length);
           continue;
         }
-        const paired = /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/artifact>/i.exec(this.buf);
+        const paired = tailSlice.includes("</")
+          ? /^<artifact\b((?:"[^"]*"|'[^']*'|[^>"'])*)>([\s\S]*?)<\/artifact>/i.exec(this.buf)
+          : null;
         if (paired) {
           out += this.advanceNormalText(renderArtifactBlock(paired[1] || "", paired[2] || ""));
           this.buf = this.buf.slice(paired[0].length);

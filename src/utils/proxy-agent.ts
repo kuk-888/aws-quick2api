@@ -1,3 +1,4 @@
+import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -5,6 +6,133 @@ import type { Duplex } from "node:stream";
 import tls from "node:tls";
 
 const ALLOWED_PROXY_PROTOCOLS = new Set(["http:", "https:", "socks5:", "socks5h:"]);
+
+// Bounded TTL DNS cache (30s) strictly for upstream AWS Quick & proxy hosts (never used for user SSRF URL checks).
+const UPSTREAM_DNS_TTL_MS = 30_000;
+const MAX_UPSTREAM_DNS_CACHE = 256;
+interface CachedDnsEntry {
+  expiresAt: number;
+  addresses: dns.LookupAddress[];
+}
+const upstreamDnsCache = new Map<string, CachedDnsEntry>();
+
+function cachedUpstreamLookup(
+  hostname: string,
+  options: dns.LookupAllOptions | dns.LookupOneOptions | number,
+  callback: (err: NodeJS.ErrnoException | null, address: string | dns.LookupAddress[], family?: number) => void,
+): void {
+  const opts = typeof options === "number" ? { family: options } : options || {};
+  const wantAll = Boolean((opts as dns.LookupAllOptions).all);
+  const reqFamily = opts.family === 4 || opts.family === 6 ? opts.family : 0;
+  const cacheKey = `${hostname.toLowerCase()}|${reqFamily}`;
+  const now = Date.now();
+  const hit = upstreamDnsCache.get(cacheKey);
+  if (hit && hit.expiresAt > now && hit.addresses.length > 0) {
+    if (wantAll) {
+      callback(null, hit.addresses.map((a) => ({ address: a.address, family: a.family })));
+    } else {
+      const first = hit.addresses[0]!;
+      callback(null, first.address, first.family);
+    }
+    return;
+  }
+  dns.lookup(hostname, { ...(reqFamily ? { family: reqFamily } : {}), all: true }, (err, addresses) => {
+    if (err || !Array.isArray(addresses) || addresses.length === 0) {
+      callback(err, wantAll ? [] : "", 0);
+      return;
+    }
+    if (upstreamDnsCache.size >= MAX_UPSTREAM_DNS_CACHE) {
+      const oldest = upstreamDnsCache.keys().next().value;
+      if (oldest) upstreamDnsCache.delete(oldest);
+    }
+    upstreamDnsCache.set(cacheKey, {
+      expiresAt: Date.now() + UPSTREAM_DNS_TTL_MS,
+      addresses,
+    });
+    if (wantAll) {
+      callback(null, addresses.map((a) => ({ address: a.address, family: a.family })));
+    } else {
+      const first = addresses[0]!;
+      callback(null, first.address, first.family);
+    }
+  });
+}
+
+// Bounded single-use TLS 1.3 session ticket cache for tunneled proxy connections (enables 1-RTT TLS resumption).
+const MAX_TLS_SESSION_HOSTS = 128;
+const MAX_TLS_TICKETS_PER_HOST = 4;
+const proxyTlsSessions = new Map<string, Buffer[]>();
+
+function popProxyTlsSession(key: string): Buffer | undefined {
+  const list = proxyTlsSessions.get(key);
+  if (!list || list.length === 0) return undefined;
+  const ticket = list.pop();
+  if (list.length === 0) proxyTlsSessions.delete(key);
+  return ticket;
+}
+
+function pushProxyTlsSession(key: string, session: Buffer): void {
+  let list = proxyTlsSessions.get(key);
+  if (!list) {
+    if (proxyTlsSessions.size >= MAX_TLS_SESSION_HOSTS) {
+      const oldest = proxyTlsSessions.keys().next().value;
+      if (oldest) proxyTlsSessions.delete(oldest);
+    }
+    list = [];
+    proxyTlsSessions.set(key, list);
+  }
+  if (list.length >= MAX_TLS_TICKETS_PER_HOST) list.shift();
+  list.push(session);
+}
+
+function connectTunneledTls(socket: Duplex, servername: string, targetPort: number): tls.TLSSocket {
+  const sessionKey = `${servername.toLowerCase()}:${targetPort}`;
+  const session = popProxyTlsSession(sessionKey);
+  const tlsSocket = tls.connect({
+    socket,
+    servername,
+    ...(session ? { session } : {}),
+  });
+  tlsSocket.setNoDelay?.(true);
+  tlsSocket.on("session", (newSession: Buffer) => {
+    pushProxyTlsSession(sessionKey, newSession);
+  });
+  tlsSocket.once("error", () => {
+    proxyTlsSessions.delete(sessionKey);
+  });
+  return tlsSocket;
+}
+
+// Shared direct-upstream agents: keeps direct HTTPS connections warm for 60s (vs undici's 4s drop)
+// and gives direct WebSocket dials 1-RTT TLS session resumption + cached DNS.
+const directHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  timeout: 60_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  maxCachedSessions: 128,
+  lookup: cachedUpstreamLookup as unknown as typeof dns.lookup,
+});
+
+const directHttpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 15_000,
+  timeout: 60_000,
+  maxSockets: 64,
+  maxFreeSockets: 16,
+  lookup: cachedUpstreamLookup as unknown as typeof dns.lookup,
+});
+
+const directWsAgent = new https.Agent({
+  keepAlive: false,
+  maxCachedSessions: 128,
+  lookup: cachedUpstreamLookup as unknown as typeof dns.lookup,
+});
+
+export function getDirectWsAgent(): https.Agent {
+  return directWsAgent;
+}
 
 /**
  * Mask credentials in a proxy URL for safe display/logging (`http://user:pass@1.2.3.4:8080` -> `http://***@1.2.3.4:8080`).
@@ -96,7 +224,7 @@ class HttpConnectTunnelAgent extends https.Agent {
 
   constructor(proxyUrl: string) {
     // 20s idle free-socket timeout prevents reusing NAT-dropped sockets on residential proxies.
-    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 16, maxFreeSockets: 4 });
+    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 64, maxFreeSockets: 16 });
     this.proxyUrl = new URL(proxyUrl);
   }
 
@@ -149,11 +277,7 @@ class HttpConnectTunnelAgent extends https.Agent {
         done(null, socket);
         return;
       }
-      const tlsSocket = tls.connect({
-        socket,
-        servername: options.servername || targetHost,
-      });
-      tlsSocket.setNoDelay?.(true);
+      const tlsSocket = connectTunneledTls(socket, options.servername || targetHost, targetPort);
       done(null, tlsSocket);
     });
 
@@ -183,7 +307,11 @@ export function establishSocks5Tunnel(
   const hasAuth = Boolean(username || password);
 
   return new Promise<net.Socket>((resolve, reject) => {
-    const socket = net.connect({ host: proxyHost, port: proxyPort });
+    const socket = net.connect({
+      host: proxyHost,
+      port: proxyPort,
+      lookup: cachedUpstreamLookup as unknown as typeof dns.lookup,
+    });
     socket.setNoDelay(true);
     let settled = false;
     let stage: "greeting" | "auth" | "connect" = "greeting";
@@ -329,7 +457,7 @@ class Socks5TunnelAgent extends https.Agent {
 
   constructor(proxyUrl: string) {
     // 20s idle free-socket timeout prevents reusing NAT-dropped sockets on residential proxies.
-    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 16, maxFreeSockets: 4 });
+    super({ keepAlive: true, keepAliveMsecs: 15_000, timeout: 20_000, maxSockets: 64, maxFreeSockets: 16 });
     this.proxyUrl = new URL(proxyUrl);
   }
 
@@ -346,11 +474,7 @@ class Socks5TunnelAgent extends https.Agent {
           callback?.(null, socket);
           return;
         }
-        const tlsSocket = tls.connect({
-          socket,
-          servername: options.servername || targetHost,
-        });
-        tlsSocket.setNoDelay?.(true);
+        const tlsSocket = connectTunneledTls(socket, options.servername || targetHost, targetPort);
         callback?.(null, tlsSocket);
       })
       .catch((err) => {
@@ -429,7 +553,7 @@ const MAX_PROXY_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 function doProxiedHttpsRequest(
   u: URL,
-  agent: https.Agent | undefined,
+  agent: http.Agent | https.Agent | undefined,
   init: { method?: string; headers?: Record<string, string>; body?: string | Buffer | Uint8Array; signal?: AbortSignal },
 ): Promise<{ ok: boolean; status: number; text: () => Promise<string>; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
@@ -619,11 +743,37 @@ export async function fetchViaOptionalProxy(
   const retryDelayMs = Math.max(0, options?.retryDelayMs ?? 300);
 
   if (!effectiveProxy) {
+    // In production (native fetch untouched by test harnesses), use our persistent 60s Keep-Alive +
+    // TLS-session-resuming + DNS-cached agent instead of undici's 4s keepAliveTimeout default.
+    if (globalThis.fetch === NATIVE_FETCH) {
+      const u = new URL(url);
+      const directAgent = u.protocol === "http:" ? directHttpAgent : directHttpsAgent;
+      let lastDirectErr: unknown;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          return await doProxiedHttpsRequest(u, directAgent, init);
+        } catch (err) {
+          lastDirectErr = err;
+          if (attempt >= maxRetries || init.signal?.aborted || !isTransientProxyNetworkError(err)) {
+            throw err;
+          }
+          const delay = retryDelayMs * (attempt + 1);
+          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+      throw lastDirectErr;
+    }
     const fetchInit: RequestInit = {
       ...(init.method ? { method: init.method } : {}),
       ...(init.headers ? { headers: init.headers } : {}),
       ...(init.body !== undefined
-        ? { body: typeof init.body === "string" ? init.body : Buffer.from(init.body) }
+        ? {
+          body: (typeof init.body === "string"
+            ? init.body
+            : Buffer.isBuffer(init.body)
+              ? init.body
+              : Buffer.from(init.body)) as BodyInit,
+        }
         : {}),
       ...(init.signal ? { signal: init.signal } : {}),
     };

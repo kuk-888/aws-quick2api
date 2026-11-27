@@ -185,11 +185,11 @@ See [.env.example](./.env.example) for the full template:
 | `AWS_QUICK_LOCALE` | `en-US` | Locale sent to upstream |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | Desktop client version header override |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | - | Global default outbound proxy (case-insensitive, respects `NO_PROXY`; per-account `http://`, `https://`, `socks5://` and shorthand proxies can override in Console) |
-| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | Opt-in toggle (hot-configurable in Console; off by default so user-supplied `system` prompts pass through untouched): recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive `smart` blocks or refuse local tool calls; neutralizes conflicting AI identities and pseudo-system XML wrappers while preserving all workspace rule content |
+| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | 3-mode policy (hot-configurable in Console; `false` by default): `false` (pass through untouched), `true` (soften conflicting AI identities/pseudo-system tags and fold sensitive `<skills>` summaries while keeping tool schemas & workspace rules), `strip` (drop client `system` prose while preserving `<tool_call>` definitions & structured JSON constraints for heavy agent IDEs) |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | Opt-in toggle (hot-configurable in Console): when enabled, if upstream returns `content_filtered` before text emission, a helper model rephrases the latest user prompt into defensive engineering wording and retries once on the exact same requested model (via native `edit_message` on warm threads) |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | Custom prompt template for defensive auto-rephrase (empty = built-in default; editable in Console with one-click reset) |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | Lightweight helper model (`quick-fast` or `quick-balanced`) used strictly for short prompt rephrasing; never replaces the answering model |
-| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | Warm incremental session cache TTL (30 min) and max entries |
+| `WARM_SESSION_TTL_MS` / `PARKED_WS_IDLE_TTL_MS` / `MAX_WARM_SESSIONS` | `3600000` / `3600000` / `256` | Warm session cache & parked single-WS (16-thread multiplexed) idle keepalive TTL (60 min for direct OAuth; automatically capped at 25 min for proxied or Web Cookie/Outpost accounts to avoid proxy idle disconnects) |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | GitHub `owner/repo` for non-blocking release check in Console (set `off` to disable) |
 | `DISABLE_SELF_UPDATE` | `false` | Set to `true` to completely disable Web Console one-click hot-update & rollback endpoints |
 
@@ -198,8 +198,8 @@ See [.env.example](./.env.example) for the full template:
 ## Known Limitations
 
 - **Sampling parameters (`temperature`, `top_p`, `max_tokens`, `stop`, `seed`)**: Not enforced upstream; accepted for client compatibility and reported via response headers.
-- **`response_format` (`json_object` / `json_schema`) & `n > 1`**: Not supported; returns an explicit `400` error.
-- **Attachments**: Image inputs (PNG/JPG/WebP/GIF, up to 10 per turn; exceeding returns `400`) and PDF/document inputs (Anthropic `document`, OpenAI Chat `file`, Responses `input_file`; up to 5 per turn; exceeding returns `400`) are supported. With OAuth credentials, multi-image turns (≥2 images or >20 KB) and binary files like PDFs upload natively out-of-band at full resolution (up to 10 MB per file; upload failures return explicit errors without silent downgrade); non-OAuth credentials and single tiny images use `sharp` inline compression. Audio attachments are not supported yet.
+- **`response_format` & `n > 1`**: Structured JSON output is soft-bridged across all three APIs (OpenAI Chat `response_format`, Responses `text.format`, Anthropic `output_config.format` without returning `400`); `n > 1` is not supported and returns an explicit `400` error.
+- **Attachments**: Image inputs (PNG/JPG/WebP/GIF, up to 10 per turn; exceeding returns `400`) and PDF/document inputs (Anthropic `document`, OpenAI Chat `file`, Responses `input_file`; up to 5 per turn; exceeding returns `400`) are supported. With both OAuth and Web Cookie credentials, multi-image turns (≥2 images or >20 KB) and binary files like PDFs upload natively out-of-band at full resolution (up to 10 MB per file; upload failures return explicit errors without silent downgrade); other credentials and single tiny images use `sharp` inline compression. Audio attachments are not supported yet.
 - **Non-chat endpoints**: Embeddings, image generation, TTS, and Whisper are not supported.
 
 ---

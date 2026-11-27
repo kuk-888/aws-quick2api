@@ -42,6 +42,7 @@ export class TurnProtocolTracker {
   private assistantMessageId: string | undefined;
   private readonly activeCloudTools = new Set<string>();
   private sawCloudTool = false;
+  private cloudToolCount = 0;
   private thinkingOpen = false;
 
   private usageCount = 0;
@@ -95,6 +96,7 @@ export class TurnProtocolTracker {
 
   onCloudToolStart(toolId: string | undefined, toolName: string | undefined): void {
     this.sawCloudTool = true;
+    this.cloudToolCount += 1;
     const key = (toolId && toolId.trim()) || (toolName && toolName.trim()) || `tool_${this.activeCloudTools.size + 1}`;
     this.activeCloudTools.add(key);
   }
@@ -114,6 +116,10 @@ export class TurnProtocolTracker {
 
   hasSeenCloudTools(): boolean {
     return this.sawCloudTool;
+  }
+
+  getCloudToolCount(): number {
+    return this.cloudToolCount;
   }
 
   setResolvedModel(model: string): void {
@@ -193,7 +199,7 @@ export class TurnProtocolTracker {
   }
 
   /**
-   * Extracts active branch / root session updates from an AWS Quick `tree_sync` payload.
+   * Extracts active branch / root session updates from an AWS Quick `tree_sync` or `tree_delta` payload.
    */
   static parseTreeSync(payload: Record<string, unknown>): {
     activeBranchId?: string;
@@ -202,7 +208,11 @@ export class TurnProtocolTracker {
     const activeBranchId =
       typeof payload.active_branch_id === "string" && payload.active_branch_id.trim()
         ? payload.active_branch_id.trim()
-        : undefined;
+        : typeof payload.branch_id === "string" && payload.branch_id.trim()
+          ? payload.branch_id.trim()
+          : typeof payload.kernel_thread_id === "string" && payload.kernel_thread_id.trim()
+            ? payload.kernel_thread_id.trim()
+            : undefined;
     const rootSessionId =
       typeof payload.root_session_id === "string" && payload.root_session_id.trim()
         ? payload.root_session_id.trim()

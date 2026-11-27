@@ -89,6 +89,51 @@ export function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/**
+ * Soft-bridges OpenAI `response_format` / Responses `text.format` / Anthropic `output_config.format`
+ * (`json_object` and `json_schema`) into a strict JSON output system instruction so clients like
+ * OpenWebUI, LangChain, Cherry Studio, and OpenAI SDK `.parse()` work cleanly instead of failing 400.
+ * Still throws `400 unsupported_parameter` for genuinely unknown/unsupported format types.
+ */
+export function buildStructuredOutputBridgePrompt(
+  fmt: unknown,
+  paramName: "response_format" | "text.format" | "output_config.format",
+): string | null {
+  if (!isRecord(fmt) || fmt.type === undefined || fmt.type === "text") return null;
+  const kind = typeof fmt.type === "string" ? fmt.type : typeof fmt.type;
+  if (kind === "json_object") {
+    return [
+      "## Structured JSON Output Requirement",
+      "Respond with ONLY a single valid JSON object. Do not wrap the response in markdown code fences (```json) and do not include any text before or after the JSON object.",
+    ].join("\n");
+  }
+  if (kind === "json_schema") {
+    const nested = isRecord(fmt.json_schema) ? fmt.json_schema : fmt;
+    const schemaName = typeof nested.name === "string" && nested.name.trim() ? nested.name.trim() : undefined;
+    const schemaObj = isRecord(nested.schema) ? nested.schema : undefined;
+    let schemaStr = "";
+    if (schemaObj) {
+      try {
+        const raw = JSON.stringify(schemaObj);
+        schemaStr = raw.length > 16_000 ? `${raw.slice(0, 16_000)}...` : raw;
+      } catch {
+        schemaStr = "";
+      }
+    }
+    return [
+      `## Structured JSON Schema Output Requirement${schemaName ? ` (${schemaName})` : ""}`,
+      "Respond with ONLY a single valid raw JSON value strictly conforming to the required JSON Schema. Do not wrap the response in markdown code fences (```json) and do not include any prose before or after the JSON.",
+      ...(schemaStr ? [`JSON Schema:\n${schemaStr}`] : []),
+    ].join("\n");
+  }
+  throw new GatewayError(
+    `\`${paramName}\` of type '${kind}' is not supported. Supported types are 'text', 'json_object', and 'json_schema'.`,
+    400,
+    "unsupported_parameter",
+    paramName,
+  );
+}
+
 export function parseDataUrlOrRemoteImage(rawUrl: string): NormalizedImage | null {
   const trimmed = rawUrl.trim();
   if (!trimmed) return null;

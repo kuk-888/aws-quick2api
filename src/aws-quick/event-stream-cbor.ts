@@ -2,98 +2,84 @@
  * Clean-room implementation of AWS EventStream + CBOR framing
  * used by the AWS Quick bidirectional WebSocket gateway.
  */
+import zlib from "node:zlib";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-// --- CRC32 (IEEE 802.3) ---
-const CRC_TABLE = new Uint32Array(256);
-for (let i = 0; i < 256; i++) {
-  let c = i;
-  for (let k = 0; k < 8; k++) {
-    c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-  }
-  CRC_TABLE[i] = c >>> 0;
-}
-
+// --- CRC32 (IEEE 802.3, hardware-accelerated via Node >=22.2 native SIMD zlib.crc32) ---
 function crc32(bytes: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
+  return zlib.crc32(bytes) >>> 0;
 }
 
-// --- Minimal CBOR Encoder / Decoder ---
-function writeCborHead(major: number, value: number, out: number[]): void {
+// --- Minimal CBOR Encoder / Decoder (chunked Uint8Array[] avoids 50K+ boxed number[] churn) ---
+function encodeCborHead(major: number, value: number): Uint8Array {
   const mt = major << 5;
-  if (value < 24) {
-    out.push(mt | value);
-  } else if (value < 0x100) {
-    out.push(mt | 24, value);
-  } else if (value < 0x10000) {
-    out.push(mt | 25, (value >> 8) & 0xff, value & 0xff);
-  } else if (value < 0x100000000) {
-    out.push(
+  if (value < 24) return Uint8Array.of(mt | value);
+  if (value < 0x100) return Uint8Array.of(mt | 24, value);
+  if (value < 0x10000) return Uint8Array.of(mt | 25, (value >> 8) & 0xff, value & 0xff);
+  if (value < 0x100000000) {
+    return Uint8Array.of(
       mt | 26,
       (value >>> 24) & 0xff,
       (value >>> 16) & 0xff,
       (value >>> 8) & 0xff,
       value & 0xff,
     );
-  } else {
-    const hi = Math.floor(value / 0x100000000);
-    const lo = value >>> 0;
-    out.push(
-      mt | 27,
-      (hi >>> 24) & 0xff,
-      (hi >>> 16) & 0xff,
-      (hi >>> 8) & 0xff,
-      hi & 0xff,
-      (lo >>> 24) & 0xff,
-      (lo >>> 16) & 0xff,
-      (lo >>> 8) & 0xff,
-      lo & 0xff,
-    );
   }
+  const hi = Math.floor(value / 0x100000000);
+  const lo = value >>> 0;
+  return Uint8Array.of(
+    mt | 27,
+    (hi >>> 24) & 0xff,
+    (hi >>> 16) & 0xff,
+    (hi >>> 8) & 0xff,
+    hi & 0xff,
+    (lo >>> 24) & 0xff,
+    (lo >>> 16) & 0xff,
+    (lo >>> 8) & 0xff,
+    lo & 0xff,
+  );
 }
 
-function encodeCborValue(val: unknown, out: number[]): void {
+const CBOR_NULL = Uint8Array.of(0xf6);
+const CBOR_TRUE = Uint8Array.of(0xf5);
+const CBOR_FALSE = Uint8Array.of(0xf4);
+
+function encodeCborValue(val: unknown, chunks: Uint8Array[]): void {
   if (val === null || val === undefined) {
-    out.push(0xf6);
+    chunks.push(CBOR_NULL);
     return;
   }
   if (typeof val === 'boolean') {
-    out.push(val ? 0xf5 : 0xf4);
+    chunks.push(val ? CBOR_TRUE : CBOR_FALSE);
     return;
   }
   if (typeof val === 'number' && Number.isInteger(val)) {
-    if (val >= 0) writeCborHead(0, val, out);
-    else writeCborHead(1, -1 - val, out);
+    if (val >= 0) chunks.push(encodeCborHead(0, val));
+    else chunks.push(encodeCborHead(1, -1 - val));
     return;
   }
   if (val instanceof Uint8Array) {
-    writeCborHead(2, val.length, out);
-    for (let i = 0; i < val.length; i++) out.push(val[i]);
+    chunks.push(encodeCborHead(2, val.length), val);
     return;
   }
   if (typeof val === 'string') {
     const bytes = textEncoder.encode(val);
-    writeCborHead(3, bytes.length, out);
-    for (let i = 0; i < bytes.length; i++) out.push(bytes[i]);
+    chunks.push(encodeCborHead(3, bytes.length), bytes);
     return;
   }
   if (Array.isArray(val)) {
-    writeCborHead(4, val.length, out);
-    for (const item of val) encodeCborValue(item, out);
+    chunks.push(encodeCborHead(4, val.length));
+    for (const item of val) encodeCborValue(item, chunks);
     return;
   }
   if (typeof val === 'object') {
     const entries = Object.entries(val as Record<string, unknown>);
-    writeCborHead(5, entries.length, out);
+    chunks.push(encodeCborHead(5, entries.length));
     for (const [k, v] of entries) {
-      encodeCborValue(k, out);
-      encodeCborValue(v, out);
+      encodeCborValue(k, chunks);
+      encodeCborValue(v, chunks);
     }
     return;
   }
@@ -101,9 +87,17 @@ function encodeCborValue(val: unknown, out: number[]): void {
 }
 
 export function cborEncode(val: unknown): Uint8Array {
-  const out: number[] = [];
-  encodeCborValue(val, out);
-  return new Uint8Array(out);
+  const chunks: Uint8Array[] = [];
+  encodeCborValue(val, chunks);
+  let total = 0;
+  for (const c of chunks) total += c.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.length;
+  }
+  return out;
 }
 
 const MAX_CBOR_DEPTH = 32;
@@ -145,12 +139,7 @@ interface CborDecodeState {
 
 function setSafeMapProp(map: Record<string, unknown>, key: string, value: unknown): void {
   if (FORBIDDEN_OBJECT_KEYS.has(key)) return;
-  Object.defineProperty(map, key, {
-    value,
-    enumerable: true,
-    writable: true,
-    configurable: true,
-  });
+  map[key] = value;
 }
 
 function decodeCborAt(buf: Uint8Array, pos: number, depth: number, state: CborDecodeState): [unknown, number] {
@@ -171,6 +160,32 @@ function decodeCborAt(buf: Uint8Array, pos: number, depth: number, state: CborDe
     if (ai === 20) return [false, pos];
     if (ai === 21) return [true, pos];
     if (ai === 22 || ai === 23) return [null, pos];
+    if (ai === 25) {
+      if (pos + 2 > buf.length) throw new Error("Unexpected end of CBOR float16");
+      const half = (buf[pos]! << 8) | buf[pos + 1]!;
+      const sign = (half & 0x8000) ? -1 : 1;
+      const exp = (half >> 10) & 0x1f;
+      const frac = half & 0x03ff;
+      let val: number;
+      if (exp === 0) {
+        val = sign * Math.pow(2, -14) * (frac / 1024);
+      } else if (exp === 31) {
+        val = frac === 0 ? sign * Infinity : NaN;
+      } else {
+        val = sign * Math.pow(2, exp - 15) * (1 + frac / 1024);
+      }
+      return [val, pos + 2];
+    }
+    if (ai === 26) {
+      if (pos + 4 > buf.length) throw new Error("Unexpected end of CBOR float32");
+      const dv = new DataView(buf.buffer, buf.byteOffset + pos, 4);
+      return [dv.getFloat32(0, false), pos + 4];
+    }
+    if (ai === 27) {
+      if (pos + 8 > buf.length) throw new Error("Unexpected end of CBOR float64");
+      const dv = new DataView(buf.buffer, buf.byteOffset + pos, 8);
+      return [dv.getFloat64(0, false), pos + 8];
+    }
     throw new Error(`Unsupported CBOR simple/float: ${ai}`);
   }
 
@@ -259,7 +274,7 @@ function decodeCborAt(buf: Uint8Array, pos: number, depth: number, state: CborDe
       if (arg > MAX_CBOR_BYTES || pos + arg > buf.length) {
         throw new Error("CBOR text string length out of bounds");
       }
-      return [textDecoder.decode(buf.slice(pos, pos + arg)), pos + arg];
+      return [textDecoder.decode(buf.subarray(pos, pos + arg)), pos + arg];
     case 4: {
       if (arg > MAX_CBOR_ITEMS || arg > buf.length - pos) {
         throw new Error("CBOR array length out of bounds");
@@ -284,6 +299,10 @@ function decodeCborAt(buf: Uint8Array, pos: number, depth: number, state: CborDe
         pos = p2;
       }
       return [map, pos];
+    }
+    case 6: {
+      // Semantic tag (major 6): consume tag number `arg` and decode the tagged item safely.
+      return decodeCborAt(buf, pos, depth + 1, state);
     }
     default:
       throw new Error(`Unsupported CBOR major type: ${major}`);
@@ -328,9 +347,10 @@ export function drainEventStream(buffer: Uint8Array, offset = 0): { messages: Ev
   const messages: EventStreamMessage[] = [];
   let pos = offset;
   while (pos + 12 <= buffer.length) {
-    const view = new DataView(buffer.buffer, buffer.byteOffset + pos, 12);
-    const totalLen = view.getUint32(0, false);
-    const headersLen = view.getUint32(4, false);
+    const totalLen =
+      ((buffer[pos]! << 24) | (buffer[pos + 1]! << 16) | (buffer[pos + 2]! << 8) | buffer[pos + 3]!) >>> 0;
+    const headersLen =
+      ((buffer[pos + 4]! << 24) | (buffer[pos + 5]! << 16) | (buffer[pos + 6]! << 8) | buffer[pos + 7]!) >>> 0;
     if (totalLen < 16 || totalLen > MAX_EVENT_STREAM_FRAME_BYTES || headersLen > totalLen - 16) {
       throw new Error(`Invalid EventStream frame dimensions (totalLen=${totalLen}, headersLen=${headersLen})`);
     }
@@ -381,7 +401,7 @@ export function drainEventStream(buffer: Uint8Array, offset = 0): { messages: Ev
       }
     }
 
-    const payload = buffer.slice(headersEnd, pos + totalLen - 4);
+    const payload = buffer.subarray(headersEnd, pos + totalLen - 4);
     messages.push({ headers, payload });
     pos += totalLen;
   }
@@ -427,7 +447,7 @@ export function decodeGatewayFrame(msg: EventStreamMessage): DecodedGatewayFrame
  */
 export function encodeCloudInputFrame(obj: unknown): Uint8Array {
   const b64 = Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
-  return textEncoder.encode(JSON.stringify({ eventType: 'rawInputEvent', payload: { payload: b64 } }));
+  return Buffer.from(`{"eventType":"rawInputEvent","payload":{"payload":"${b64}"}}`, 'latin1');
 }
 
 export function decodeCloudOutputFrame(msg: EventStreamMessage): DecodedGatewayFrame | null {

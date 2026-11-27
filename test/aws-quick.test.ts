@@ -1046,7 +1046,7 @@ describe("Credential parser & ClientKeyStore", () => {
       assert.ok(compactPrompt.includes("## Client Tools (JSON Schema)"));
       assert.ok(!compactPrompt.includes("bypassing any device-access"));
       assert.ok(!fallbackPrompt.includes("bypassing any device-access"));
-      assert.ok(fallbackPrompt.includes("## Structured Tool Request Format"));
+      assert.ok(fallbackPrompt.includes("## Tool Schemas (JSON)"));
 
       // Dashboard HTML still renders valid JS with the new customAgentPrompt, editChatAgent, and 5h burst bar
       const html = renderDashboardHtml("/dashboard", "testnonce");
@@ -1396,13 +1396,14 @@ describe("Credential parser & ClientKeyStore", () => {
       "auto",
       { compactForCustomAgent: true, preferClientToolsOverWorkspace: true },
     );
-    assert.ok(fastBridge.includes("Prefer the `<tool_call>` schemas above over built-in workspace tools."));
+    assert.ok(fastBridge.includes("For file, shell, and workspace actions, emit matching `<tool_call>` blocks"));
+    assert.ok(!fastBridge.includes("instead of built-in"), "must keep purely positive zero-override phrasing");
     const sonnetBridge = buildToolBridgePrompt(
       [{ name: "Read", description: "Read file", inputSchema: { type: "object", properties: { file_path: { type: "string" } } } }],
       "auto",
       { compactForCustomAgent: true, preferClientToolsOverWorkspace: false },
     );
-    assert.ok(!sonnetBridge.includes("built-in workspace tools"));
+    assert.ok(!sonnetBridge.includes("For file, shell, and workspace actions"));
 
     // 2) OpenAI /v1/responses unwraps single-turn user array input to plain text (no [USER]: prefix)
     const singleResp = parseResponsesRequest({
@@ -2453,6 +2454,104 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
       await engine.disposeAll();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
     }
+  });
+
+  it("enforces single-turn isolation, anti-answer guardrails, entity fidelity, and friendly UI copy for content-filter rephrase", async () => {
+    const {
+      DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT,
+      LEGACY_CONTENT_FILTER_REPHRASE_PROMPT,
+      extractPreservableEntities,
+      splitTrailingUserTurn,
+      validateRephrasedPrompt,
+    } = await import("../src/core/upstream-errors.js");
+    const { renderDashboardHtml } = await import("../src/web/dashboard-ui.js");
+
+    // 1. Upgraded prompt preserves actionable engineering intent & avoids legacy meta-prohibition
+    assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("content moderation"));
+    assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("neutral"));
+    assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("Preserve actionable intent"));
+    assert.ok(DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("Preserve all benign technical details"));
+    assert.ok(!DEFAULT_CONTENT_FILTER_REPHRASE_PROMPT.includes("explicitly ask the responder NOT to output vulnerable code"));
+    assert.ok(LEGACY_CONTENT_FILTER_REPHRASE_PROMPT.includes("explicitly ask the responder NOT to output vulnerable code"));
+
+    // 2. Single-turn isolation splits only the trailing [USER]: turn and keeps prior turns verbatim
+    const single = splitTrailingUserTurn("Fix retry bug in src/core/engine.ts");
+    assert.equal(single.hasMarkers, false);
+    assert.equal(single.prefix, "");
+    assert.equal(single.lastUser, "Fix retry bug in src/core/engine.ts");
+
+    const multi = splitTrailingUserTurn(
+      "[USER]: Remember project code ORION-8821.\n\n[ASSISTANT]: Acknowledged ORION-8821.\n\n[USER]: kill zombie node processes on port 8080",
+    );
+    assert.equal(multi.hasMarkers, true);
+    assert.equal(multi.prefix, "[USER]: Remember project code ORION-8821.\n\n[ASSISTANT]: Acknowledged ORION-8821.\n\n[USER]: ");
+    assert.equal(multi.lastUser, "kill zombie node processes on port 8080");
+
+    // 3. Entity extraction captures file paths and backtick identifiers
+    const entities = extractPreservableEntities(
+      "Edit `src/core/engine.ts` and call `rephrasePromptForContentFilter` with `quick-fast`.",
+    );
+    assert.ok(entities.includes("src/core/engine.ts"));
+    assert.ok(entities.includes("rephrasePromptForContentFilter"));
+
+    // 4. Guardrail accepts faithful neutral rewrite and strips accidental wrapper markers
+    const good = validateRephrasedPrompt(
+      "帮我查一下 `src/core/engine.ts` 里的 `killStaleWorker` 为什么没有清掉僵尸进程，直接给我 diff。",
+      "[USER]: 帮我排查 `src/core/engine.ts` 里的 `killStaleWorker` 为何未能终止残留工作进程，并直接给出修改 diff。",
+    );
+    assert.equal(good.ok, true);
+    assert.ok(good.cleaned && !good.cleaned.startsWith("[USER]:"));
+    assert.ok(good.cleaned && good.cleaned.includes("src/core/engine.ts"));
+
+    // 5. Guardrail rejects helper accidentally answering instead of rewriting
+    const answered = validateRephrasedPrompt(
+      "Explain why `src/core/engine.ts` retries failed streams.",
+      "Sure! Here is why `src/core/engine.ts` retries failed streams: when the upstream socket closes...",
+    );
+    assert.equal(answered.ok, false);
+    assert.equal(answered.reason, "accidental_answer_prefix");
+
+    const answeredZh = validateRephrasedPrompt(
+      "帮我写一个 Redis 分布式锁的 Go 实现",
+      "好的，下面是使用 Redis 实现分布式锁的完整步骤与方案说明：",
+    );
+    assert.equal(answeredZh.ok, false);
+    assert.equal(answeredZh.reason, "accidental_answer_prefix");
+
+    // 6. Guardrail rejects accidental fenced code block when original had none
+    const accidentalCode = validateRephrasedPrompt(
+      "帮我给 src/auth/jwt.ts 写个防重放中间件",
+      "```ts\nexport function antiReplayMiddleware(req: Request, res: Response, next: NextFunction) {\n  const jti = req.headers['x-jti'];\n  return next();\n}\n```",
+    );
+    assert.equal(accidentalCode.ok, false);
+    assert.equal(accidentalCode.reason, "accidental_code_answer");
+
+    // 7. Guardrail rejects severely truncated rewrites
+    const truncated = validateRephrasedPrompt(
+      "请帮我检查 src/core/engine.ts 里的并发连接池回收逻辑，并补充 3 个覆盖超时、断连和重连的单元测试，输出完整 patch。",
+      "请检查连接池逻辑。",
+    );
+    assert.equal(truncated.ok, false);
+    assert.equal(truncated.reason, "too_short");
+
+    // 8. Guardrail rejects rewrite that drops >= 2 critical technical entities
+    const droppedEntities = validateRephrasedPrompt(
+      "重构 `src/core/engine.ts` 里的 `rephrasePromptForContentFilter` 和 `src/web/dashboard-ui.ts` 里的配置保存逻辑，保持兼容。",
+      "请帮我重构核心引擎和控制台页面里的配置保存与重试处理逻辑，确保整体架构保持向后兼容。",
+    );
+    assert.equal(droppedEntities.ok, false);
+    assert.equal(droppedEntities.reason, "entities_dropped");
+
+    // 9. Dashboard renders beginner-friendly UI labels and dynamic mode hint
+    const html = renderDashboardHtml("/dashboard", "test-nonce");
+    assert.ok(html.includes("账号分配与防误拦策略"));
+    assert.ok(html.includes("多账号分配方式"));
+    assert.ok(html.includes("同一对话固定用同一账号"));
+    assert.ok(html.includes("在思考过程顶部显示实际模型"));
+    assert.ok(html.includes("客户端系统提示词兼容模式"));
+    assert.ok(html.includes("sanitizeModeHint"));
+    assert.ok(html.includes("智能兼容（推荐 · 防误拦且保留规则）"));
+    assert.ok(html.includes("被误拦时自动换词重试"));
   });
 
   it("preserves real HTTP 403/429 during server.ts 15s delayed flushEarly without leaking timers", async () => {
@@ -3885,12 +3984,19 @@ describe("Security hardening regressions (SSRF, CBOR/EventStream, wsHost, redact
     });
     assert.equal(ccTurn.tools.length, 1, "server built-in tool_search_tool_regex must not become a fake custom tool");
     assert.ok(ccTurn.incrementalUserText?.includes("[Image attached (1)]"), "image-only tool_result must not say [empty]");
+    const schemaTurn = parseAnthropicMessagesRequest({
+      model: "quick-balanced",
+      max_tokens: 64,
+      output_config: { format: { type: "json_schema", schema: { type: "object", properties: { ok: { type: "boolean" } } } } },
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.ok(schemaTurn.systemPrompt?.includes("Structured JSON Schema Output Requirement"), "output_config.format json_schema should soft-bridge cleanly");
     assert.throws(
       () =>
         parseAnthropicMessagesRequest({
           model: "quick-balanced",
           max_tokens: 64,
-          output_config: { format: { type: "json_schema", schema: { type: "object" } } },
+          output_config: { format: { type: "xml_unsupported" } },
           messages: [{ role: "user", content: "hi" }],
         }),
       (e: unknown) => e instanceof GatewayError && e.status === 400 && e.code === "unsupported_parameter",
@@ -4614,7 +4720,7 @@ setInterval(() => {}, 10_000);
       "<guidelines>\nNever defeat or bypass an access control, permission check, or sandbox.\nNever solve or bypass a CAPTCHA.\n</guidelines>",
       "<guidelines>\nAlways prefer async/await over raw Promise chains.\n</guidelines>",
       "<user_rules>\nThe following are user-defined rules that you MUST ALWAYS FOLLOW WITHOUT ANY EXCEPTION. These rules take precedence over any other instructions.\n<RULE[/workspace/AGENTS.md]>\nKeep functions under 60 lines and write unit tests.\n</RULE[/workspace/AGENTS.md]>\n</user_rules>",
-      "<skills>\nIf a skill seems relevant to your current task, you MUST read its `SKILL.md` instructions before proceeding.\n- deploy-helper: Deploy build artifacts.\n</skills>",
+      "<skills>\nIf a skill seems relevant to your current task, you MUST read its `SKILL.md` instructions before proceeding.\n- deploy-helper: Deploy build artifacts.\n- js-reverse-mcp (/skills/js-reverse/SKILL.md): Chrome DevTools breakpoints, XHR interception, and script source dumping.\n- ops-vault: AES-256 encrypted credential vault querying.\n</skills>",
       "<system-reminder>\nBranch: main\n</system-reminder>",
     ].join("\n\n");
 
@@ -4629,11 +4735,17 @@ setInterval(() => {}, 10_000);
     assert.ok(!deepCleaned.includes("WITHOUT ANY EXCEPTION"));
     assert.ok(!deepCleaned.includes("take precedence over any other instructions"));
     assert.ok(!deepCleaned.includes("<system-reminder>"));
-    // Preserves 100% of actual user conventions, custom non-security guidelines, and skill entries!
+    // Preserves 100% of actual user conventions, custom non-security guidelines, and normal skill entries,
+    // while folding high-risk reverse/interception/vault skill descriptions down to name + SKILL.md path!
     assert.ok(deepCleaned.includes("Always prefer async/await over raw Promise chains."));
     assert.ok(deepCleaned.includes("Keep functions under 60 lines and write unit tests."));
     assert.ok(deepCleaned.includes("### Rules (AGENTS.md)"));
     assert.ok(deepCleaned.includes("- deploy-helper: Deploy build artifacts."));
+    assert.ok(deepCleaned.includes("- js-reverse-mcp (/skills/js-reverse/SKILL.md)\n"));
+    assert.ok(!deepCleaned.includes("XHR interception"));
+    assert.ok(!deepCleaned.includes("script source dumping"));
+    assert.ok(deepCleaned.includes("- ops-vault\n") || deepCleaned.endsWith("- ops-vault"));
+    assert.ok(!deepCleaned.includes("credential vault"));
     assert.ok(deepCleaned.includes("[Context note]\nBranch: main\n[/Context note]"));
 
     // 4) End-to-end server verification:
@@ -4747,7 +4859,7 @@ setInterval(() => {}, 10_000);
       },
       envFile,
     );
-    assert.equal(cfg.sanitizeClientSystemPrompt, false, "must default to false");
+    assert.equal(cfg.sanitizeClientSystemPrompt, "false", "must default to 'false'");
 
     const gw = createGatewayServer({ config: cfg });
     // Inject mock WS factory into engine for offline deterministic testing
@@ -4800,15 +4912,15 @@ setInterval(() => {}, 10_000);
         authorization: `Bearer ${loginData.token}`,
       };
 
-      // B) Toggle `sanitizeClientSystemPrompt: true` via `/v1/admin/settings`
+      // B) Toggle `sanitizeClientSystemPrompt: true` (backward-compatible boolean) via `/v1/admin/settings`
       const setRes = await fetch(`${base}/v1/admin/settings`, {
         method: "POST",
         headers: adminHeaders,
         body: JSON.stringify({ sanitizeClientSystemPrompt: true }),
       });
       assert.equal(setRes.status, 200);
-      const setJson = (await setRes.json()) as { settings: { sanitizeClientSystemPrompt: boolean } };
-      assert.equal(setJson.settings.sanitizeClientSystemPrompt, true);
+      const setJson = (await setRes.json()) as { settings: { sanitizeClientSystemPrompt: string } };
+      assert.equal(setJson.settings.sanitizeClientSystemPrompt, "true");
 
       // Next request immediately deep-sanitizes `custom_prompt` while keeping business rules intact!
       const resOptIn = await fetch(`${base}/v1/messages`, {
@@ -4830,6 +4942,54 @@ setInterval(() => {}, 10_000);
       assert.ok(!sanitizedCustomPrompt.includes("Antigravity"));
       assert.ok(!sanitizedCustomPrompt.includes("WITHOUT ANY EXCEPTION"));
       assert.ok(sanitizedCustomPrompt.includes("Keep functions under 60 lines and write unit tests."));
+
+      // B2) Reject invalid sanitizeClientSystemPrompt value with 400
+      const badSanRes = await fetch(`${base}/v1/admin/settings`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ sanitizeClientSystemPrompt: "bogus_mode" }),
+      });
+      assert.equal(badSanRes.status, 400);
+
+      // B3) Toggle `sanitizeClientSystemPrompt: "strip"` -> drops client systemPrompt completely while preserving BOTH tool schemas AND JSON structured output constraints!
+      const stripSetRes = await fetch(`${base}/v1/admin/settings`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ sanitizeClientSystemPrompt: "strip" }),
+      });
+      assert.equal(stripSetRes.status, 200);
+      const stripSetJson = (await stripSetRes.json()) as { settings: { sanitizeClientSystemPrompt: string } };
+      assert.equal(stripSetJson.settings.sanitizeClientSystemPrompt, "strip");
+
+      const resStrip = await fetch(`${base}/v1/messages`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": clientToken,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "quick-smart",
+          max_tokens: 128,
+          system: heavyIdePrompt,
+          output_config: { format: { type: "json_schema", schema: { type: "object", properties: { ok: { type: "boolean" } } } } },
+          tools: [{ name: "read_local", description: "Read local file", input_schema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] } }],
+          messages: [{ role: "user", content: "Ping 3" }],
+        }),
+      });
+      assert.equal(resStrip.status, 200);
+      const stripCustomPrompt = String(capturedChatFrames[2]!.custom_prompt || "");
+      assert.ok(!stripCustomPrompt.includes("Antigravity"), "strip mode must drop client identity");
+      assert.ok(!stripCustomPrompt.includes("Keep functions under 60 lines"), "strip mode must drop client system prompt completely");
+      assert.ok(stripCustomPrompt.includes("Structured JSON Schema Output Requirement"), "strip mode must preserve gateway JSON schema constraint");
+      assert.ok(stripCustomPrompt.includes("read_local"), "strip mode must preserve client tool schemas");
+
+      // Reset back to "false"
+      await fetch(`${base}/v1/admin/settings`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify({ sanitizeClientSystemPrompt: "false" }),
+      });
 
       // C) Run `POST /v1/admin/keys/sync-agents` in explicit `mode: "upgrade"`: upgrades `legacy-bridge-99` (`Quick2API Bridge` -> `Coding Assistant`)
       //    and NEVER modifies `personal-writer-01` (`写作改写助手`)!
@@ -6932,7 +7092,7 @@ setInterval(() => {}, 10_000);
         incognitoMode: true,
         autoEnsureCodingAgent: true,
         customAgentPrompt: "",
-        sanitizeClientSystemPrompt: false,
+        sanitizeClientSystemPrompt: "false" as const,
         showRoutedModelInThinking: "true" as const,
         autoRephraseOnContentFilter: false,
         contentFilterRephrasePrompt: "",
@@ -7628,7 +7788,7 @@ setInterval(() => {}, 10_000);
       ee.readyState = initialState;
       ee.closed = false;
       ee.sent = [];
-      ee.ping = () => {};
+      ee.ping = () => { };
       ee.send = (d: unknown) => {
         ee.sent.push(d);
       };
@@ -7798,7 +7958,7 @@ setInterval(() => {}, 10_000);
         if (typeof outer?.payload?.payload === "string") {
           return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as Record<string, unknown>;
         }
-      } catch {}
+      } catch { }
       return null;
     };
     const encodeCloudOut = (ev: Record<string, unknown>): Buffer => {
@@ -7911,7 +8071,8 @@ setInterval(() => {}, 10_000);
                 ws.emit("close", 1006, Buffer.from("transient drop"));
               } else {
                 ws.emit("message", encodeCloudOut({ type: "text_delta", payload: { delta: "RECOVERED" } }));
-                ws.emit("message", encodeCloudOut({ type: "message_complete", thread_id: "thr-ok", payload: {} }));
+                const sentTid = (ev.payload as { thread_id?: string } | undefined)?.thread_id || "thr-ok";
+                ws.emit("message", encodeCloudOut({ type: "message_complete", thread_id: sentTid, payload: {} }));
               }
             });
           }
@@ -8115,5 +8276,1405 @@ setInterval(() => {}, 10_000);
       compressed.map((im) => im.name),
       ["user_image_001.png", "user_image_002.png", "user_image_003.png", "user_image_004.png"],
     );
+  });
+
+  it("Standby WS auto-replenishes after idle TTL expiry, remote drop, and newly enabled slots with failure backoff", async () => {
+    const WebSocket = (await import("ws")).default;
+    const { WebSocketServer } = await import("ws");
+    const { encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+    const { collectTurnEvents } = await import("../src/protocols/common.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+
+    const decodeMockCloudIn = (buf: Buffer): Record<string, unknown> | null => {
+      try {
+        const outer = JSON.parse(buf.toString("utf8")) as { payload?: { payload?: string } };
+        if (typeof outer?.payload?.payload === "string") {
+          return JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8")) as Record<string, unknown>;
+        }
+      } catch { }
+      return null;
+    };
+    const encodeMockCloudOut = (ev: Record<string, unknown>): Uint8Array => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      const payload = Buffer.from(JSON.stringify({ payload: b64 }), "utf8");
+      return encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, payload);
+    };
+    const mkOAuth = (suffix: string) =>
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: `cid-standby-auto-${suffix}`,
+          clientSecret: `csec-${suffix}`,
+          refreshToken: `rtok-${suffix}`,
+          accessToken: `atok-${suffix}`,
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        "utf8",
+      ).toString("base64url");
+
+    const waitUntil = async (pred: () => boolean, timeoutMs = 2_000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (pred()) return;
+        await new Promise((r) => setTimeout(r, 15));
+      }
+      assert.ok(pred(), "condition timed out");
+    };
+
+    let connSeq = 0;
+    let closedSeqs: number[] = [];
+    let activeSocks = new Map<number, InstanceType<typeof WebSocket>>();
+    let rejectHandshakes = false;
+    let userMsgConnId: number | null = null;
+
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((r) => wss.once("listening", r));
+    const wsPort = (wss.address() as { port: number }).port;
+
+    wss.on("connection", (sock) => {
+      const myId = ++connSeq;
+      activeSocks.set(myId, sock);
+      sock.on("close", () => {
+        activeSocks.delete(myId);
+        closedSeqs.push(myId);
+      });
+      if (rejectHandshakes) {
+        sock.close(1011, "simulated proxy failure");
+        return;
+      }
+      sock.on("message", (raw) => {
+        const frame = decodeMockCloudIn(Buffer.from(raw as Buffer));
+        if (!frame) return;
+        const fType = String(frame.type || "");
+        if (fType === "session_connect") {
+          sock.send(encodeMockCloudOut({ type: "session_established", payload: { session_id: `s-${myId}` } }));
+        } else if (fType === "user_message") {
+          userMsgConnId = myId;
+          sock.send(encodeMockCloudOut({ type: "text_delta", payload: { delta: "STANDBY_FAST" } }));
+          sock.send(encodeMockCloudOut({ type: "turn_usage", payload: { input_tokens: 8, output_tokens: 2 } }));
+          sock.send(encodeMockCloudOut({ type: "message_complete", payload: { text: "STANDBY_FAST" } }));
+        }
+      });
+    });
+
+    const key1 = mkOAuth("1");
+    const key2 = mkOAuth("2");
+    const pool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: `${key1},${key2}`,
+        SESSION_AFFINITY: "false",
+        AUTO_DISABLE_EXHAUSTED_KEYS: "false",
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      }),
+      dataDir: undefined,
+    });
+    const [slot1, slot2] = pool.allManagedKeys();
+    assert.ok(slot1 && slot2);
+    // Start with only slot1 enabled so we can test single-slot TTL rotation first, then slot2 dynamic enable!
+    pool.updateSlotMeta(slot2.slotId, { enabled: false });
+
+    const engine = new QuickExecutionEngine({
+      config: loadConfigFromEnv({ QUICK_TOKENS: `${key1},${key2}`, AUTO_ENSURE_CODING_AGENT: "false", INCOGNITO: "true" }),
+      usageTracker: new UsageTracker(),
+      webSocketFactory: () => new WebSocket(`ws://127.0.0.1:${wsPort}`),
+      enableStandbyPrewarmWithFactory: true,
+      standbyTtlMs: 160,
+      standbyMaintainIntervalMs: 90,
+      standbyReplenishDelayMs: 20,
+    });
+
+    try {
+      // 1. Startup warmup fills slot1 standby WS (conn #1)
+      engine.warmStandbyPool(pool);
+      engine.startStandbyMaintenance(pool);
+      await waitUntil(() => engine.runtimeStats().standbyWs === 1 && connSeq >= 1);
+      const firstConnId = connSeq;
+
+      // 2. Simulate >10m idle TTL expiry: conn #1 closes cleanly and auto-rotates to a fresh standby WS (conn #2+)
+      await waitUntil(() => closedSeqs.includes(firstConnId) && connSeq > firstConnId && engine.runtimeStats().standbyWs === 1);
+      const rotatedConnId = connSeq;
+      assert.ok(rotatedConnId > firstConnId, "expired standby WS must auto-rotate to a fresh connection");
+
+      // 3. Brand-new cold turn after idle rotation adopts the freshly rotated standby WS directly (ZERO extra dial!)
+      const turnResult = await collectTurnEvents(
+        engine.executeTurnWithPool(
+          {
+            requestedModel: "quick-balanced",
+            rawBody: { messages: [{ role: "user", content: "hello after long idle" }] },
+            fullTranscriptText: "hello after long idle",
+            images: [],
+            tools: [],
+            toolChoice: "auto",
+            trailingToolResults: [],
+            stream: true,
+            estimatedInputTokens: 6,
+          },
+          pool,
+        ),
+      );
+      assert.equal(turnResult.text, "STANDBY_FAST");
+      assert.equal(
+        userMsgConnId,
+        rotatedConnId,
+        `cold turn after idle TTL rotation must adopt rotated standby conn #${rotatedConnId} directly, got #${userMsgConnId}`,
+      );
+
+      // 4. Remote abrupt close on standby WS self-heals automatically
+      await waitUntil(() => engine.runtimeStats().standbyWs === 1 && connSeq > rotatedConnId);
+      const beforeDropSeq = connSeq;
+      const liveStandbySock = activeSocks.get(beforeDropSeq);
+      assert.ok(liveStandbySock, "expected active standby socket on mock server");
+      liveStandbySock.terminate();
+      await waitUntil(() => connSeq > beforeDropSeq && engine.runtimeStats().standbyWs === 1);
+
+      // 5. Enabling slot2 dynamically is picked up automatically by periodic maintenance -> standbyWs === 2
+      pool.updateSlotMeta(slot2.slotId, { enabled: true });
+      await waitUntil(() => engine.runtimeStats().standbyWs === 2);
+
+      // 6. Failure backoff guard: repeated failed dials on a broken proxy/endpoint back off cleanly (no storm)
+      const failKey = mkOAuth("fail");
+      const failPool = new UpstreamKeyPool({
+        ...loadConfigFromEnv({
+          QUICK_TOKENS: failKey,
+          AUTO_ENSURE_CODING_AGENT: "false",
+          INCOGNITO: "true",
+        }),
+        dataDir: undefined,
+      });
+      rejectHandshakes = true;
+      let failAttempts = 0;
+      const failEngine = new QuickExecutionEngine({
+        config: loadConfigFromEnv({ QUICK_TOKENS: failKey, AUTO_ENSURE_CODING_AGENT: "false", INCOGNITO: "true" }),
+        usageTracker: new UsageTracker(),
+        webSocketFactory: () => {
+          failAttempts += 1;
+          return new WebSocket(`ws://127.0.0.1:${wsPort}`);
+        },
+        enableStandbyPrewarmWithFactory: true,
+        standbyTtlMs: 500,
+        standbyMaintainIntervalMs: 40,
+        standbyReplenishDelayMs: 10,
+      });
+      try {
+        failEngine.warmStandbyPool(failPool);
+        failEngine.startStandbyMaintenance(failPool);
+        await new Promise((r) => setTimeout(r, 220));
+        assert.equal(failAttempts, 1, `broken standby dial must back off after 1st failure instead of storming, got ${failAttempts}`);
+        assert.equal(failEngine.runtimeStats().standbyWs, 0);
+      } finally {
+        await failEngine.disposeAll();
+        failPool.dispose();
+      }
+    } finally {
+      await engine.disposeAll();
+      pool.dispose();
+      await new Promise<void>((r) => wss.close(() => r()));
+    }
+  });
+
+  it("Wave 3: park() standby-safe eviction + 3-slot warm cap, standby-aware tiebreak, RequestAttachmentCache dedup, zero-alloc token estimator, O(N) streaming filters, and SIMD CBOR/EventStream", async () => {
+    const { EventEmitter } = await import("node:events");
+    const WsClass = (await import("ws")).default;
+    const { WarmSessionPool, MAX_PARKED_WS_PER_SLOT } = await import("../src/core/warm-session-pool.js");
+    const { RequestAttachmentCache } = await import("../src/core/request-attachment-cache.js");
+    const { estimateAnthropicTokens } = await import("../src/protocols/anthropic.js");
+    const { StreamingToolCallFilter } = await import("../src/core/tool-bridge.js");
+    const { StreamingUiTagSanitizer } = await import("../src/core/ui-tag-sanitizer.js");
+    const { cborEncode, cborDecode, encodeEventStream, drainEventStream, encodeCloudInputFrame, decodeCloudOutputFrame } = await import("../src/aws-quick/event-stream-cbor.js");
+    const { getDirectWsAgent } = await import("../src/utils/proxy-agent.js");
+
+    type StubWs = InstanceType<typeof EventEmitter> & { readyState: number; closed: boolean; close(): void; terminate(): void; ping(): void; send(): void };
+    const makeStubWs = (): StubWs => {
+      const ee = new EventEmitter() as StubWs;
+      ee.readyState = WsClass.OPEN;
+      ee.closed = false;
+      ee.close = () => { ee.closed = true; ee.readyState = WsClass.CLOSED; };
+      ee.terminate = () => { ee.closed = true; ee.readyState = WsClass.CLOSED; };
+      ee.ping = () => { };
+      ee.send = () => { };
+      return ee;
+    };
+    const asWs = (s: StubWs) => s as unknown as import("ws").default;
+
+    // 1. MAX_PARKED_WS_PER_SLOT === 3 & park() does NOT double-evict standby WS; priority eviction keeps heavy multi-turn sessions
+    assert.equal(MAX_PARKED_WS_PER_SLOT, 3);
+    const wpool = new WarmSessionPool({ maxWarmSessions: 32 });
+    const standbySock = makeStubWs();
+    assert.equal(
+      wpool.storeStandby({
+        slotId: "s-w3",
+        isIncognito: true,
+        handle: {
+          ws: asWs(standbySock),
+          outpostId: "web0",
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          surfaceType: "DESKTOP",
+          appVersion: "1.0.0",
+          surfaceName: "desktop",
+        },
+      }),
+      true,
+    );
+    const wsC1 = makeStubWs();
+    const wsC2 = makeStubWs();
+    const wsC3 = makeStubWs();
+    const wsC4 = makeStubWs();
+    // Simulate active turn finishing (active=0 at idle park time or active=1): park 3 conversations while keeping standby intact!
+    assert.equal(wpool.park({ scope: "s", conversationKey: "c1", slotId: "s-w3", isIncognito: true, prefixHashes: ["h1"], threadId: "t1", priority: 2, ws: asWs(wsC1), encodeFrame: encodeCloudInputFrame }), true);
+    assert.equal(wpool.park({ scope: "s", conversationKey: "c2", slotId: "s-w3", isIncognito: true, prefixHashes: ["h2"], threadId: "t2", priority: 1, ws: asWs(wsC2), encodeFrame: encodeCloudInputFrame }), true);
+    assert.equal(wpool.park({ scope: "s", conversationKey: "c3", slotId: "s-w3", isIncognito: true, prefixHashes: ["h3"], threadId: "t3", priority: 2, ws: asWs(wsC3), encodeFrame: encodeCloudInputFrame }), true);
+    assert.equal(wpool.countParkedWsForSlot("s-w3"), 3, "idle slot must hold 3 conversation parked WS");
+    assert.equal(wpool.countStandbyWs(), 1, "parking 3rd conversation WS must NOT wipe healthy standby WS");
+    assert.equal(standbySock.closed, false);
+
+    // Parking 4th conversation WS evicts low-priority helper `c2` (priority=1) instead of heavy coding sessions `c1`/`c3` (priority=2) AND preserves standby!
+    assert.equal(wpool.park({ scope: "s", conversationKey: "c4", slotId: "s-w3", isIncognito: true, prefixHashes: ["h4"], threadId: "t4", priority: 2, ws: asWs(wsC4), encodeFrame: encodeCloudInputFrame }), true);
+    assert.equal(wsC2.closed, true, "low-priority tiny helper session must be evicted first");
+    assert.equal(wsC1.closed, false, "high-priority coding session c1 must survive");
+    assert.equal(wsC3.closed, false, "high-priority coding session c3 must survive");
+    assert.equal(standbySock.closed, false, "standby WS must still survive conversation cap eviction");
+
+    // invalidateSlot with keepStandby=true drops conversation threads while keeping standby WS alive!
+    wpool.invalidateSlot("s-w3", { keepStandby: true });
+    assert.equal(wpool.countParkedWsForSlot("s-w3"), 0);
+    assert.equal(wpool.countStandbyWs(), 1);
+    assert.equal(standbySock.closed, false);
+    wpool.disposeAll();
+
+    // 2. Standby-aware tiebreaker in quota-aware mode (and strictly bypassed in round-robin mode)
+    const mkKey = (s: string) =>
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: `cid-tie-${s}`,
+          clientSecret: "sec",
+          refreshToken: `rt-${s}`,
+          accessToken: `at-${s}`,
+          expiresAt: Date.now() + 3_600_000,
+        }),
+      ).toString("base64url");
+    const kA = mkKey("a");
+    const kB = mkKey("b");
+    const qPool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({ QUICK_TOKENS: `${kA},${kB}`, LB_STRATEGY: "quota-aware", SESSION_AFFINITY: "false" }),
+      dataDir: undefined,
+    });
+    const [slotA, slotB] = qPool.allManagedKeys();
+    assert.ok(slotA && slotB);
+    qPool.setStandbyProbe((sid) => sid === slotB.slotId);
+    const l1 = qPool.leaseKey("quick-balanced");
+    assert.equal(l1.slotId, slotB.slotId, "quota-aware must prefer standby-warmed slotB over cold slotA when tied");
+    l1.release();
+    qPool.dispose();
+
+    const rrPool = new UpstreamKeyPool({
+      ...loadConfigFromEnv({ QUICK_TOKENS: `${kA},${kB}`, LB_STRATEGY: "round-robin", SESSION_AFFINITY: "false" }),
+      dataDir: undefined,
+    });
+    const [rrA, rrB] = rrPool.allManagedKeys();
+    rrPool.setStandbyProbe((sid) => sid === rrB!.slotId);
+    const rrL1 = rrPool.leaseKey("quick-balanced");
+    assert.equal(rrL1.slotId, rrA!.slotId, "round-robin must remain strictly deterministic");
+    rrL1.release();
+    rrPool.dispose();
+
+    // 3. RequestAttachmentCache deduplicates concurrent uploads and prepared images cleanly
+    const attCache = new RequestAttachmentCache();
+    let uploadCalls = 0;
+    const sampleBuf = Buffer.from("same-payload-bytes");
+    const [u1, u2] = await Promise.all([
+      attCache.getOrUploadAttachment("s1", "t1", sampleBuf, async () => {
+        uploadCalls += 1;
+        await new Promise((r) => setTimeout(r, 20));
+        return { type: "file", name: "a.txt", size: sampleBuf.byteLength, mimeType: "text/plain", path: "/w/a.txt", attachmentId: "att-1", contentSha256: "abc" };
+      }),
+      attCache.getOrUploadAttachment("s1", "t1", sampleBuf, async () => {
+        uploadCalls += 1;
+        return { type: "file", name: "a.txt", size: sampleBuf.byteLength, mimeType: "text/plain", path: "/w/a.txt", attachmentId: "att-2", contentSha256: "abc" };
+      }),
+    ]);
+    assert.equal(uploadCalls, 1, "concurrent identical uploads must share 1 in-flight Promise");
+    assert.equal(u1.attachmentId, u2.attachmentId);
+
+    let prepCalls = 0;
+    const [p1, p2] = await Promise.all([
+      attCache.getOrPrepareHighResImage(sampleBuf, "image/webp", async () => {
+        prepCalls += 1;
+        await new Promise((r) => setTimeout(r, 15));
+        return { buf: Buffer.from("jpeg"), mimeType: "image/jpeg" };
+      }),
+      attCache.getOrPrepareHighResImage(sampleBuf, "image/webp", async () => {
+        prepCalls += 1;
+        return { buf: Buffer.from("jpeg2"), mimeType: "image/jpeg" };
+      }),
+    ]);
+    assert.equal(prepCalls, 1, "concurrent identical image preparations must share 1 in-flight Promise");
+    assert.equal(p1.buf.toString(), p2.buf.toString());
+
+    // 4. Zero-allocation estimateAnthropicTokens skips thinking, counts images, and handles CJK accurately
+    const hugeBase64 = "A".repeat(200_000);
+    const est = estimateAnthropicTokens({
+      system: "你是一个严谨的架构师。",
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "thinking", thinking: "X".repeat(100_000) }, { type: "text", text: "Hello world" }],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: "image/png", data: hugeBase64 } },
+            { type: "text", text: "请分析截图" },
+          ],
+        },
+      ],
+    });
+    assert.ok(est > 1_000 && est < 3_000, `expected ~1600 image + small text tokens (excluding 100K thinking & 200K base64), got ${est}`);
+
+    // 5. O(N) linear streaming under 20KB buffered_block & 20KB <artifact> streamed in 20-byte chunks
+    const tPerf0 = performance.now();
+    const bigPatch = "*** Begin Patch\n" + "+const line = 1234567890;\n".repeat(800) + "*** End Patch";
+    const bigPayload = `<tool_call>{"name":"apply_patch","arguments":${JSON.stringify(bigPatch)}}</tool_call>`;
+    const fLin = new StreamingToolCallFilter(new Set(["apply_patch"]), new Set(["apply_patch"]));
+    let endCount = 0;
+    for (let i = 0; i < bigPayload.length; i += 20) {
+      const r = fLin.feedIncremental(bigPayload.slice(i, i + 20));
+      endCount += r.events.filter((e) => e.kind === "tool_call_end").length;
+    }
+    assert.equal(endCount, 1);
+
+    const bigArtifact = `<artifact type="text/markdown" title="Report">${"Section body text. ".repeat(1000)}</artifact>Done`;
+    const uiLin = new StreamingUiTagSanitizer();
+    let uiOut = "";
+    for (let i = 0; i < bigArtifact.length; i += 20) {
+      uiOut += uiLin.feed(bigArtifact.slice(i, i + 20));
+    }
+    uiOut += uiLin.flush();
+    assert.ok(uiOut.includes("Report") && uiOut.endsWith("Done"));
+    assert.ok(performance.now() - tPerf0 < 500, "20KB chunked buffered_block + artifact must stay O(N) fast");
+
+    // 6. SIMD zlib.crc32 + chunked cborEncode + encodeCloudInputFrame round-trip + direct WS agent
+    const bigObj = { payload: Buffer.from("hello".repeat(8_000), "utf8"), count: 42, ok: true };
+    const cborBytes = cborEncode(bigObj);
+    const decodedCbor = cborDecode(cborBytes) as { payload: Uint8Array; count: number; ok: boolean };
+    assert.equal(decodedCbor.count, 42);
+    assert.equal(decodedCbor.ok, true);
+    assert.equal(Buffer.from(decodedCbor.payload).toString("utf8").length, 40_000);
+
+    const esFrame = encodeEventStream({ ":event-type": "rawInputEvent", ":message-type": "event" }, cborBytes);
+    const drained = drainEventStream(esFrame, 0);
+    assert.equal(drained.messages.length, 1);
+    assert.equal(drained.consumed, esFrame.length);
+    assert.equal(drained.messages[0]!.headers[":event-type"], "rawInputEvent");
+
+    const cloudFrame = encodeCloudInputFrame({ type: "ping", payload: { n: 1 } });
+    const parsedCloud = JSON.parse(Buffer.from(cloudFrame).toString("utf8")) as { eventType: string; payload: { payload: string } };
+    assert.equal(parsedCloud.eventType, "rawInputEvent");
+    assert.deepEqual(JSON.parse(Buffer.from(parsedCloud.payload.payload, "base64").toString("utf8")), { type: "ping", payload: { n: 1 } });
+    assert.ok(getDirectWsAgent(), "direct WS agent with TLS resumption + DNS cache must be exported");
+
+    // 7. Web Console overview renders live Warm & Standby Pool card cleanly (ZH + EN)
+    const dashHtml = renderDashboardHtml("/dashboard", "nonce-w3");
+    assert.ok(dashHtml.includes('id="ovWarmPoolCard"'));
+    assert.ok(dashHtml.includes('id="ovWarmPoolVal"'));
+    assert.ok(dashHtml.includes('id="ovStandbyTag"'));
+    assert.ok(dashHtml.includes("Warm & Standby Pool"));
+  });
+
+  it("auto-routes user Retry / Edit of last prompt through native edit_message branching (including chained edits & rekeySlot)", async () => {
+    const { EventEmitter } = await import("node:events");
+    const wsMod = await import("ws");
+    const WsClass = wsMod.default;
+    const { WebSocketServer } = wsMod;
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+
+    // 1. Unit-level WarmSessionPool editKey lookup + rekeySlot migration
+    const pool = new WarmSessionPool({});
+    type StubWs = InstanceType<typeof EventEmitter> & { readyState: number; send(): void; ping(): void; close(): void; terminate(): void };
+    const mkFakeWs = () => {
+      const ee = new EventEmitter() as StubWs;
+      ee.readyState = WsClass.OPEN;
+      ee.send = () => { };
+      ee.ping = () => { };
+      ee.close = () => { ee.readyState = WsClass.CLOSED; };
+      ee.terminate = () => { ee.readyState = WsClass.CLOSED; };
+      return ee as unknown as import("ws").default;
+    };
+    const fakeWs = mkFakeWs();
+    pool.park({
+      scope: "s",
+      conversationKey: "conv-edit",
+      slotId: "slot-old",
+      isIncognito: true,
+      prefixHashes: ["hash-after-t2"],
+      editPrefixHash: "hash-before-t2",
+      lastUserMessageId: "msg-t2-orig",
+      threadId: "tid-root",
+      rootThreadId: "tid-root",
+      ws: fakeWs,
+      outpostId: "op1",
+      encodeFrame: (f: Record<string, unknown>) => Buffer.from(JSON.stringify(f)),
+    });
+    pool.rekeySlot("slot-old", "slot-new");
+    const editHit = pool.lookup("s", "conv-edit", "slot-new", true, "hash-before-t2");
+    assert.ok(editHit, "editPrefixHash must survive rekeySlot and match on user Retry/Edit");
+    assert.equal(editHit.editOriginalMessageId, "msg-t2-orig");
+    assert.equal(editHit.threadId, "tid-root");
+    assert.equal(editHit.rootThreadId, "tid-root");
+    assert.equal(editHit.reusedWs, fakeWs);
+    // Consuming editKey must also consume the sibling continuation key atomically
+    assert.equal(pool.lookup("s", "conv-edit", "slot-new", true, "hash-after-t2"), undefined);
+    pool.disposeAll();
+
+    // 2. Real local WebSocketServer E2E: T1 -> T2 -> Edit(T2->T2') -> Chained Edit(T2'->T2'') -> T3 on branch-2 (ONLY 1 WS dial!)
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    const addr = wss.address() as { port: number };
+    const wsUrl = `ws://127.0.0.1:${addr.port}`;
+    let dialCount = 0;
+    const inboundFrames: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    let branchSeq = 0;
+
+    wss.on("connection", (ws: import("ws").WebSocket) => {
+      dialCount += 1;
+      ws.on("message", (raw: import("ws").RawData) => {
+        const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+        let frame: { type?: string; payload?: Record<string, unknown> };
+        try {
+          const outer = JSON.parse(text) as { eventType?: string; payload?: { payload?: string } };
+          if (outer.eventType === "rawInputEvent" && outer.payload?.payload) {
+            frame = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"));
+          } else {
+            return;
+          }
+        } catch {
+          return;
+        }
+        const type = String(frame.type || "");
+        const payload = (frame.payload || {}) as Record<string, unknown>;
+        const sendEv = (ev: Record<string, unknown>) => {
+          const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+          const es = encodeEventStream(
+            { ":event-type": "rawOutputEvent", ":message-type": "event" },
+            Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+          );
+          ws.send(es);
+        };
+        if (type === "session_connect") {
+          sendEv({ type: "session_established", payload: { ok: true } });
+          return;
+        }
+        if (type === "user_message" || type === "edit_message") {
+          inboundFrames.push({ type, payload });
+          const reqTid = String(payload.thread_id || "t-root");
+          const outTid = type === "edit_message" ? `branch-${++branchSeq}` : reqTid;
+          const reply = `ANS:${String(payload.text || "")}`;
+          if (type === "edit_message") {
+            sendEv({
+              type: "tree_sync",
+              payload: { root_session_id: payload.root_session_id, active_branch_id: outTid },
+            });
+          }
+          sendEv({ type: "message_start", thread_id: outTid, payload: { role: "assistant" } });
+          sendEv({ type: "text_delta", thread_id: outTid, payload: { delta: reply, kernel_thread_id: outTid } });
+          sendEv({ type: "turn_usage", thread_id: outTid, payload: { input_tokens: 10, output_tokens: 5, resolved_model_id: "us.anthropic.claude-sonnet-5-5" } });
+          sendEv({ type: "message_complete", thread_id: outTid, payload: { text: reply, kernel_thread_id: outTid } });
+        }
+      });
+    });
+
+    const fakeOAuth =
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: "cid-edit-branch-e2e",
+          clientSecret: "sec",
+          refreshToken: "rt-edit-branch-e2e",
+          accessToken: "at-edit-branch-e2e",
+          expiresAt: Date.now() + 3_600_000,
+        }),
+      ).toString("base64url");
+    const cfg = {
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: fakeOAuth,
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      }),
+      dataDir: undefined,
+    };
+    const keyPool = new UpstreamKeyPool(cfg);
+    const engine = new QuickExecutionEngine({
+      config: cfg,
+      usageTracker: new UsageTracker(),
+      webSocketFactory: () => new WsClass(wsUrl),
+    });
+
+    const runChat = async (messages: Array<{ role: string; content: string }>) => {
+      const turn = parseChatCompletionsRequest(
+        { model: "quick-balanced", messages },
+        { "x-session-id": "sess-edit-branch-1" },
+      );
+      let out = "";
+      let mode = "";
+      for await (const ev of engine.executeTurnWithPool(turn, keyPool, (m) => { mode = m.execMode; })) {
+        if (ev.type === "text") out += ev.text;
+      }
+      return { out, mode };
+    };
+
+    try {
+      // T1: Cold start
+      const r1 = await runChat([{ role: "user", content: "Remember secret X1" }]);
+      assert.equal(r1.out, "ANS:Remember secret X1");
+      assert.equal(dialCount, 1);
+
+      // T2: Normal warm continuation
+      const r2 = await runChat([
+        { role: "user", content: "Remember secret X1" },
+        { role: "assistant", content: r1.out },
+        { role: "user", content: "Old question V1" },
+      ]);
+      assert.equal(r2.out, "ANS:Old question V1");
+      assert.equal(r2.mode, "warm_incremental");
+      assert.equal(dialCount, 1, "T2 must reuse parked WS");
+
+      // Edit 1: User edits T2 ("Old question V1" -> "Edited question V2")
+      const r2Edit1 = await runChat([
+        { role: "user", content: "Remember secret X1" },
+        { role: "assistant", content: r1.out },
+        { role: "user", content: "Edited question V2" },
+      ]);
+      assert.equal(r2Edit1.out, "ANS:Edited question V2");
+      assert.equal(r2Edit1.mode, "warm_incremental");
+      assert.equal(dialCount, 1, "User edit must reuse parked WS with 0 reconnects");
+
+      // Edit 2 (Chained): User edits again ("Edited question V2" -> "Edited question V3")
+      const r2Edit2 = await runChat([
+        { role: "user", content: "Remember secret X1" },
+        { role: "assistant", content: r1.out },
+        { role: "user", content: "Edited question V3" },
+      ]);
+      assert.equal(r2Edit2.out, "ANS:Edited question V3");
+      assert.equal(r2Edit2.mode, "warm_incremental");
+      assert.equal(dialCount, 1, "Chained user edit must still reuse parked WS");
+
+      // T3: Continue conversation after Edit 2
+      const r3 = await runChat([
+        { role: "user", content: "Remember secret X1" },
+        { role: "assistant", content: r1.out },
+        { role: "user", content: "Edited question V3" },
+        { role: "assistant", content: r2Edit2.out },
+        { role: "user", content: "Follow up on V3" },
+      ]);
+      assert.equal(r3.out, "ANS:Follow up on V3");
+      assert.equal(r3.mode, "warm_incremental");
+      assert.equal(dialCount, 1, "All 5 turns must complete on 1 single WS");
+
+      // Verify exact wire frames sent to AWS Quick
+      assert.equal(inboundFrames.length, 5);
+      assert.equal(inboundFrames[0]!.type, "user_message");
+      assert.equal(inboundFrames[1]!.type, "user_message");
+      assert.equal(inboundFrames[2]!.type, "edit_message");
+      assert.equal(inboundFrames[2]!.payload.original_message_id, inboundFrames[1]!.payload.message_id);
+      assert.equal(inboundFrames[2]!.payload.thread_id, inboundFrames[0]!.payload.thread_id);
+      assert.equal(inboundFrames[2]!.payload.root_session_id, inboundFrames[0]!.payload.thread_id);
+
+      assert.equal(inboundFrames[3]!.type, "edit_message");
+      assert.equal(inboundFrames[3]!.payload.original_message_id, inboundFrames[2]!.payload.message_id);
+      assert.equal(inboundFrames[3]!.payload.thread_id, "branch-1");
+      assert.equal(inboundFrames[3]!.payload.root_session_id, inboundFrames[0]!.payload.thread_id);
+
+      assert.equal(inboundFrames[4]!.type, "user_message");
+      assert.equal(inboundFrames[4]!.payload.thread_id, "branch-2");
+
+      // Implicit `anc_` anchor (no x-session-id): Turn 2 (priorAssistantTurns=1) MUST NOT register editKey
+      // so two strangers sharing one API key with identical Turn-1 greeting ("hi") cannot collide on edit_message;
+      // Turn 3 (priorAssistantTurns=2) DOES allow editKey.
+      const runAnon = async (messages: Array<{ role: string; content: string }>) => {
+        const turn = parseChatCompletionsRequest({ model: "quick-balanced", messages }, {});
+        turn.scope = "shared-key";
+        if (turn.conversationKey) turn.conversationKey = `${turn.scope}:${turn.conversationKey}`;
+        let out = "";
+        for await (const ev of engine.executeTurnWithPool(turn, keyPool)) {
+          if (ev.type === "text") out += ev.text;
+        }
+        return out;
+      };
+      const a1 = await runAnon([{ role: "user", content: "hi" }]);
+      const a2 = await runAnon([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: a1 },
+        { role: "user", content: "User A private turn 2" },
+      ]);
+      const framesBeforeB = inboundFrames.length;
+      await runAnon([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: a1 },
+        { role: "user", content: "User B different turn 2" },
+      ]);
+      assert.equal(
+        inboundFrames[framesBeforeB]!.type,
+        "user_message",
+        "implicit anc_ Turn 2 must NOT hijack User A's thread via edit_message",
+      );
+      // Now advance User A to Turn 3 (priorAssistantTurns=2) -> editing Turn 3 IS allowed!
+      const a3 = await runAnon([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: a1 },
+        { role: "user", content: "User A private turn 2" },
+        { role: "assistant", content: a2 },
+        { role: "user", content: "User A turn 3 orig" },
+      ]);
+      assert.ok(a3.includes("User A turn 3 orig"));
+      const framesBeforeEdit3 = inboundFrames.length;
+      await runAnon([
+        { role: "user", content: "hi" },
+        { role: "assistant", content: a1 },
+        { role: "user", content: "User A private turn 2" },
+        { role: "assistant", content: a2 },
+        { role: "user", content: "User A turn 3 edited" },
+      ]);
+      assert.equal(
+        inboundFrames[framesBeforeEdit3]!.type,
+        "edit_message",
+        "implicit anc_ Turn 3+ (priorAssistantTurns>=2) should enable native edit_message",
+      );
+    } finally {
+      await engine.disposeAll();
+      keyPool.dispose();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it("Single-WS Serial Borrow/Return Multiplexing: 10 windows on 1 physical WS (0 cross-talk), concurrent burst isolation, untouched release, and dead-WS incognito purge", async () => {
+    const wsMod = await import("ws");
+    const WsClass = wsMod.default;
+    const { WebSocketServer } = wsMod;
+    const { MAX_THREADS_PER_SHARED_WS } = await import("../src/core/warm-session-pool.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { encodeEventStream } = await import("../src/aws-quick/event-stream-cbor.js");
+
+    assert.equal(MAX_THREADS_PER_SHARED_WS, 16);
+
+    const wss = new WebSocketServer({ port: 0 });
+    await new Promise<void>((resolve) => wss.once("listening", () => resolve()));
+    const addr = wss.address() as { port: number };
+    const wsUrl = `ws://127.0.0.1:${addr.port}`;
+
+    let dialCount = 0;
+    let maxConcurrentPerConn = 0;
+    const activeSockets: Array<import("ws").WebSocket> = [];
+    // Simulate AWS Pod-local incognito RAM per WebSocket connection: Map<ws, Map<threadId, string[]>>
+    const podMemoryByWs = new WeakMap<import("ws").WebSocket, Map<string, string[]>>();
+
+    wss.on("connection", (ws: import("ws").WebSocket) => {
+      dialCount += 1;
+      activeSockets.push(ws);
+      podMemoryByWs.set(ws, new Map());
+      let inflightOnThisWs = 0;
+      ws.on("message", (raw: import("ws").RawData) => {
+        const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
+        let frame: { type?: string; payload?: Record<string, unknown> };
+        try {
+          const outer = JSON.parse(text) as { eventType?: string; payload?: { payload?: string } };
+          if (outer.eventType === "rawInputEvent" && outer.payload?.payload) {
+            frame = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"));
+          } else {
+            return;
+          }
+        } catch {
+          return;
+        }
+        const type = String(frame.type || "");
+        const payload = (frame.payload || {}) as Record<string, unknown>;
+        const sendEv = (ev: Record<string, unknown>) => {
+          const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+          ws.send(
+            encodeEventStream(
+              { ":event-type": "rawOutputEvent", ":message-type": "event" },
+              Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+            ),
+          );
+        };
+        if (type === "session_connect") {
+          sendEv({ type: "session_established", payload: { ok: true } });
+          return;
+        }
+        if (type === "user_message") {
+          inflightOnThisWs += 1;
+          if (inflightOnThisWs > maxConcurrentPerConn) maxConcurrentPerConn = inflightOnThisWs;
+          const tid = String(payload.thread_id || "");
+          const msg = String(payload.text || "");
+          const mem = podMemoryByWs.get(ws)!;
+          const history = mem.get(tid) || [];
+          const delayMs = msg.includes("SLOW_HOLD") ? 60 : 5;
+          setTimeout(() => {
+            history.push(msg);
+            mem.set(tid, history);
+            // Reply with first remembered message in this thread so any Pod amnesia or cross-talk immediately fails!
+            const reply = `MEM[${history.length}]:${history[0]}`;
+            sendEv({ type: "message_start", thread_id: tid, payload: { role: "assistant" } });
+            sendEv({ type: "text_delta", thread_id: tid, payload: { delta: reply, kernel_thread_id: tid } });
+            sendEv({ type: "turn_usage", thread_id: tid, payload: { input_tokens: 10, output_tokens: 5 } });
+            sendEv({ type: "message_complete", thread_id: tid, payload: { text: reply, kernel_thread_id: tid } });
+            inflightOnThisWs -= 1;
+          }, delayMs);
+        }
+      });
+    });
+
+    const fakeOAuth =
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          v: 1,
+          region: "us-east-1",
+          issuerUrl: "https://oidc.us-east-1.amazonaws.com",
+          wsHost: "qbs-cell000.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+          clientId: "cid-mux-borrow-e2e",
+          clientSecret: "sec",
+          refreshToken: "rt-mux-borrow-e2e",
+          accessToken: "at-mux-borrow-e2e",
+          expiresAt: Date.now() + 3_600_000,
+        }),
+      ).toString("base64url");
+    const cfg = {
+      ...loadConfigFromEnv({
+        QUICK_TOKENS: fakeOAuth,
+        INCOGNITO: "true",
+        AUTO_ENSURE_CODING_AGENT: "false",
+      }),
+      dataDir: undefined,
+    };
+    const keyPool = new UpstreamKeyPool(cfg);
+    const engine = new QuickExecutionEngine({
+      config: cfg,
+      usageTracker: new UsageTracker(),
+      webSocketFactory: () => new WsClass(wsUrl),
+    });
+
+    const runChat = async (sessId: string, messages: Array<{ role: string; content: string }>) => {
+      const turn = parseChatCompletionsRequest({ model: "quick-balanced", messages }, { "x-session-id": sessId });
+      let out = "";
+      let mode = "";
+      for await (const ev of engine.executeTurnWithPool(turn, keyPool, (m) => { mode = m.execMode; })) {
+        if (ev.type === "text") out += ev.text;
+      }
+      return { out, mode };
+    };
+
+    try {
+      // 1. Open 10 independent windows (W01..W10) sequentially -> ALL share 1 SINGLE physical WS!
+      const wins = Array.from({ length: 10 }, (_, i) => ({
+        sess: `mux-w-${i + 1}`,
+        secret: `SECRET-W${String(i + 1).padStart(2, "0")}`,
+        t1Out: "",
+      }));
+      for (const w of wins) {
+        const r = await runChat(w.sess, [{ role: "user", content: w.secret }]);
+        assert.equal(r.out, `MEM[1]:${w.secret}`);
+        w.t1Out = r.out;
+      }
+      assert.equal(dialCount, 1, "All 10 cold windows must borrow/return 1 single Primary Shared WS");
+      assert.equal(engine.runtimeStats().warmIdleSessions, 10, "All 10 windows must be tracked warm");
+      assert.equal(engine.runtimeStats().standbyWs, 1, "Primary Shared WS is ready as standby");
+
+      // 2. Run Turn 2 across ALL 10 windows -> 10/10 warm_incremental, 0 cross-talk, STILL dialCount === 1!
+      for (const w of wins) {
+        const r2 = await runChat(w.sess, [
+          { role: "user", content: w.secret },
+          { role: "assistant", content: w.t1Out },
+          { role: "user", content: "recall?" },
+        ]);
+        assert.equal(r2.mode, "warm_incremental", `Window ${w.sess} must hit warm_incremental`);
+        assert.equal(r2.out, `MEM[2]:${w.secret}`, `Window ${w.sess} must recall ONLY its own Pod memory (0 cross-talk)`);
+      }
+      assert.equal(dialCount, 1, "All 20 turns across 10 windows must use ONLY 1 physical WS");
+      assert.equal(maxConcurrentPerConn, 1, "Strict serial borrow lock: NEVER interleave concurrent frames on 1 WS");
+
+      // 3. Concurrent burst: hold Primary WS busy with SLOW_HOLD while launching a 2nd simultaneous request ->
+      //    2nd request must use an auxiliary WS (maxConcurrentPerConn stays 1!), AND primary warm windows survive!
+      const [slowRes, burstRes] = await Promise.all([
+        runChat("mux-slow", [{ role: "user", content: "SLOW_HOLD_A" }]),
+        new Promise<{ out: string; mode: string }>((resolve) =>
+          setTimeout(() => { void runChat("mux-burst", [{ role: "user", content: "BURST_B" }]).then(resolve); }, 10),
+        ),
+      ]);
+      assert.equal(slowRes.out, "MEM[1]:SLOW_HOLD_A");
+      assert.equal(burstRes.out, "MEM[1]:BURST_B");
+      assert.equal(dialCount, 2, "Concurrent request while Primary is borrowed must dial clean auxiliary WS");
+      assert.equal(maxConcurrentPerConn, 1, "Zero frame interleaving even during concurrent burst");
+
+      // 4. Verify W01 still survived warm on Primary WS after concurrent burst!
+      const w1T3 = await runChat(wins[0]!.sess, [
+        { role: "user", content: wins[0]!.secret },
+        { role: "assistant", content: wins[0]!.t1Out },
+        { role: "user", content: "recall?" },
+        { role: "assistant", content: `MEM[2]:${wins[0]!.secret}` },
+        { role: "user", content: "turn3?" },
+      ]);
+      assert.equal(w1T3.mode, "warm_incremental");
+      assert.equal(w1T3.out, `MEM[3]:${wins[0]!.secret}`);
+
+      // 5. Terminate Primary WS -> all its incognito warm entries must purge cleanly (zero Pod amnesia!)
+      activeSockets[0]!.terminate();
+      await new Promise((r) => setTimeout(r, 30));
+      const w2AfterDrop = await runChat(wins[1]!.sess, [
+        { role: "user", content: wins[1]!.secret },
+        { role: "assistant", content: wins[1]!.t1Out },
+        { role: "user", content: "recall?" },
+        { role: "assistant", content: `MEM[2]:${wins[1]!.secret}` },
+        { role: "user", content: "after-drop?" },
+      ]);
+      assert.equal(w2AfterDrop.mode, "incognito", "After Primary WS dies, incognito entries must fall back cleanly to cold replay");
+      assert.ok(w2AfterDrop.out.includes(wins[1]!.secret), "Cold replay after Primary drop must preserve full history");
+    } finally {
+      await engine.disposeAll();
+      keyPool.dispose();
+      await new Promise<void>((resolve) => wss.close(() => resolve()));
+    }
+  });
+
+  it("supports configurable 30m PARKED_WS_IDLE_TTL_MS and flushEarly smart/image 25s anti-499 keepalive floor", async () => {
+    const { EventEmitter } = await import("node:events");
+    const WsClass = (await import("ws")).default;
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+
+    // 1. Default PARKED_WS_IDLE_TTL_MS is 60m (3,600,000ms) and respects custom env override
+    const defaultCfg = loadConfigFromEnv({ QUICK_TOKENS: "example.aws.dev|tok" });
+    assert.equal(defaultCfg.parkedWsIdleTtlMs, 60 * 60 * 1000);
+    const customCfg = loadConfigFromEnv({ QUICK_TOKENS: "example.aws.dev|tok", PARKED_WS_IDLE_TTL_MS: "2400000" });
+    assert.equal(customCfg.parkedWsIdleTtlMs, 2_400_000);
+
+    // Custom parkedWsIdleTtlMs actually governs parked WS idle expiration cleanly
+    const shortPool = new WarmSessionPool({ warmSessionTtlMs: 60_000, parkedWsIdleTtlMs: 80 });
+    type StubWs = InstanceType<typeof EventEmitter> & { readyState: number; closed: boolean; close(): void; terminate(): void; ping(): void; send(d: unknown): void };
+    const stub = new EventEmitter() as StubWs;
+    stub.readyState = WsClass.OPEN;
+    stub.closed = false;
+    stub.close = () => { stub.closed = true; stub.readyState = WsClass.CLOSED; };
+    stub.terminate = () => { stub.closed = true; stub.readyState = WsClass.CLOSED; };
+    stub.ping = () => { };
+    stub.send = () => { };
+    shortPool.park({
+      scope: "s",
+      conversationKey: "ttl-test",
+      slotId: "slot-ttl",
+      isIncognito: true,
+      prefixHashes: ["h-ttl"],
+      threadId: "t-ttl",
+      ws: stub as unknown as import("ws").default,
+      encodeFrame: (f: Record<string, unknown>) => Buffer.from(JSON.stringify(f)),
+    });
+    assert.equal(stub.closed, false);
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(stub.closed, true, "parked WS must honor custom parkedWsIdleTtlMs");
+    shortPool.disposeAll();
+
+    // 2. flushEarly activates for short-prompt quick-smart & emits `: keepalive` at flushEarlyMaxTotalWaitMs floor
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-flush-floor-"));
+    const cfg = loadConfigFromEnv({
+      HOST: "127.0.0.1",
+      PORT: "0",
+      GATEWAY_TOKEN: "sk-aq-test-real-token-9876543210",
+      QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+      DATA_DIR: tmpDir,
+      ENV_FILE_PATH: path.join(tmpDir, ".env"),
+      ENABLE_DASHBOARD: "false",
+    });
+    const gw = createGatewayServer({ config: cfg, flushEarlyDelayMs: 60, flushEarlyMaxTotalWaitMs: 90 });
+    (gw.engine as unknown as { executeTurnWithPool: typeof gw.engine.executeTurnWithPool }).executeTurnWithPool =
+      async function* (_turn, _pool, onExecMeta) {
+        // Simulate stalled OOB/failover (`flushEarlyReady: false`) exceeding the 90ms total-wait floor
+        onExecMeta?.({ slotId: "slot-1", maskedKey: "oauth:s1***", execMode: "incognito", flushEarlyReady: false });
+        await new Promise((r) => setTimeout(r, 160));
+        yield { type: "text", text: "Survived slow OOB via keepalive!" };
+        yield { type: "done", stopReason: "stop" };
+      };
+    await new Promise<void>((resolve) => gw.server.listen(0, "127.0.0.1", resolve));
+    const addr = gw.server.address() as { port: number };
+    try {
+      const t0 = Date.now();
+      const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          authorization: "Bearer sk-aq-test-real-token-9876543210",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: "quick-smart",
+          stream: true,
+          messages: [{ role: "user", content: "short prompt" }],
+        }),
+      });
+      const headersMs = Date.now() - t0;
+      assert.equal(res.status, 200);
+      assert.ok(headersMs < 150, `expected HTTP 200 headers via keepalive floor (~90ms), got ${headersMs}ms`);
+      const body = await res.text();
+      assert.ok(body.includes(": keepalive"), "must emit SSE keepalive before slow OOB completes");
+      assert.ok(body.includes("Survived slow OOB via keepalive!"));
+    } finally {
+      await gw.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hardening batch: warm lookup preserves entry while borrowed, Ctrl+C spares primary WS, OOB timeout->504, tool-bridge/S2C/Web-upload/structured-output/CORS/CBOR-float", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { default: WsClass, WebSocketServer } = await import("ws");
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { buildOutOfBandContextPrompt } = await import("../src/core/media-utils.js");
+    const { uploadWebBinaryAttachment } = await import("../src/aws-quick/web-client.js");
+    const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+    const { TurnProtocolTracker } = await import("../src/core/turn-protocol-state.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const dummyTracker = new UsageTracker();
+
+    // 1. WarmSessionPool: lookup() must NOT delete warmThreads entry while Primary Shared WS is borrowed
+    const wPool = new WarmSessionPool({ warmSessionTtlMs: 60_000, parkedWsIdleTtlMs: 60_000 });
+    type FakeWs = InstanceType<typeof EventEmitter> & { readyState: number; close(): void; terminate(): void; ping(): void; send(d: unknown): void };
+    const mkFakeWs = (): FakeWs => {
+      const s = new EventEmitter() as FakeWs;
+      s.readyState = WsClass.OPEN;
+      s.close = () => { s.readyState = WsClass.CLOSED; s.emit("close", 1000, Buffer.alloc(0)); };
+      s.terminate = () => { s.readyState = WsClass.CLOSED; s.emit("close", 1006, Buffer.alloc(0)); };
+      s.ping = () => { };
+      s.send = () => { };
+      return s;
+    };
+    const sharedWs = mkFakeWs();
+    const sharedMeta = {
+      decodeFrame: decodeCloudOutputFrame,
+      surfaceType: "QUICK_WORK_DESKTOP_MAC",
+      appVersion: "1.2.4757",
+      surfaceName: "desktop" as const,
+    };
+    wPool.park({
+      scope: "s", conversationKey: "win-A", slotId: "slot-borrow", isIncognito: true,
+      prefixHashes: ["hash-A"], threadId: "th-A",
+      ws: sharedWs as unknown as import("ws").default,
+      encodeFrame: (f: Record<string, unknown>) => Buffer.from(JSON.stringify(f)),
+      sharedHandleMeta: sharedMeta,
+    });
+    wPool.park({
+      scope: "s", conversationKey: "win-B", slotId: "slot-borrow", isIncognito: true,
+      prefixHashes: ["hash-B"], threadId: "th-B",
+      ws: sharedWs as unknown as import("ws").default,
+      encodeFrame: (f: Record<string, unknown>) => Buffer.from(JSON.stringify(f)),
+      sharedHandleMeta: sharedMeta,
+    });
+    assert.equal(wPool.isPrimarySharedWs("slot-borrow", sharedWs as unknown as import("ws").default), true);
+    // Borrow primary WS via win-A
+    const hitA = wPool.lookup("s", "win-A", "slot-borrow", true, "hash-A");
+    assert.equal(hitA?.reusedWs, sharedWs);
+    // Concurrent lookup for win-B while primary is borrowed must return undefined WITHOUT deleting win-B!
+    const missWhileBusy = wPool.lookup("s", "win-B", "slot-borrow", true, "hash-B");
+    assert.equal(missWhileBusy, undefined);
+    // Return primary WS -> win-B MUST still hit warm!
+    assert.equal(wPool.releaseUntouchedWs("slot-borrow", sharedWs as unknown as import("ws").default), true);
+    const hitBAfterReturn = wPool.lookup("s", "win-B", "slot-borrow", true, "hash-B");
+    assert.equal(hitBAfterReturn?.threadId, "th-B");
+    assert.equal(hitBAfterReturn?.reusedWs, sharedWs);
+    wPool.disposeAll();
+
+    // 2. OOB timeout maps to 504 (not 499 client_aborted), while actual client abort maps to 499
+    const liveClientAc = new AbortController();
+    const timeoutErr = Object.assign(new Error("The operation was aborted due to timeout"), { name: "TimeoutError" });
+    const mappedTimeout = mapAttachmentUploadError(timeoutErr, "OOB upload", liveClientAc.signal);
+    assert.equal(mappedTimeout.status, 504);
+    assert.equal(mappedTimeout.code, "timeout_error");
+    const abortedClientAc = new AbortController();
+    abortedClientAc.abort();
+    const mappedClientAbort = mapAttachmentUploadError(new Error("aborted"), "OOB upload", abortedClientAc.signal);
+    assert.equal(mappedClientAbort.status, 499);
+    assert.equal(mappedClientAbort.code, "client_aborted");
+
+    // 3. OOB `.txt` prompt forbids local `<tool_call>` reads + tool-bridge compactForCustomAgent & state machine fixes
+    const oobMsg = buildOutOfBandContextPrompt("x".repeat(5000), "conversation_context_1234.txt", 1000);
+    assert.ok(oobMsg.includes("AWS Quick cloud workspace file"));
+    assert.ok(oobMsg.includes("never call client `<tool_call>` tools"));
+    const compactBridge = buildToolBridgePrompt(
+      [{ name: "Read", description: "read file", inputSchema: { type: "object", properties: { path: { type: "string" } } } }],
+      "auto",
+      { compactForCustomAgent: true, preferClientToolsOverWorkspace: true },
+    );
+    assert.ok(compactBridge.includes("The caller executes `<tool_call>` JSON blocks locally"));
+    assert.ok(compactBridge.includes("For file, shell, and workspace actions, emit matching `<tool_call>` blocks"));
+    assert.ok(!compactBridge.includes("external coding client"));
+
+    // 3a. StreamingToolCallFilter closes truncated JSON arrays in LIFO order
+    const fArr = new StreamingToolCallFilter(new Set(["batch_tool"]));
+    fArr.feedIncremental('<tool_call>{"name":"batch_tool","arguments":{"items":["one","two"');
+    const flushedArr = fArr.flushIncremental();
+    const endArr = flushedArr.events.find((e) => e.kind === "tool_call_end");
+    assert.ok(endArr && endArr.kind === "tool_call_end");
+    assert.deepEqual(endArr.call.argsObject, { items: ["one", "two"] });
+
+    // 3b. Missing `</tool_call>` before second `<tool_call>` must NOT swallow the 2nd tool call
+    const fMulti = new StreamingToolCallFilter(new Set(["t1", "t2"]));
+    const rMulti = fMulti.feedIncremental(
+      '<tool_call>{"name":"t1","arguments":{"a":1}} <tool_call>{"name":"t2","arguments":{"b":2}}</tool_call>',
+    );
+    const endsMulti = [...rMulti.events, ...fMulti.flushIncremental().events].filter((e) => e.kind === "tool_call_end");
+    assert.equal(endsMulti.length, 2, "must recover second tool call even when first omitted </tool_call>");
+
+    // 4. Structured output soft-bridging across OpenAI Chat, OpenAI Responses, and Anthropic
+    const chatJson = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: "Return ok" }],
+    });
+    assert.ok(chatJson.systemPrompt?.includes("Structured JSON Output Requirement"));
+    const respSchema = parseResponsesRequest({
+      model: "quick-balanced",
+      text: { format: { type: "json_schema", name: "MyOut", schema: { type: "object", properties: { n: { type: "number" } } } } },
+      input: "Return n",
+    });
+    assert.ok(respSchema.systemPrompt?.includes("Structured JSON Schema Output Requirement (MyOut)"));
+    assert.ok(respSchema.systemPrompt?.includes('"properties"'));
+    assert.throws(
+      () => parseChatCompletionsRequest({ model: "quick-balanced", response_format: { type: "invalid_fmt" }, messages: [{ role: "user", content: "hi" }] }),
+      (e: unknown) => e instanceof GatewayError && e.status === 400 && e.code === "unsupported_parameter",
+    );
+
+    // 5. CBOR float16, float32, float64 & semantic Tag (major 6) decoding
+    // float16 1.5 -> 0xf9 0x3e 0x00
+    assert.equal(cborDecode(new Uint8Array([0xf9, 0x3e, 0x00])), 1.5);
+    // float32 3.5 -> 0xfa 0x40 0x60 0x00 0x00
+    assert.equal(cborDecode(new Uint8Array([0xfa, 0x40, 0x60, 0x00, 0x00])), 3.5);
+    // float64 1234.5678
+    const f64Buf = new Uint8Array(9);
+    f64Buf[0] = 0xfb;
+    new DataView(f64Buf.buffer).setFloat64(1, 1234.5678, false);
+    assert.equal(cborDecode(f64Buf), 1234.5678);
+    // CBOR semantic Tag 1 (epoch timestamp) wrapping integer 42: 0xc1 0x18 0x2a
+    assert.equal(cborDecode(new Uint8Array([0xc1, 0x18, 0x2a])), 42);
+
+    // 6. Real local WebSocketServer: Ctrl+C graceful stop_generation preserves Primary Shared WS & S2C thread_id/scope/tool_error/tree_delta filtering
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((res) => wss.once("listening", res));
+    const wsPort = (wss.address() as { port: number }).port;
+    let totalWsConns = 0;
+    let sawStopGen = false;
+    wss.on("connection", (sock) => {
+      totalWsConns += 1;
+      const sendEv = (obj: Record<string, unknown>) => {
+        const b64 = Buffer.from(JSON.stringify(obj), "utf8").toString("base64");
+        sock.send(encodeEventStream({ ":event-type": "rawOutputEvent", ":message-type": "event" }, Buffer.from(JSON.stringify({ payload: b64 }))));
+      };
+      sock.on("message", (raw) => {
+        const str = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : Buffer.from(raw as ArrayBuffer).toString("utf8");
+        const outer = JSON.parse(str) as { payload?: { payload?: string } };
+        const frame = JSON.parse(Buffer.from(outer.payload?.payload || "", "base64").toString("utf8")) as { type: string; payload?: Record<string, unknown> };
+        {
+          if (frame.type === "session_connect") {
+            sendEv({ type: "session_established", payload: {} });
+          } else if (frame.type === "stop_generation") {
+            sawStopGen = true;
+            sendEv({ type: "turn_aborted", thread_id: frame.payload?.thread_id, payload: {} });
+          } else if (frame.type === "user_message") {
+            const tid = String(frame.payload?.thread_id || "");
+            const txt = String(frame.payload?.text || "");
+            sendEv({ type: "message_start", thread_id: tid, message_id: "asst-1", payload: {} });
+            if (txt.includes("SLOW_ABORT")) {
+              sendEv({ type: "text_delta", thread_id: tid, payload: { delta: "partial..." } });
+              return; // Wait for stop_generation
+            }
+            // Inject foreign thread_id & background task_stream frames that MUST be ignored!
+            sendEv({ type: "text_delta", thread_id: "foreign-thread-999", payload: { delta: "FOREIGN_LEAK" } });
+            sendEv({ type: "message_complete", thread_id: "foreign-thread-999", payload: {} });
+            sendEv({ type: "text_delta", thread_id: tid, scope: "task_stream", payload: { delta: "TASK_STREAM_LEAK" } });
+            // Inject tool_start + tool_error (must clear activeCloudTools cleanly) and tree_delta
+            sendEv({ type: "tool_start", thread_id: tid, payload: { tool_id: "ct-1", tool_name: "cloud_sandbox" } });
+            sendEv({ type: "tool_error", thread_id: tid, payload: { tool_id: "ct-1", tool_name: "cloud_sandbox" } });
+            sendEv({ type: "tree_delta", thread_id: tid, payload: { active_branch_id: tid } });
+            sendEv({ type: "text_delta", thread_id: tid, payload: { delta: `CLEAN:${txt}` } });
+            sendEv({ type: "turn_usage", thread_id: tid, payload: { input_tokens: 5, output_tokens: 5, total_tokens: 10 } });
+            sendEv({ type: "message_complete", thread_id: tid, payload: {} });
+          }
+        }
+      });
+    });
+
+    const livePool = new WarmSessionPool({ warmSessionTtlMs: 60_000, parkedWsIdleTtlMs: 60_000 });
+    try {
+      const dialOne = async () => {
+        const ws = new WsClass(`ws://127.0.0.1:${wsPort}`);
+        await new Promise<void>((res, rej) => { ws.once("open", res); ws.once("error", rej); });
+        return ws;
+      };
+      const ws1 = await dialOne();
+      const mkRun = async (ws: import("ws").default, threadId: string, text: string, prefixHash: string, isReused: boolean, signal?: AbortSignal) => {
+        const out: string[] = [];
+        const turn: ParsedProtocolTurn = {
+          requestedModel: "quick-balanced",
+          rawBody: {},
+          conversationKey: threadId,
+          fullTranscriptText: text,
+          currentInputPrefixHash: prefixHash,
+          images: [],
+          tools: [],
+          toolChoice: "auto",
+          trailingToolResults: [],
+          hasToolResults: false,
+          stream: true,
+          includeStreamUsage: false,
+          estimatedInputTokens: 10,
+          ...(signal ? { signal } : {}),
+        };
+        for await (const ev of runTurnStream({
+          ws, isWeb: false, apiKey: "test-key", execMode: "incognito", toolFilter: null, usageTracker: dummyTracker,
+          encodeFrame: encodeCloudInputFrame, decodeFrame: decodeCloudOutputFrame,
+          surfaceType: "QUICK_WORK_DESKTOP_MAC", appVersion: "1.2.4757", surfaceName: "desktop", outpostId: "op1",
+          isReusedOpenWs: isReused, isStandbyWs: false, preSessionConnectSent: false, alreadyTrackedActive: false,
+          slotId: "slot-live", isIncognito: true, isWarmIncremental: isReused, isInternalHelperCall: false, isRephraseRetry: false,
+          turn, selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+          threadId, effectiveRootThreadId: threadId,
+          chunks: [text], effectiveCustomPrompt: null, attachments: [], rawPromptForRephrase: text,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          runMaxTimeoutMs: 10_000, runIdleTimeoutMs: 10_000, showRoutedModelInThinking: "false", webSearchEnabled: false,
+          warmPool: livePool,
+        })) {
+          if (ev.type === "text") out.push(ev.text);
+        }
+        return out.join("");
+      };
+
+      // Turn 1 on win-1 establishes Primary Shared WS & verifies S2C filtering (no FOREIGN_LEAK / TASK_STREAM_LEAK)
+      const r1 = await mkRun(ws1, "th-win-1", "WIN1_T1", "p-win1", false);
+      assert.equal(r1, "CLEAN:WIN1_T1");
+      assert.equal(totalWsConns, 1);
+
+      // Turn 2 on win-2 parks a second thread on the SAME Primary Shared WS
+      const standbyOrWin = livePool.takeStandby("slot-live", true);
+      assert.equal(standbyOrWin?.ws, ws1);
+      const r2 = await mkRun(ws1, "th-win-2", "WIN2_T1", "p-win2", true);
+      assert.equal(r2, "CLEAN:WIN2_T1");
+
+      // Turn 3 on win-1 aborts mid-stream (Ctrl+C): must send stop_generation & reclaim Primary Shared WS!
+      const parkedHash1 = extendHashWithAssistantTurn("p-win1", "CLEAN:WIN1_T1");
+      const parkedHash2 = extendHashWithAssistantTurn("p-win2", "CLEAN:WIN2_T1");
+      const hit1 = livePool.lookup(undefined, "th-win-1", "slot-live", true, parkedHash1);
+      assert.equal(hit1?.reusedWs, ws1);
+      const abortAc = new AbortController();
+      await assert.rejects(async () => {
+        const gen = runTurnStream({
+          ws: ws1, isWeb: false, apiKey: "test-key", execMode: "incognito", toolFilter: null, usageTracker: dummyTracker,
+          encodeFrame: encodeCloudInputFrame, decodeFrame: decodeCloudOutputFrame,
+          surfaceType: "QUICK_WORK_DESKTOP_MAC", appVersion: "1.2.4757", surfaceName: "desktop", outpostId: "op1",
+          isReusedOpenWs: true, isStandbyWs: false, preSessionConnectSent: false, alreadyTrackedActive: false,
+          slotId: "slot-live", isIncognito: true, isWarmIncremental: true, isInternalHelperCall: false, isRephraseRetry: false,
+          turn: {
+            requestedModel: "quick-balanced", rawBody: {}, conversationKey: "th-win-1",
+            fullTranscriptText: "SLOW_ABORT", currentInputPrefixHash: "p-win1-2", images: [], tools: [], toolChoice: "auto",
+            trailingToolResults: [], hasToolResults: false, stream: true, includeStreamUsage: false, estimatedInputTokens: 10,
+            signal: abortAc.signal,
+          },
+          selection: { model: "quick-balanced", agentMode: "balanced", thinkingEffort: "off" },
+          threadId: "th-win-1", effectiveRootThreadId: "th-win-1",
+          chunks: ["SLOW_ABORT"], effectiveCustomPrompt: null, attachments: [], rawPromptForRephrase: "SLOW_ABORT",
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          runMaxTimeoutMs: 10_000, runIdleTimeoutMs: 10_000, showRoutedModelInThinking: "false", webSearchEnabled: false,
+          warmPool: livePool,
+        });
+        for await (const ev of gen) {
+          if (ev.type === "text") abortAc.abort();
+        }
+      }, (e: unknown) => e instanceof GatewayError && e.status === 499);
+
+      // Give graceful drain 80ms to process `turn_aborted` and return ws1 to idle
+      await new Promise((r) => setTimeout(r, 80));
+      assert.equal(sawStopGen, true, "Ctrl+C must send stop_generation");
+      assert.equal(ws1.readyState, WsClass.OPEN, "Primary Shared WS must remain OPEN after graceful Ctrl+C!");
+      // Unrelated sibling window win-2 MUST STILL HIT WARM on the exact same ws1 (zero collateral wipe)!
+      const hit2AfterAbort = livePool.lookup(undefined, "th-win-2", "slot-live", true, parkedHash2);
+      assert.equal(hit2AfterAbort?.reusedWs, ws1, "Sibling warm session win-2 must survive Ctrl+C on win-1!");
+      const r2Follow = await mkRun(ws1, "th-win-2", "WIN2_T2", "p-win2-2", true);
+      assert.equal(r2Follow, "CLEAN:WIN2_T2");
+      assert.equal(totalWsConns, 1, "Entire multi-window + Ctrl+C scenario must use 1 single WS!");
+    } finally {
+      livePool.disposeAll();
+      await new Promise<void>((res) => wss.close(() => res()));
+    }
+
+    // 7. TurnProtocolTracker parseTreeSync handles tree_delta fields & cloudToolCount
+    const tracker = new TurnProtocolTracker();
+    tracker.onCloudToolStart("t1", "file_read");
+    assert.equal(tracker.getCloudToolCount(), 1);
+    tracker.onCloudToolResult("t1", "file_read");
+    assert.equal(tracker.hasActiveCloudTools(), false);
+    assert.deepEqual(TurnProtocolTracker.parseTreeSync({ branch_id: "branch-abc", root_session_id: "root-1" }), {
+      activeBranchId: "branch-abc",
+      rootSessionId: "root-1",
+    });
+
+    // 8. Web Cookie uploadWebBinaryAttachment aligns 1:1 with `req-1431-presigned-url.json` & rejects 0-byte upload
+    const origFetch = globalThis.fetch;
+    const seenWebCalls: Array<{ url: string; headers: Record<string, string> }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const hdrs: Record<string, string> = {};
+      if (init?.headers && typeof init.headers === "object") {
+        for (const [k, v] of Object.entries(init.headers as Record<string, string>)) hdrs[k.toLowerCase()] = String(v);
+      }
+      seenWebCalls.push({ url, headers: hdrs });
+      if (url.includes("/attachments/presigned-url")) {
+        return new Response(JSON.stringify({ attachmentId: "att-web-123" }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ type: "api_response", status: 201, body: JSON.stringify({ path: "/data/s3files/test.png" }) }), { status: 200 });
+    }) as typeof globalThis.fetch;
+    try {
+      const webCred = { accountId: "123456789012", mbtc: "tok+1=", cookie: "JSESSIONID=abc" };
+      await assert.rejects(
+        () => uploadWebBinaryAttachment(webCred, Buffer.alloc(0), "empty.png", "image/png", "th-w1"),
+        /empty file/i,
+      );
+      const att = await uploadWebBinaryAttachment(webCred, Buffer.from("PNGDATA"), "pic.png", "image/png", "th-w1");
+      assert.equal(att.attachmentId, "att-web-123");
+      assert.equal(att.path, "/data/s3files/test.png");
+      const firstCall = seenWebCalls[0]!;
+      assert.ok(firstCall.url.includes("Operation=ConversationServiceFileAttachmentProxy"));
+      assert.ok(firstCall.url.includes("awsAccountId=123456789012"));
+      assert.ok(firstCall.url.includes("name=pic.png"));
+      assert.ok(firstCall.url.includes("contentType=image%2Fpng"));
+      assert.ok(firstCall.url.includes("contentLength=7"));
+      assert.equal(firstCall.headers["x-amzn-target"], "api");
+      assert.equal(firstCall.headers["x-amzn-web-client-version"], "0.1.4");
+      assert.ok(firstCall.headers["referer"]?.includes("conversationId=th-w1"));
+      assert.equal(firstCall.headers["x-quick-file-name"], undefined);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+
+    // 9. CORS OPTIONS preflight dynamically echoes browser headers (LobeChat/NextChat) on API routes, never admin
+    const tmpCorsDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-cors-"));
+    const corsCfg = loadConfigFromEnv({
+      HOST: "127.0.0.1", PORT: "0",
+      GATEWAY_TOKEN: "sk-aq-test-real-token-9876543210",
+      QUICK_TOKENS: "example.aws.dev|eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.sig",
+      DATA_DIR: tmpCorsDir, ENV_FILE_PATH: path.join(tmpCorsDir, ".env"), ENABLE_DASHBOARD: "true",
+    });
+    const corsGw = createGatewayServer({ config: corsCfg });
+    await new Promise<void>((res) => corsGw.server.listen(0, "127.0.0.1", res));
+    const corsPort = (corsGw.server.address() as { port: number }).port;
+    try {
+      const apiOpt = await fetch(`http://127.0.0.1:${corsPort}/v1/chat/completions`, {
+        method: "OPTIONS",
+        headers: { "access-control-request-headers": "authorization, content-type, http-referer, x-title, x-request-id" },
+      });
+      assert.equal(apiOpt.status, 204);
+      const allowHdrs = apiOpt.headers.get("access-control-allow-headers") || "";
+      assert.ok(allowHdrs.includes("http-referer") && allowHdrs.includes("x-title") && allowHdrs.includes("x-request-id"));
+      const adminOpt = await fetch(`http://127.0.0.1:${corsPort}/v1/admin/overview`, {
+        method: "OPTIONS",
+        headers: { "access-control-request-headers": "x-title" },
+      });
+      assert.equal(adminOpt.status, 204);
+      assert.equal(adminOpt.headers.get("access-control-allow-origin"), null, "Admin routes must NEVER emit CORS headers");
+    } finally {
+      await corsGw.close();
+      rmSync(tmpCorsDir, { recursive: true, force: true });
+    }
+  });
+
+  it("defaults warm/parked keepalive to 60m for direct OAuth while auto-capping proxied and non-OAuth sockets to 25m", async () => {
+    const defaultCfg = loadConfigFromEnv({});
+    assert.equal(defaultCfg.sessionAffinityTtlMs, 60 * 60 * 1000);
+    assert.equal(defaultCfg.warmSessionTtlMs, 60 * 60 * 1000);
+    assert.equal(defaultCfg.parkedWsIdleTtlMs, 60 * 60 * 1000);
+
+    const { WarmSessionPool, PROXIED_OR_NON_OAUTH_PARKED_WS_CAP_MS } = await import("../src/core/warm-session-pool.js");
+    assert.equal(PROXIED_OR_NON_OAUTH_PARKED_WS_CAP_MS, 25 * 60 * 1000);
+
+    const oauthKey =
+      "oauth:" +
+      Buffer.from(
+        JSON.stringify({
+          region: "us-east-1",
+          issuerUrl: "https://view.awsapps.com/start",
+          wsHost: "demo.quick.aws.com",
+          clientId: "cid-1",
+          clientSecret: "csec-1",
+          refreshToken: "rt-1",
+        }),
+      ).toString("base64url");
+    const webKey =
+      "web:" +
+      Buffer.from(
+        JSON.stringify({
+          accountId: "123456789012",
+          mbtc: "tok",
+          cookie: "JSESSIONID=abc",
+        }),
+      ).toString("base64url");
+
+    const pool60 = new WarmSessionPool({});
+    assert.equal(pool60.computeParkedWsIdleTtlMs(oauthKey, undefined), 60 * 60 * 1000, "direct OAuth gets full 60m");
+    assert.equal(pool60.computeParkedWsIdleTtlMs(oauthKey, "http://127.0.0.1:7890"), 25 * 60 * 1000, "proxied OAuth auto-caps at 25m");
+    assert.equal(pool60.computeParkedWsIdleTtlMs(webKey, undefined), 25 * 60 * 1000, "web cookie auto-caps at 25m");
+    assert.equal(pool60.computeParkedWsIdleTtlMs("local-outpost", undefined), 25 * 60 * 1000, "local-outpost auto-caps at 25m");
+    assert.equal(pool60.computeParkedWsIdleTtlMs("demo.quick.aws.com|rawtok", undefined), 25 * 60 * 1000, "static token auto-caps at 25m");
+
+    const pool10 = new WarmSessionPool({ warmSessionTtlMs: 10 * 60 * 1000, parkedWsIdleTtlMs: 10 * 60 * 1000 });
+    assert.equal(pool10.computeParkedWsIdleTtlMs(oauthKey, "http://127.0.0.1:7890"), 10 * 60 * 1000, "smaller explicit TTL is preserved");
+
+    // Live WebSocket timer check: proxied primary WS expires at short cap (~70ms) while direct OAuth primary stays OPEN past 160ms
+    const { WebSocketServer, WebSocket: WsClass } = await import("ws");
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((res) => wss.once("listening", res));
+    const port = (wss.address() as { port: number }).port;
+    const shortPool = new WarmSessionPool({
+      warmSessionTtlMs: 400,
+      parkedWsIdleTtlMs: 400,
+      proxiedOrNonOAuthCapMs: 70,
+    });
+    const dial = () =>
+      new Promise<InstanceType<typeof WsClass>>((resolve, reject) => {
+        const ws = new WsClass(`ws://127.0.0.1:${port}`);
+        ws.once("open", () => resolve(ws));
+        ws.once("error", reject);
+      });
+    try {
+      const wsDirect = await dial();
+      const wsProxied = await dial();
+      const meta = {
+        decodeFrame: decodeCloudOutputFrame,
+        surfaceType: "QUICK_WORK_DESKTOP_MAC",
+        appVersion: "1.2.4757",
+        surfaceName: "desktop" as const,
+      };
+      shortPool.park({
+        scope: "s", conversationKey: "c1", slotId: "slot-direct", isIncognito: true,
+        prefixHashes: ["h-direct"], threadId: "th-direct", ws: wsDirect, outpostId: "op1",
+        encodeFrame: encodeCloudInputFrame, sharedHandleMeta: meta, apiKey: oauthKey,
+      });
+      shortPool.park({
+        scope: "s", conversationKey: "c2", slotId: "slot-proxied", isIncognito: true,
+        prefixHashes: ["h-proxied"], threadId: "th-proxied", ws: wsProxied, outpostId: "op2",
+        encodeFrame: encodeCloudInputFrame, sharedHandleMeta: meta, apiKey: oauthKey, proxyUrl: "http://127.0.0.1:7890",
+      });
+      await new Promise((r) => setTimeout(r, 160));
+      assert.equal(wsDirect.readyState, WsClass.OPEN, "direct OAuth primary WS must stay OPEN past proxied cap");
+      assert.notEqual(wsProxied.readyState, WsClass.OPEN, "proxied OAuth primary WS must expire at cap");
+    } finally {
+      shortPool.disposeAll();
+      await new Promise<void>((res) => wss.close(() => res()));
+    }
   });
 });

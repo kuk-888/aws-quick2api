@@ -11,9 +11,8 @@ import {
 } from "../core/types.js";
 import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
-import { estimatePromptTokens } from "../core/media-utils.js";
 import { resolveKnownModelId } from "../services/model-catalog.js";
-import { officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
+import { buildStructuredOutputBridgePrompt, officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
 function flattenAnthropicSystem(system: unknown): string | undefined {
   if (typeof system === "string") return system.trim() || undefined;
@@ -239,30 +238,97 @@ export function parseAnthropicToolChoice(raw: unknown): ToolChoiceMode {
   return "auto";
 }
 
+interface TokenAccState {
+  ascii: number;
+  nonAscii: number;
+  images: number;
+}
+
+function accumulateStringChars(str: string, state: TokenAccState): void {
+  for (let i = 0; i < str.length; i++) {
+    if (str.charCodeAt(i) <= 0x7f) state.ascii += 1;
+    else state.nonAscii += 1;
+  }
+}
+
+function accumulateAnthropicJsonNode(node: unknown, state: TokenAccState, depth: number): void {
+  if (depth > 32 || node === null || node === undefined) {
+    state.ascii += 4;
+    return;
+  }
+  const t = typeof node;
+  if (t === "string") {
+    state.ascii += 2; // quotes
+    accumulateStringChars(node as string, state);
+    return;
+  }
+  if (t === "number") {
+    state.ascii += String(node).length;
+    return;
+  }
+  if (t === "boolean") {
+    state.ascii += node ? 4 : 5;
+    return;
+  }
+  if (Array.isArray(node)) {
+    state.ascii += 2; // []
+    for (let i = 0; i < node.length; i++) {
+      const item = node[i];
+      if (isRecord(item) && (item.type === "thinking" || item.type === "redacted_thinking")) {
+        continue;
+      }
+      if (i > 0) state.ascii += 1;
+      accumulateAnthropicJsonNode(item, state, depth + 1);
+    }
+    return;
+  }
+  if (t === "object") {
+    const rec = node as Record<string, unknown>;
+    if (rec.type === "thinking" || rec.type === "redacted_thinking") {
+      return;
+    }
+    if (rec.type === "image") {
+      state.images += 1;
+      state.ascii += 16; // `{"type":"image"}`
+      return;
+    }
+    if (rec.type === "document" && isRecord(rec.source) && rec.source.type === "base64") {
+      state.images += 1;
+      state.ascii += 20; // `{"type":"document"}`
+      if (typeof rec.title === "string") {
+        state.ascii += 10;
+        accumulateStringChars(rec.title, state);
+      }
+      return;
+    }
+    state.ascii += 2; // {}
+    let first = true;
+    for (const key in rec) {
+      if (!Object.prototype.hasOwnProperty.call(rec, key)) continue;
+      const val = rec[key];
+      if (val === undefined) continue;
+      if (isRecord(val) && (val.type === "thinking" || val.type === "redacted_thinking")) continue;
+      if (!first) state.ascii += 1;
+      first = false;
+      state.ascii += 3; // "":
+      accumulateStringChars(key, state);
+      accumulateAnthropicJsonNode(val, state, depth + 1);
+    }
+  }
+}
+
 export function estimateAnthropicTokens(body: unknown): number {
   if (!isRecord(body)) return 1;
-  let images = 0;
-  // Replace every image/base64-document block (including ones nested in tool_result content) so the base64
-  // payload is not counted as text, and omit ignored thinking blocks; estimate text with the bilingual CJK/ASCII
-  // estimator so Chinese/Japanese/Korean prompts are not underestimated 4-6x.
-  const serialized = JSON.stringify(
-    { system: body.system ?? "", messages: body.messages ?? [], tools: body.tools ?? [] },
-    (_key, value) => {
-      if (isRecord(value) && (value.type === "thinking" || value.type === "redacted_thinking")) {
-        return undefined;
-      }
-      if (isRecord(value) && value.type === "image") {
-        images += 1;
-        return { type: "image" };
-      }
-      if (isRecord(value) && value.type === "document" && isRecord(value.source) && value.source.type === "base64") {
-        images += 1;
-        return { type: "document", title: value.title };
-      }
-      return value;
-    }
-  );
-  return Math.max(1, estimatePromptTokens(serialized)) + estimateImageTokens(images);
+  // Zero-allocation recursive AST token counter (replaces `JSON.stringify(..., replacer)` which
+  // forced V8 off its fast-path and allocated 300KB-450KB temporary strings on every turn).
+  // Still skips thinking blocks, counts image/base64-document blocks as image tokens, and matches
+  // `estimatePromptTokens`'s bilingual CJK/ASCII formula (`ascii / 3.8 + nonAscii / 1.5`).
+  const state: TokenAccState = { ascii: 36, nonAscii: 0, images: 0 };
+  if (body.system !== undefined) accumulateAnthropicJsonNode(body.system, state, 0);
+  if (body.messages !== undefined) accumulateAnthropicJsonNode(body.messages, state, 0);
+  if (body.tools !== undefined) accumulateAnthropicJsonNode(body.tools, state, 0);
+  const textTokens = Math.ceil(state.ascii / 3.8 + state.nonAscii / 1.5);
+  return Math.max(1, textTokens) + estimateImageTokens(state.images);
 }
 
 interface AnthropicTurnLine extends HashableDialogItem {
@@ -286,20 +352,15 @@ export function parseAnthropicMessagesRequest(
   if (typeof body.max_tokens !== "number" || !Number.isInteger(body.max_tokens) || body.max_tokens < 1) {
     throw new GatewayError("`max_tokens` must be a positive integer.", 400, "invalid_request_error", "max_tokens");
   }
-  if (isRecord(body.output_config) && isRecord(body.output_config.format) && body.output_config.format.type !== undefined && body.output_config.format.type !== "text") {
-    const kind = typeof body.output_config.format.type === "string" ? body.output_config.format.type : typeof body.output_config.format.type;
-    throw new GatewayError(
-      `\`output_config.format\` of type '${kind}' is not supported. Structured outputs cannot be enforced by AWS Quick; describe the schema in the prompt (or use a tool) and validate client-side.`,
-      400,
-      "unsupported_parameter",
-      "output_config.format",
-    );
-  }
+  const structuredOutputPrompt = isRecord(body.output_config)
+    ? buildStructuredOutputBridgePrompt(body.output_config.format, "output_config.format")
+    : null;
 
   const rawBody: Record<string, unknown> = { ...body };
 
   const requestedModel = requireModelField(body);
-  const systemPrompt = flattenAnthropicSystem(body.system);
+  const rawSystemPrompt = flattenAnthropicSystem(body.system);
+  const systemPrompt = [rawSystemPrompt, structuredOutputPrompt].filter(Boolean).join("\n\n") || undefined;
   const { customTools: tools, nativeSdkTools } = parseAnthropicTools(body.tools);
   const toolChoice = parseAnthropicToolChoice(body.tool_choice);
 
@@ -453,6 +514,7 @@ export function parseAnthropicMessagesRequest(
     rawBody,
     ...(conversationKey ? { conversationKey } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
+    ...(structuredOutputPrompt ? { structuredOutputPrompt } : {}),
     fullTranscriptText,
     ...prefixHashes,
     images: allImages,

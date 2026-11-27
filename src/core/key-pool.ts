@@ -24,10 +24,12 @@ import { SessionAffinityTable, type AffinityBindingView } from "./session-affini
 import {
   GatewayError,
   parseRoutedModelThinkingMode,
+  parseSanitizeClientSystemPromptMode,
   type AutoDisabledState,
   type GatewayConfig,
   type LbStrategy,
   type RoutedModelThinkingMode,
+  type SanitizeClientSystemPromptMode,
 } from "./types.js";
 
 export interface KeyIdentitySummary {
@@ -164,7 +166,7 @@ export interface PoolRoutingSettings {
   incognitoMode: boolean;
   autoEnsureCodingAgent: boolean;
   customAgentPrompt?: string;
-  sanitizeClientSystemPrompt: boolean;
+  sanitizeClientSystemPrompt: SanitizeClientSystemPromptMode;
   showRoutedModelInThinking: RoutedModelThinkingMode;
   autoRephraseOnContentFilter: boolean;
   contentFilterRephrasePrompt?: string;
@@ -275,7 +277,7 @@ export class UpstreamKeyPool {
   private incognitoMode: boolean;
   private autoEnsureCodingAgent: boolean;
   private customAgentPrompt?: string;
-  private sanitizeClientSystemPrompt: boolean;
+  private sanitizeClientSystemPrompt: SanitizeClientSystemPromptMode;
   private showRoutedModelInThinking: RoutedModelThinkingMode;
   private autoRephraseOnContentFilter: boolean;
   private contentFilterRephrasePrompt?: string;
@@ -283,7 +285,7 @@ export class UpstreamKeyPool {
   private chatAgentId?: string;
   private readonly rrIndexByGroup = new Map<string, number>();
   private readonly unsubscribeOAuthRotation: () => void;
-  private onSlotInvalidatedCallback?: (slotId: string) => void;
+  private onSlotInvalidatedCallback?: (slotId: string, opts?: { keepStandby?: boolean }) => void;
   private onSlotRekeyedCallback?: (oldSlotId: string, newSlotId: string) => void;
   private readonly groupRenameListeners = new Set<(oldName: string, newName: string) => void>();
 
@@ -326,7 +328,7 @@ export class UpstreamKeyPool {
     this.incognitoMode = config.incognitoMode !== false;
     this.autoEnsureCodingAgent = config.autoEnsureCodingAgent !== false;
     this.customAgentPrompt = config.customAgentPrompt?.trim() || undefined;
-    this.sanitizeClientSystemPrompt = config.sanitizeClientSystemPrompt === true;
+    this.sanitizeClientSystemPrompt = parseSanitizeClientSystemPromptMode(config.sanitizeClientSystemPrompt);
     this.showRoutedModelInThinking = parseRoutedModelThinkingMode(config.showRoutedModelInThinking);
     this.autoRephraseOnContentFilter = config.autoRephraseOnContentFilter === true;
     this.contentFilterRephrasePrompt = config.contentFilterRephrasePrompt?.trim() || undefined;
@@ -359,7 +361,7 @@ export class UpstreamKeyPool {
       this.incognitoMode = persistedState.incognitoMode;
       this.autoEnsureCodingAgent = persistedState.autoEnsureCodingAgent;
       this.customAgentPrompt = persistedState.customAgentPrompt.trim() || undefined;
-      this.sanitizeClientSystemPrompt = persistedState.sanitizeClientSystemPrompt === true;
+      this.sanitizeClientSystemPrompt = parseSanitizeClientSystemPromptMode(persistedState.sanitizeClientSystemPrompt);
       if (persistedState.showRoutedModelInThinking !== undefined) {
         this.showRoutedModelInThinking = parseRoutedModelThinkingMode(persistedState.showRoutedModelInThinking);
       }
@@ -547,7 +549,9 @@ export class UpstreamKeyPool {
     this.flushStateToDisk();
   }
 
-  setOnSlotInvalidated(cb: ((slotId: string) => void) | undefined): void {
+  private standbyProbe?: (slotId: string) => boolean;
+
+  setOnSlotInvalidated(cb: ((slotId: string, opts?: { keepStandby?: boolean }) => void) | undefined): void {
     this.onSlotInvalidatedCallback = cb;
   }
 
@@ -555,10 +559,14 @@ export class UpstreamKeyPool {
     this.onSlotRekeyedCallback = cb;
   }
 
-  private emitSlotInvalidated(slotId: string): void {
+  setStandbyProbe(probe: ((slotId: string) => boolean) | undefined): void {
+    this.standbyProbe = probe;
+  }
+
+  private emitSlotInvalidated(slotId: string, opts?: { keepStandby?: boolean }): void {
     if (!slotId || !this.onSlotInvalidatedCallback) return;
     try {
-      this.onSlotInvalidatedCallback(slotId);
+      this.onSlotInvalidatedCallback(slotId, opts);
     } catch {
       // non-fatal
     }
@@ -836,8 +844,8 @@ export class UpstreamKeyPool {
     if (typeof patch.customAgentPrompt === "string") {
       this.customAgentPrompt = patch.customAgentPrompt.trim().slice(0, 4000) || undefined;
     }
-    if (typeof patch.sanitizeClientSystemPrompt === "boolean") {
-      this.sanitizeClientSystemPrompt = patch.sanitizeClientSystemPrompt;
+    if (patch.sanitizeClientSystemPrompt !== undefined) {
+      this.sanitizeClientSystemPrompt = parseSanitizeClientSystemPromptMode(patch.sanitizeClientSystemPrompt);
     }
     if (patch.showRoutedModelInThinking !== undefined) {
       this.showRoutedModelInThinking = parseRoutedModelThinkingMode(patch.showRoutedModelInThinking);
@@ -1386,7 +1394,7 @@ export class UpstreamKeyPool {
               s.activeInflight < this.maxInflightPerSlot,
           );
           if (spareCandidates.length > 0) {
-            const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
+            const borrowed = this.pickBestCandidate(spareCandidates, targetPool, requiredGroup);
             return this.bindAndLease(borrowed, conversationKey);
           }
           return this.leaseSpecificKey(stickySlot.rawKey, true);
@@ -1399,7 +1407,7 @@ export class UpstreamKeyPool {
               s.activeInflight < this.maxInflightPerSlot,
           );
           if (spareCandidates.length > 0) {
-            const borrowed = this.pickBestCandidate(spareCandidates, targetPool);
+            const borrowed = this.pickBestCandidate(spareCandidates, targetPool, requiredGroup);
             return this.bindAndLease(borrowed, conversationKey);
           }
           // Fall through without evicting sticky affinity
@@ -1475,6 +1483,10 @@ export class UpstreamKeyPool {
 
     const n = this.slots.length;
     const startIdx = (this.rrIndexByGroup.get(scopeKey) ?? 0) % Math.max(1, n);
+    // Only apply standby-aware tiebreaking when total eligible candidates fit within the global
+    // standby pool cap (16) so slots beyond index 16 can never starve.
+    const useStandbyTiebreak =
+      this.lbStrategy === "quota-aware" && Boolean(this.standbyProbe) && pool.length <= 16;
 
     const sorted = [...pool].sort((a, b) => {
       if (this.lbStrategy === "quota-aware") {
@@ -1493,6 +1505,13 @@ export class UpstreamKeyPool {
         const tierA = remA !== null && remA >= 40 ? 2 : 1;
         const tierB = remB !== null && remB >= 40 ? 2 : 1;
         if (tierA !== tierB) return tierB - tierA;
+        // 4) Among equally-healthy, equally-loaded slots, prefer one with an open pre-warmed standby WS
+        //    for instant 0ms cold-turn dispatch (saves ~1.9s direct / ~7.1s residential proxy dial).
+        if (useStandbyTiebreak) {
+          const warmA = this.standbyProbe!(a.slotId) ? 1 : 0;
+          const warmB = this.standbyProbe!(b.slotId) ? 1 : 0;
+          if (warmA !== warmB) return warmB - warmA;
+        }
       } else if (a.activeInflight !== b.activeInflight) {
         return a.activeInflight - b.activeInflight;
       }
@@ -1970,6 +1989,7 @@ export class UpstreamKeyPool {
       slot.label = patch.label.trim() || undefined;
     }
     let shouldInvalidateSlot = false;
+    let mustDropStandby = false;
     let groupChanged = false;
     if (patch.group !== undefined) {
       if (nextGroup) this.accountGroups.add(nextGroup);
@@ -1983,6 +2003,7 @@ export class UpstreamKeyPool {
     if (patch.proxyUrl !== undefined && (slot.proxyUrl || "") !== (nextProxy || "")) {
       slot.proxyUrl = nextProxy;
       shouldInvalidateSlot = true;
+      mustDropStandby = true;
     }
     if (patch.chatAgentId !== undefined && (slot.chatAgentId || "") !== (nextChatAgentId || "")) {
       slot.chatAgentId = nextChatAgentId;
@@ -2003,10 +2024,11 @@ export class UpstreamKeyPool {
         slot.autoDisabledKind = undefined;
         this.affinityTable.evictAllForKey(slot.rawKey);
         shouldInvalidateSlot = true;
+        mustDropStandby = true;
       }
     }
     if (shouldInvalidateSlot) {
-      this.emitSlotInvalidated(slot.slotId);
+      this.emitSlotInvalidated(slot.slotId, mustDropStandby ? undefined : { keepStandby: true });
     }
     this.persist();
     if (slot.enabled && (patch.enabled === true || patch.clearCooldown || groupChanged)) {

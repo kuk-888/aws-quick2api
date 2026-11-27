@@ -54,6 +54,8 @@ export interface RunTurnStreamParams {
   isReusedOpenWs: boolean;
   /** True when `ws` was adopted from the pre-warmed standby pool (enables fast 10s first-response liveness guard). */
   isStandbyWs?: boolean;
+  /** True when the caller already invoked `warmPool.trackActiveWsStart(slotId)` before OOB uploads. */
+  alreadyTrackedActive?: boolean;
   /** True when `session_connect` was already sent during speculative parallel dial (awaiting `session_established`). */
   preSessionConnectSent?: boolean;
   /** Any raw WS chunks received during speculative parallel dial before `runTurnStream` attached listeners. */
@@ -118,6 +120,7 @@ export async function* runTurnStream(
     ws,
     isReusedOpenWs,
     isStandbyWs,
+    alreadyTrackedActive,
     preSessionConnectSent,
     preBufferedFrames,
     encodeFrame,
@@ -165,9 +168,12 @@ export async function* runTurnStream(
   let effectiveRootThreadId = params.effectiveRootThreadId;
   let activeKernelThreadId = threadId;
 
-  warmPool.trackActiveWsStart(slotId);
+  if (!alreadyTrackedActive) {
+    warmPool.trackActiveWsStart(slotId);
+  }
 
   const queue: Array<GatewayStreamEvent | { type: "__error"; error: Error }> = [];
+  let qHead = 0;
   let notify: (() => void) | null = null;
   let ended = false;
   const push = (item: GatewayStreamEvent | { type: "__error"; error: Error }) => {
@@ -180,7 +186,7 @@ export async function* runTurnStream(
   };
   const waitNext = () =>
     new Promise<void>((resolve) => {
-      if (queue.length > 0 || ended) {
+      if (qHead < queue.length || ended) {
         resolve();
         return;
       }
@@ -280,14 +286,26 @@ export async function* runTurnStream(
     if (!ended) {
       ended = true;
       clearAllStreamTimers();
+      const isPrimaryShared = warmPool.isPrimarySharedWs(slotId, ws);
       const assistantMsgId = proto.getAssistantMessageId();
-      if (ws.readyState === WebSocket.OPEN && assistantMsgId) {
+      if (ws.readyState === WebSocket.OPEN && !initialChunkSent && isPrimaryShared) {
+        // Request aborted before any chat frame was dispatched on the Primary Shared WS:
+        // reclaim it immediately without closing so sibling warm sessions stay alive.
+        ws.off("message", onWsMessage);
+        ws.off("error", onWsError);
+        ws.off("close", onWsClose);
+        if (warmPool.releaseUntouchedWs(slotId, ws)) {
+          wsParked = true;
+        } else {
+          safeCloseWs();
+        }
+      } else if (ws.readyState === WebSocket.OPEN && (assistantMsgId || (initialChunkSent && isPrimaryShared))) {
         try {
           ws.send(
             encodeFrame({
               type: "stop_generation",
               payload: {
-                message_id: assistantMsgId,
+                ...(assistantMsgId ? { message_id: assistantMsgId } : {}),
                 thread_id: activeKernelThreadId || threadId,
               },
             }),
@@ -297,13 +315,71 @@ export async function* runTurnStream(
         ws.off("message", onWsMessage);
         ws.off("error", onWsError);
         ws.off("close", onWsClose);
-        ws.on("error", () => { });
-        const graceClose = setTimeout(() => {
-          try {
-            ws.close();
-          } catch { }
-        }, 350);
-        graceClose.unref?.();
+        if (isPrimaryShared) {
+          // Graceful abort drain for Primary Shared WS: wait up to 2.5s for upstream to confirm
+          // `turn_aborted` / `message_complete` / `stream_ended` so we can return the shared WS
+          // to idle instead of closing it and wiping up to 15 unrelated warm sessions on this slot.
+          let drainSettled = false;
+          let drainBuf = Buffer.alloc(0);
+          const drainAssembler = new ChunkedFrameAssembler();
+          const finishDrain = (reclaim: boolean) => {
+            if (drainSettled) return;
+            drainSettled = true;
+            clearTimeout(drainTimer);
+            ws.off("message", onDrainMsg);
+            ws.off("error", onDrainDead);
+            ws.off("close", onDrainDead);
+            drainAssembler.clear();
+            if (reclaim && ws.readyState === WebSocket.OPEN && warmPool.releaseUntouchedWs(slotId, ws)) {
+              return;
+            }
+            safeCloseWs();
+          };
+          const onDrainDead = () => finishDrain(false);
+          const onDrainMsg = (data: Buffer) => {
+            if (drainSettled) return;
+            try {
+              drainBuf = appendWsRecvBuf(drainBuf, data);
+              const { messages, consumed } = drainEventStream(drainBuf, 0);
+              if (consumed > 0) drainBuf = consumed >= drainBuf.length ? EMPTY_RECV_BUF : drainBuf.subarray(consumed);
+              for (const esMsg of messages) {
+                const decoded = decodeFrame(esMsg);
+                if (!decoded || decoded.type === "error") continue;
+                const ev = drainAssembler.push(decoded.data);
+                if (!ev) continue;
+                const et = String(ev.type || "");
+                const evTid = typeof ev.thread_id === "string" ? ev.thread_id.trim() : "";
+                if (
+                  evTid &&
+                  evTid !== threadId &&
+                  evTid !== activeKernelThreadId &&
+                  evTid !== effectiveRootThreadId
+                ) {
+                  continue;
+                }
+                if (et === "turn_aborted" || et === "message_complete" || et === "stream_ended") {
+                  finishDrain(true);
+                  return;
+                }
+              }
+            } catch {
+              finishDrain(false);
+            }
+          };
+          ws.on("message", onDrainMsg);
+          ws.once("error", onDrainDead);
+          ws.once("close", onDrainDead);
+          const drainTimer = setTimeout(() => finishDrain(false), 2_500);
+          drainTimer.unref?.();
+        } else {
+          ws.on("error", () => { });
+          const graceClose = setTimeout(() => {
+            try {
+              ws.close();
+            } catch { }
+          }, 350);
+          graceClose.unref?.();
+        }
       } else {
         safeCloseWs();
       }
@@ -551,6 +627,12 @@ export async function* runTurnStream(
         ws.off("message", onWsMessage);
         ws.off("error", onWsError);
         ws.off("close", onWsClose);
+        // Guard `editKey` registration against theoretical shared-API-key Turn-1 collisions:
+        // only enable native `edit_message` Retry/Edit when the caller supplies an explicit session
+        // identifier (`hdr_`/`pck_`/`meta_`/`usr_`, i.e. not implicit first-message `anc_`) OR the
+        // conversation already spans >= 2 completed prior assistant turns.
+        const hasExplicitSessionKey = Boolean(turn.conversationKey) && !/(?:^|:)anc_/.test(turn.conversationKey!);
+        const allowEditKey = hasExplicitSessionKey || (turn.priorAssistantTurns ?? 0) >= 2;
         parkedForReuse = warmPool.park({
           scope: turn.scope,
           conversationKey: turn.conversationKey,
@@ -559,13 +641,24 @@ export async function* runTurnStream(
           ...(chatAgentId ? { chatAgentId } : {}),
           ...(warmGeneration !== undefined ? { expectedGeneration: warmGeneration } : {}),
           prefixHashes: nextHashes,
+          ...(totalChunks === 1 && lastSentMessageId && turn.priorPrefixHash && !isInternalHelperCall && allowEditKey
+            ? { editPrefixHash: turn.priorPrefixHash, lastUserMessageId: lastSentMessageId }
+            : {}),
           threadId: effectiveFinishThreadId,
           rootThreadId: effectiveRootThreadId,
+          priority: isWarmIncremental || turn.estimatedInputTokens >= 1_500 ? 2 : 1,
           ...(allowParkWs
             ? {
               ws,
               outpostId,
               encodeFrame,
+              sharedHandleMeta: {
+                decodeFrame,
+                surfaceType,
+                appVersion,
+                surfaceName,
+                ...(actorArn ? { actorArn } : {}),
+              },
               apiKey,
               proxyUrl,
               lastAckSeq: proto.getLastAckSequence(),
@@ -683,6 +776,74 @@ export async function* runTurnStream(
     pingTimer.unref?.();
   };
 
+  const EMPTY_RECV_BUF = Buffer.alloc(0);
+  const rawThinkingObj =
+    turn.rawBody?.thinking && typeof turn.rawBody.thinking === "object"
+      ? (turn.rawBody.thinking as { type?: unknown })
+      : undefined;
+  const rawReasoningObj =
+    turn.rawBody?.reasoning && typeof turn.rawBody.reasoning === "object"
+      ? (turn.rawBody.reasoning as { effort?: unknown })
+      : undefined;
+  const rawOutputCfgObj =
+    turn.rawBody?.output_config && typeof turn.rawBody.output_config === "object"
+      ? (turn.rawBody.output_config as { effort?: unknown })
+      : undefined;
+  const isOffToken = (v: unknown): boolean => {
+    if (typeof v !== "string") return false;
+    const k = v.trim().toLowerCase();
+    return k === "none" || k === "off" || k === "disabled" || k === "false";
+  };
+  const explicitThinkingDisabled =
+    isOffToken(rawThinkingObj?.type) ||
+    turn.rawBody?.enable_thinking === false ||
+    isOffToken(turn.rawBody?.reasoning_effort) ||
+    isOffToken(turn.rawBody?.effort) ||
+    isOffToken(rawReasoningObj?.effort) ||
+    isOffToken(rawOutputCfgObj?.effort);
+  const canEmitRoutedThinking = (hasRealThinkingDelta = false) =>
+    !isInternalHelperCall &&
+    routedThinkingMode !== "false" &&
+    (routedThinkingMode === "always" ||
+      (!explicitThinkingDisabled &&
+        (selection.thinkingEffort !== "off" || hasRealThinkingDelta || isRephraseRetry))) &&
+    !emittedRoutedModel &&
+    !hasEmittedText;
+  const formatRoutedHeaderLine = (modelName?: string, isExact = true) => {
+    const rephraseTag = isRephraseRetry ? " · rephrased" : "";
+    const routedPart = modelName
+      ? (isExact ? ` · routed=${modelName}` : ` · routed≈${modelName}`)
+      : "";
+    return `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort}${routedPart}${rephraseTag}\n`;
+  };
+  const emitOrDeferRoutedThinking = (modelName?: string, isExact = true) => {
+    emittedRoutedModel = true;
+    emittedRoutedModelName = modelName || undefined;
+    emittedRoutedExact = Boolean(modelName && isExact);
+    const line = formatRoutedHeaderLine(modelName, isExact);
+    if (!usageLimitChecked) pendingRoutedThinking = line;
+    else {
+      emittedRoutedThinkingToClient = true;
+      push({ type: "thinking", text: line });
+    }
+  };
+  const advanceIntermediateChunk = (forChunkIdx: number) => {
+    if (!awaitingChunkAck || advancingChunk || ended || activeChunkIndex !== forChunkIdx || activeChunkIndex >= totalChunks - 1) return;
+    awaitingChunkAck = false;
+    clearPostUsageTimer();
+    advancingChunk = true;
+    chunkAdvanceTimer = setTimeout(() => {
+      chunkAdvanceTimer = null;
+      if (ended || activeChunkIndex !== forChunkIdx) {
+        advancingChunk = false;
+        return;
+      }
+      activeChunkIndex += 1;
+      advancingChunk = false;
+      sendChunkMessage(activeChunkIndex);
+    }, 50);
+  };
+
   const onWsMessage = (data: Buffer) => {
     if (ended) return;
     missedPongs = 0;
@@ -691,7 +852,9 @@ export async function* runTurnStream(
     try {
       recvBuf = appendWsRecvBuf(recvBuf, data);
       const { messages, consumed } = drainEventStream(recvBuf, 0);
-      if (consumed > 0) recvBuf = recvBuf.subarray(consumed);
+      if (consumed > 0) {
+        recvBuf = consumed >= recvBuf.length ? EMPTY_RECV_BUF : recvBuf.subarray(consumed);
+      }
       drainedMessages = messages;
     } catch (err) {
       clearAllStreamTimers();
@@ -728,6 +891,13 @@ export async function* runTurnStream(
       proto.observeTransport(ev);
       const evType = String(ev.type || "");
       const payload = (ev.payload && typeof ev.payload === "object" ? ev.payload : {}) as Record<string, unknown>;
+      const evScope = typeof ev.scope === "string" ? ev.scope.trim() : "";
+      if (evScope === "task_stream") {
+        continue;
+      }
+      const evThreadId = typeof ev.thread_id === "string" ? ev.thread_id.trim() : "";
+      const payloadRootId =
+        typeof payload.root_session_id === "string" ? payload.root_session_id.trim() : "";
 
       if (evType === "session_established" || evType === "connected") {
         if (evType === "connected" && oauthClientId) {
@@ -744,7 +914,31 @@ export async function* runTurnStream(
         continue;
       }
 
-      if (evType === "tree_sync") {
+      // Adopt new branch IDs emitted during `edit_message` branching (`tree_sync` / `tree_delta` / `runs_updated`).
+      if (
+        editBranch &&
+        evThreadId &&
+        evThreadId.startsWith("branch-") &&
+        (evType === "runs_updated" || evType === "tree_delta" || evType === "tree_sync" || evType === "message_start")
+      ) {
+        activeKernelThreadId = evThreadId;
+      }
+
+      // Strict per-thread S2C isolation: ignore any stale/late frames from another thread_id
+      // so multiplexed/background sessions can never bleed into or terminate the active turn.
+      if (
+        evThreadId &&
+        evThreadId !== threadId &&
+        evThreadId !== activeKernelThreadId &&
+        evThreadId !== effectiveRootThreadId &&
+        evThreadId !== editBranch?.threadId &&
+        !(payloadRootId && payloadRootId === effectiveRootThreadId) &&
+        !(editBranch && evThreadId.startsWith("branch-"))
+      ) {
+        continue;
+      }
+
+      if (evType === "tree_sync" || evType === "tree_delta") {
         const syncInfo = TurnProtocolTracker.parseTreeSync(payload);
         if (syncInfo.activeBranchId) activeKernelThreadId = syncInfo.activeBranchId;
         if (syncInfo.rootSessionId) effectiveRootThreadId = syncInfo.rootSessionId;
@@ -758,23 +952,6 @@ export async function* runTurnStream(
         continue;
       }
 
-      const advanceIntermediateChunk = (forChunkIdx: number) => {
-        if (!awaitingChunkAck || advancingChunk || ended || activeChunkIndex !== forChunkIdx || activeChunkIndex >= totalChunks - 1) return;
-        awaitingChunkAck = false;
-        clearPostUsageTimer();
-        advancingChunk = true;
-        const drainDelayMs = activeChunkIndex === totalChunks - 2 ? 400 : 250;
-        chunkAdvanceTimer = setTimeout(() => {
-          chunkAdvanceTimer = null;
-          if (ended || activeChunkIndex !== forChunkIdx) {
-            advancingChunk = false;
-            return;
-          }
-          activeChunkIndex += 1;
-          advancingChunk = false;
-          sendChunkMessage(activeChunkIndex);
-        }, drainDelayMs);
-      };
       if (advancingChunk && evType !== "error" && evType !== "guardrail_blocked") continue;
       if (activeChunkIndex < totalChunks - 1) {
         const curIdx = activeChunkIndex;
@@ -805,57 +982,6 @@ export async function* runTurnStream(
           continue;
         }
       }
-
-      const rawThinkingObj =
-        turn.rawBody?.thinking && typeof turn.rawBody.thinking === "object"
-          ? (turn.rawBody.thinking as { type?: unknown })
-          : undefined;
-      const rawReasoningObj =
-        turn.rawBody?.reasoning && typeof turn.rawBody.reasoning === "object"
-          ? (turn.rawBody.reasoning as { effort?: unknown })
-          : undefined;
-      const rawOutputCfgObj =
-        turn.rawBody?.output_config && typeof turn.rawBody.output_config === "object"
-          ? (turn.rawBody.output_config as { effort?: unknown })
-          : undefined;
-      const isOffToken = (v: unknown): boolean => {
-        if (typeof v !== "string") return false;
-        const k = v.trim().toLowerCase();
-        return k === "none" || k === "off" || k === "disabled" || k === "false";
-      };
-      const explicitThinkingDisabled =
-        isOffToken(rawThinkingObj?.type) ||
-        turn.rawBody?.enable_thinking === false ||
-        isOffToken(turn.rawBody?.reasoning_effort) ||
-        isOffToken(turn.rawBody?.effort) ||
-        isOffToken(rawReasoningObj?.effort) ||
-        isOffToken(rawOutputCfgObj?.effort);
-      const canEmitRoutedThinking = (hasRealThinkingDelta = false) =>
-        !isInternalHelperCall &&
-        routedThinkingMode !== "false" &&
-        (routedThinkingMode === "always" ||
-          (!explicitThinkingDisabled &&
-            (selection.thinkingEffort !== "off" || hasRealThinkingDelta || isRephraseRetry))) &&
-        !emittedRoutedModel &&
-        !hasEmittedText;
-      const formatRoutedHeaderLine = (modelName?: string, isExact = true) => {
-        const rephraseTag = isRephraseRetry ? " · rephrased" : "";
-        const routedPart = modelName
-          ? (isExact ? ` · routed=${modelName}` : ` · routed≈${modelName}`)
-          : "";
-        return `[AWS Quick] mode=${selection.agentMode} · effort=${selection.thinkingEffort}${routedPart}${rephraseTag}\n`;
-      };
-      const emitOrDeferRoutedThinking = (modelName?: string, isExact = true) => {
-        emittedRoutedModel = true;
-        emittedRoutedModelName = modelName || undefined;
-        emittedRoutedExact = Boolean(modelName && isExact);
-        const line = formatRoutedHeaderLine(modelName, isExact);
-        if (!usageLimitChecked) pendingRoutedThinking = line;
-        else {
-          emittedRoutedThinkingToClient = true;
-          push({ type: "thinking", text: line });
-        }
-      };
 
       const rearmPostUsageIfNeeded = () => {
         if (proto.hasUsage() && !proto.hasActiveCloudTools()) {
@@ -905,7 +1031,7 @@ export async function* runTurnStream(
         touchIdleTimer();
         continue;
       }
-      if (evType === "tool_result") {
+      if (evType === "tool_result" || evType === "tool_error") {
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
         touchIdleTimer();
@@ -1060,7 +1186,12 @@ export async function* runTurnStream(
         clearAllStreamTimers();
         ended = true;
         const errCode = String(payload.error_code || "");
-        const errText = typeof payload.error === "string" ? payload.error : "";
+        const errText =
+          typeof payload.error === "string" && payload.error.trim()
+            ? payload.error
+            : typeof payload.message === "string"
+              ? payload.message
+              : "";
         let gatewayErr: GatewayError;
         if (evType === "guardrail_blocked" || errCode === "content_filtered") {
           const rawDetail = [
@@ -1260,8 +1391,12 @@ export async function* runTurnStream(
 
     while (true) {
       await waitNext();
-      while (queue.length > 0) {
-        const item = queue.shift()!;
+      while (qHead < queue.length) {
+        const item = queue[qHead++]!;
+        if (qHead >= 64 && qHead === queue.length) {
+          queue.length = 0;
+          qHead = 0;
+        }
         if (item.type === "__error") throw item.error;
         yield item;
         if (item.type === "done") return;

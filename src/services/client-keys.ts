@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { chmod, mkdir, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { normalizeAccountGroup } from "../core/key-pool.js";
 import { GatewayError, type GatewayConfig } from "../core/types.js";
@@ -100,6 +101,9 @@ export class ClientGatewayKeyManager {
   private readonly tombstoneFilePath?: string;
   private readonly tombstones = new Set<string>();
   private persistTimer: NodeJS.Timeout | null = null;
+  private persistWriteChain: Promise<void> = Promise.resolve();
+  private persistEpoch = 0;
+  private persistTmpSeq = 0;
   /** Notable startup reconciliation events (pruned / suppressed env keys) for the caller to log. */
   readonly startupEvents: Array<{ event: string; id: string; name: string }> = [];
 
@@ -260,8 +264,7 @@ export class ClientGatewayKeyManager {
     if (changed) this.persist();
   }
 
-  private persist(): void {
-    if (!this.stateFilePath) return;
+  private serializeKeysPayload(): string {
     const payload = this.keys.map((k) => ({
       id: k.id,
       name: k.name,
@@ -277,14 +280,20 @@ export class ClientGatewayKeyManager {
       source: k.source,
       stats: k.stats
     }));
+    return JSON.stringify(payload, null, 2) + "\n";
+  }
+
+  private persist(): void {
+    if (!this.stateFilePath) return;
     if (this.persistTimer) {
       clearTimeout(this.persistTimer);
       this.persistTimer = null;
     }
+    this.persistEpoch += 1;
     const dir = path.dirname(this.stateFilePath);
     mkdirSync(dir, { recursive: true });
-    const tmpPath = `${this.stateFilePath}.${process.pid}.tmp`;
-    writeFileSync(tmpPath, JSON.stringify(payload, null, 2) + "\n", { mode: 0o600 });
+    const tmpPath = `${this.stateFilePath}.${process.pid}.${++this.persistTmpSeq}.tmp`;
+    writeFileSync(tmpPath, this.serializeKeysPayload(), { mode: 0o600 });
     try {
       chmodSync(tmpPath, 0o600);
     } catch {
@@ -293,15 +302,36 @@ export class ClientGatewayKeyManager {
     renameSync(tmpPath, this.stateFilePath);
   }
 
+  private enqueueAsyncPersist(): void {
+    if (!this.stateFilePath) return;
+    const targetPath = this.stateFilePath;
+    const epoch = ++this.persistEpoch;
+    const serialized = this.serializeKeysPayload();
+    this.persistWriteChain = this.persistWriteChain
+      .then(async () => {
+        if (epoch !== this.persistEpoch) return;
+        const tmpPath = `${targetPath}.${process.pid}.${++this.persistTmpSeq}.tmp`;
+        try {
+          await mkdir(path.dirname(targetPath), { recursive: true });
+          await writeFile(tmpPath, serialized, { mode: 0o600 });
+          await chmod(tmpPath, 0o600).catch(() => { });
+          if (epoch !== this.persistEpoch) {
+            await unlink(tmpPath).catch(() => { });
+            return;
+          }
+          await rename(tmpPath, targetPath);
+        } catch {
+          await unlink(tmpPath).catch(() => { });
+        }
+      })
+      .catch(() => { });
+  }
+
   private schedulePersist(): void {
     if (!this.stateFilePath || this.persistTimer) return;
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null;
-      try {
-        this.persist();
-      } catch {
-        // Best-effort periodic flush
-      }
+      this.enqueueAsyncPersist();
     }, 2000);
     this.persistTimer.unref?.();
   }
@@ -399,7 +429,11 @@ export class ClientGatewayKeyManager {
     found.stats.requests += 1;
     found.stats.lastUsedAt = new Date().toISOString();
     if (found.maxRequests !== null && found.stats.requests >= found.maxRequests) {
-      this.persist();
+      if (this.persistTimer) {
+        clearTimeout(this.persistTimer);
+        this.persistTimer = null;
+      }
+      this.enqueueAsyncPersist();
     } else {
       this.schedulePersist();
     }

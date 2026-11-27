@@ -130,7 +130,7 @@ export async function buildPromptAndAttachmentsForTurn(
         fileAtts.push(...uploaded);
         for (const fa of uploaded) uploadedNames.push(fa.name);
       } catch (fileErr) {
-        throw mapAttachmentUploadError(fileErr, "Failed to upload attached file(s) to AWS Quick");
+        throw mapAttachmentUploadError(fileErr, "Failed to upload attached file(s) to AWS Quick", turn.signal);
       }
     } else {
       for (const f of resolvedFiles) {
@@ -167,7 +167,11 @@ export async function buildPromptAndAttachmentsForTurn(
           : AbortSignal.timeout(90_000);
         try {
           const imgAtts = await mapWithConcurrency(resolvedImgs, 5, async (im, idx) => {
-            const prepared = await prepareHighResImageForOutOfBand(im.buf, im.mimeType);
+            const prepared = reqAttCache
+              ? await reqAttCache.getOrPrepareHighResImage(im.buf, im.mimeType, () =>
+                prepareHighResImageForOutOfBand(im.buf, im.mimeType),
+              )
+              : await prepareHighResImageForOutOfBand(im.buf, im.mimeType);
             const ext = extForImageMime(prepared.mimeType);
             const imgTag = incremental ? `_${crypto.randomUUID().slice(0, 4)}` : "";
             const filename = `user_image_${String(idx + 1).padStart(3, "0")}${imgTag}.${ext}`;
@@ -202,7 +206,7 @@ export async function buildPromptAndAttachmentsForTurn(
           if (isWeb && /\((?:inner\s+)?(?:404|405)\)/i.test(errMsg)) {
             uploadedHighRes = false;
           } else {
-            throw mapAttachmentUploadError(imgErr, "Failed to upload image attachment(s) to AWS Quick");
+            throw mapAttachmentUploadError(imgErr, "Failed to upload image attachment(s) to AWS Quick", turn.signal);
           }
         }
       }
@@ -218,11 +222,6 @@ export async function buildPromptAndAttachmentsForTurn(
     return imgResults;
   };
 
-  const [filesRes, imgsRes] = await Promise.all([processFilesPhase(), processImagesPhase()]);
-  atts.push(...filesRes.fileAtts, ...imgsRes);
-  uploadedFileNames.push(...filesRes.uploadedNames);
-  inlineDocTexts.push(...filesRes.inlineDocs);
-
   const omissionBanner =
     omittedImages > 0 || omittedFiles > 0
       ? `[Note: ${[
@@ -232,6 +231,75 @@ export async function buildPromptAndAttachmentsForTurn(
         .filter(Boolean)
         .join(" and ")} from prior turns were omitted during cold replay to fit per-turn attachment limits; the most recent attachments are included.]`
       : "";
+
+  // Co-schedule oversized `.txt` OOB upload in the SAME `Promise.all` as images/files whenever
+  // we can determine the exact final prompt text up front (saves 1.5s-4s direct / 4s-10s proxy!).
+  const canPreUploadOobText =
+    Boolean(reqAttCache) &&
+    ((isOAuthAccount && Boolean(oauthCred)) || (isWeb && Boolean(webCred))) &&
+    (sourceImages.length > 0 || (sourceFiles.length > 0 && isOAuthAccount));
+
+  let preResolvedOAuthFiles: Awaited<ReturnType<typeof resolveNormalizedFiles>> | undefined;
+  let preUploadOobPromise: Promise<void> | undefined;
+  if (canPreUploadOobText) {
+    let predictableFileBanner = "";
+    let promptPredictable = sourceFiles.length === 0;
+    if (sourceFiles.length > 0 && isOAuthAccount && oauthCred) {
+      preResolvedOAuthFiles = reqAttCache
+        ? await reqAttCache.getOrResolveFiles(`files:${cacheScope}`, sourceFiles, (items) =>
+          resolveNormalizedFiles(items, turn.signal),
+        )
+        : await resolveNormalizedFiles(sourceFiles, turn.signal);
+      if (preResolvedOAuthFiles.length > 0) {
+        predictableFileBanner = `[Attached file(s) in workspace: ${preResolvedOAuthFiles.map((f) => `\`${f.filename}\``).join(", ")}. Read the attached file(s) to answer the user's request.]`;
+      }
+      promptPredictable = true;
+    }
+    if (promptPredictable) {
+      const predictedCombined = [omissionBanner, predictableFileBanner, rawPromptText?.trim() || ""]
+        .filter(Boolean)
+        .join("\n\n");
+      const predictedPromptJsonBytes = jsonStringUtf8Bytes(predictedCombined);
+      const predictedTotalBytes = predictedPromptJsonBytes + jsonStringUtf8Bytes(customPrompt || "");
+      const baseSafeSingleFrame = Math.max(4_096, MAX_WS_PAYLOAD_UTF8_BYTES - WS_FRAME_ENVELOPE_MARGIN_BYTES);
+      if (predictedTotalBytes > baseSafeSingleFrame && predictedPromptJsonBytes > 2_048) {
+        const suffix = incremental ? `_${crypto.randomUUID().slice(0, 4)}` : "";
+        const fileName = `conversation_context_${threadId.slice(0, 8)}${suffix}.txt`;
+        const promptBytes = Buffer.from(predictedCombined, "utf8");
+        const uploadTimeoutSignal = turn.signal
+          ? AbortSignal.any([turn.signal, AbortSignal.timeout(65_000)])
+          : AbortSignal.timeout(65_000);
+        const doTextUpload = () =>
+          isOAuthAccount && oauthCred
+            ? uploadOAuthTextAttachment(oauthCred, threadId, fileName, predictedCombined, effectiveProxy, uploadTimeoutSignal)
+            : uploadWebBinaryAttachment(
+              webCred!,
+              promptBytes,
+              fileName,
+              "text/plain",
+              threadId,
+              effectiveProxy,
+              uploadTimeoutSignal,
+            );
+        // Best-effort speculative warm into `reqAttCache`: `finalizePromptChunksAndOutOfBandText`
+        // adopts the exact cached upload in 0ms; errors are deferred to finalize so normal fallback runs.
+        preUploadOobPromise = reqAttCache!
+          .getOrUploadAttachment(slotId, threadId, promptBytes, doTextUpload)
+          .then(() => undefined)
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  const [filesRes, imgsRes] = await Promise.all([
+    processFilesPhase(),
+    processImagesPhase(),
+    ...(preUploadOobPromise ? [preUploadOobPromise] : []),
+  ]);
+  atts.push(...filesRes.fileAtts, ...imgsRes);
+  uploadedFileNames.push(...filesRes.uploadedNames);
+  inlineDocTexts.push(...filesRes.inlineDocs);
+
   const fileBanner =
     uploadedFileNames.length > 0
       ? `[Attached file(s) in workspace: ${uploadedFileNames.map((n) => `\`${n}\``).join(", ")}. Read the attached file(s) to answer the user's request.]`
@@ -393,7 +461,7 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
       } catch (uploadErr) {
         const errMsg = uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
         if (!(isWeb && /\((?:inner\s+)?(?:404|405)\)/i.test(errMsg))) {
-          throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick");
+          throw mapAttachmentUploadError(uploadErr, "Failed to upload oversized context attachment to AWS Quick", turn.signal);
         }
       }
     }

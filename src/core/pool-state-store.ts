@@ -5,9 +5,11 @@ import path from "node:path";
 import { mirrorPoolConfigToEnvFileAsync, mirrorPoolConfigToEnvFileSyncBestEffort } from "./config.js";
 import {
   parseRoutedModelThinkingMode,
+  parseSanitizeClientSystemPromptMode,
   type AutoDisabledState,
   type LbStrategy,
   type RoutedModelThinkingMode,
+  type SanitizeClientSystemPromptMode,
 } from "./types.js";
 
 export const POOL_STATE_FILENAME = "pool-state.json";
@@ -45,7 +47,7 @@ export interface PersistedPoolState {
   incognitoMode: boolean;
   autoEnsureCodingAgent: boolean;
   customAgentPrompt: string;
-  sanitizeClientSystemPrompt?: boolean;
+  sanitizeClientSystemPrompt?: SanitizeClientSystemPromptMode;
   showRoutedModelInThinking?: RoutedModelThinkingMode;
   autoRephraseOnContentFilter: boolean;
   contentFilterRephrasePrompt: string;
@@ -155,8 +157,7 @@ export function loadPoolStateFromDisk(stateFilePath: string): PersistedPoolState
       incognitoMode: typeof parsed.incognitoMode === "boolean" ? parsed.incognitoMode : true,
       autoEnsureCodingAgent: typeof parsed.autoEnsureCodingAgent === "boolean" ? parsed.autoEnsureCodingAgent : true,
       customAgentPrompt: typeof parsed.customAgentPrompt === "string" ? parsed.customAgentPrompt : "",
-      sanitizeClientSystemPrompt:
-        typeof parsed.sanitizeClientSystemPrompt === "boolean" ? parsed.sanitizeClientSystemPrompt : false,
+      sanitizeClientSystemPrompt: parseSanitizeClientSystemPromptMode(parsed.sanitizeClientSystemPrompt),
       ...(parsed.showRoutedModelInThinking !== undefined
         ? { showRoutedModelInThinking: parseRoutedModelThinkingMode(parsed.showRoutedModelInThinking) }
         : {}),

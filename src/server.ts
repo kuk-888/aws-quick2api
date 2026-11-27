@@ -52,8 +52,10 @@ export interface GatewayServerOptions {
   quotaHttpFetcher?: typeof fetch;
   sessionRpcFetcher?: typeof fetch;
   meFetcher?: NonNullable<Parameters<typeof fetchAllAccountQuotas>[1]>["meFetcher"];
-  /** Optional override for the 15s delayed SSE keepalive threshold (primarily for deterministic tests). */
+  /** Optional override for the 10s delayed post-dispatch SSE keepalive threshold (primarily for deterministic tests). */
   flushEarlyDelayMs?: number;
+  /** Optional override for the 25s post-lease max-wait SSE keepalive floor preventing 30s client/proxy 499s. */
+  flushEarlyMaxTotalWaitMs?: number;
   /** Optional callback triggered after a verified Web Console self-update/rollback requests process restart. */
   requestSelfUpdateRestart?: () => void;
   /** Optional custom fetch used by Web Console self-update downloads (primarily for tests). */
@@ -252,6 +254,7 @@ async function pipeSseStream(
   opts: {
     flushEarly?: boolean;
     flushEarlyDelayMs?: number;
+    flushEarlyMaxTotalWaitMs?: number;
     flushEarlyController?: {
       subscribe(cb: (armed: boolean) => void): () => void;
     };
@@ -296,30 +299,51 @@ async function pipeSseStream(
 
   let first: IteratorResult<string>;
   if (opts.flushEarly && opts.flushEarlyController) {
-    // Wait until OOB attachment uploads + WS dial complete (`armed = true`), then give upstream 15s
+    // Wait until OOB attachment uploads + WS dial complete (`armed = true`), then give upstream 10s
     // to emit the first chunk or return a real HTTP error (400/401/403/429/502). On account failover
-    // (`armed = false`), cancel any prior attempt's timer so the new attempt starts with a fresh 15s
-    // window. Only if upstream inference is genuinely slow (>15s) do we commit HTTP 200 + `: keepalive`.
-    const delayMs = Math.max(10, opts.flushEarlyDelayMs ?? 15_000);
+    // (`armed = false`), cancel the 10s post-dispatch timer so the new attempt starts fresh, while
+    // keeping a 25s post-lease total-wait floor so slow OOB/failover chains emit `: keepalive` before
+    // 30s/60s client or reverse-proxy timeouts abort with HTTP 499.
+    const delayMs = Math.max(10, opts.flushEarlyDelayMs ?? 10_000);
+    const maxTotalWaitMs = Math.max(delayMs, opts.flushEarlyMaxTotalWaitMs ?? 25_000);
     let settled = false;
     let delayedFlushTimer: NodeJS.Timeout | null = null;
-    const clearDelayedFlush = () => {
+    let maxTotalWaitTimer: NodeJS.Timeout | null = null;
+    const clearFlushTimers = () => {
       if (delayedFlushTimer) {
         clearTimeout(delayedFlushTimer);
         delayedFlushTimer = null;
       }
+      if (maxTotalWaitTimer) {
+        clearTimeout(maxTotalWaitTimer);
+        maxTotalWaitTimer = null;
+      }
     };
-    res.once("close", clearDelayedFlush);
+    const flushKeepAliveNow = () => {
+      if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
+        commitHeaders();
+        res.write(": keepalive\n\n");
+        startKeepAlive();
+      }
+    };
+    res.once("close", clearFlushTimers);
     const unsubscribe = opts.flushEarlyController.subscribe((armed) => {
-      clearDelayedFlush();
-      if (!armed || settled || headersCommitted || res.writableEnded || res.destroyed) return;
+      if (delayedFlushTimer) {
+        clearTimeout(delayedFlushTimer);
+        delayedFlushTimer = null;
+      }
+      if (settled || headersCommitted || res.writableEnded || res.destroyed) return;
+      if (!maxTotalWaitTimer && maxTotalWaitMs > 0) {
+        maxTotalWaitTimer = setTimeout(() => {
+          maxTotalWaitTimer = null;
+          flushKeepAliveNow();
+        }, maxTotalWaitMs);
+        maxTotalWaitTimer.unref?.();
+      }
+      if (!armed) return;
       delayedFlushTimer = setTimeout(() => {
         delayedFlushTimer = null;
-        if (!settled && !headersCommitted && !res.writableEnded && !res.destroyed) {
-          commitHeaders();
-          res.write(": keepalive\n\n");
-          startKeepAlive();
-        }
+        flushKeepAliveNow();
       }, delayMs);
       delayedFlushTimer.unref?.();
     });
@@ -328,13 +352,13 @@ async function pipeSseStream(
       first = await nextPromise;
       settled = true;
       unsubscribe();
-      clearDelayedFlush();
-      res.off("close", clearDelayedFlush);
+      clearFlushTimers();
+      res.off("close", clearFlushTimers);
     } catch (err) {
       settled = true;
       unsubscribe();
-      clearDelayedFlush();
-      res.off("close", clearDelayedFlush);
+      clearFlushTimers();
+      res.off("close", clearFlushTimers);
       if (keepAlive) clearInterval(keepAlive);
       if (headersCommitted) {
         if (!res.writableEnded && !res.destroyed) {
@@ -363,29 +387,30 @@ async function pipeSseStream(
     startKeepAlive();
   }
 
-  const write = async (frame: string): Promise<boolean> => {
-    if (res.writableEnded || res.destroyed) return false;
-    if (!res.write(frame)) {
-      // Resolve on drain OR close, otherwise a client that disconnects while we wait hangs forever.
-      await new Promise<void>((resolve) => {
-        const done = () => {
-          res.off("drain", done);
-          res.off("close", done);
-          resolve();
-        };
-        res.once("drain", done);
-        res.once("close", done);
-      });
-    }
-    return !(res.writableEnded || res.destroyed);
-  };
+  const waitDrainOrClose = (): Promise<void> =>
+    new Promise<void>((resolve) => {
+      const done = () => {
+        res.off("drain", done);
+        res.off("close", done);
+        resolve();
+      };
+      res.once("drain", done);
+      res.once("close", done);
+    });
 
   try {
     let step = first;
     while (!step.done) {
-      if (!(await write(step.value))) {
+      if (res.writableEnded || res.destroyed) {
         await iterator.return?.().catch(() => undefined);
         break;
+      }
+      if (!res.write(step.value)) {
+        await waitDrainOrClose();
+        if (res.writableEnded || res.destroyed) {
+          await iterator.return?.().catch(() => undefined);
+          break;
+        }
       }
       firstFrameSent = true;
       step = await iterator.next();
@@ -460,12 +485,13 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         };
       }),
   );
-  keyPool.setOnSlotInvalidated((slotId) => {
-    engine.invalidateWarmSessionsForSlot(slotId);
+  keyPool.setOnSlotInvalidated((slotId, opts) => {
+    engine.invalidateWarmSessionsForSlot(slotId, opts);
   });
   keyPool.setOnSlotRekeyed((oldSlotId, newSlotId) => {
     engine.rekeyWarmSessionsForSlot(oldSlotId, newSlotId);
   });
+  keyPool.setStandbyProbe((slotId) => engine.hasOpenStandbyForSlot(slotId, keyPool.getSettings().incognitoMode));
 
   /** Reject unknown base model ids with 404 before any account-pool / spend-guard logic runs. Does not touch pool scheduling state. */
   async function assertModelExists(requestedModel: string): Promise<void> {
@@ -473,6 +499,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
     if (!canonical) {
       throw new GatewayError(`Model '${requestedModel}' not found.`, 404, "model_not_found", "model");
     }
+    if (!options.modelListFetcher) return;
     const probeKey = keyPool.allManagedKeys().find((k) => k.enabled)?.rawKey;
     if (!probeKey) return;
     let catalog: Awaited<ReturnType<typeof listLiveModels>>;
@@ -657,12 +684,23 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
       if (adminSurface) {
         res.writeHead(204, SECURITY_HEADERS);
       } else {
+        const staticCorsHeaders =
+          "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, openai-project, x-session-id, session-id, x-conversation-id, openai-conversation-id, x-session-affinity, x-stainless-lang, x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method, http-referer, x-title, x-request-id";
+        const reqCorsHdrRaw = Array.isArray(req.headers["access-control-request-headers"])
+          ? req.headers["access-control-request-headers"].join(", ")
+          : String(req.headers["access-control-request-headers"] || "");
+        const sanitizedReqHdrs = reqCorsHdrRaw
+          .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+          .replace(/[^a-zA-Z0-9_,\-\s]/g, "")
+          .trim()
+          .slice(0, 1024);
         res.writeHead(204, {
           "access-control-allow-origin": "*",
           "access-control-expose-headers": "x-gateway-ignored-params, retry-after, x-quick-mode, x-quick-effort, x-quick-routed-model",
           "access-control-allow-methods": "GET, POST, OPTIONS",
-          "access-control-allow-headers":
-            "authorization, content-type, x-api-key, anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access, openai-beta, openai-organization, openai-project, x-session-id, session-id, x-conversation-id, openai-conversation-id, x-session-affinity, x-stainless-lang, x-stainless-package-version, x-stainless-os, x-stainless-arch, x-stainless-runtime, x-stainless-runtime-version, x-stainless-retry-count, x-stainless-timeout, x-stainless-helper-method",
+          "access-control-allow-headers": sanitizedReqHdrs || staticCorsHeaders,
+          "access-control-max-age": "86400",
+          ...(sanitizedReqHdrs ? { vary: "Access-Control-Request-Headers" } : {}),
           ...SECURITY_HEADERS
         });
       }
@@ -883,7 +921,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
             ...(routedModel ? { "x-quick-routed-model": routedModel } : {}),
           };
         };
-        let flushEarlyArmed = false;
+        let flushEarlyArmed: boolean | undefined;
         let flushEarlyListener: ((armed: boolean) => void) | null = null;
         const setFlushEarlyArmed = (armed: boolean) => {
           flushEarlyArmed = armed;
@@ -892,7 +930,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         const flushEarlyController = {
           subscribe(cb: (armed: boolean) => void) {
             flushEarlyListener = cb;
-            if (flushEarlyArmed) cb(true);
+            if (flushEarlyArmed !== undefined) cb(flushEarlyArmed);
             return () => {
               if (flushEarlyListener === cb) flushEarlyListener = null;
             };
@@ -932,14 +970,31 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         );
 
         if (turn.stream) {
-          const approxPayloadBytes =
-            Buffer.byteLength(turn.fullTranscriptText || "", "utf8") +
-            Buffer.byteLength(turn.systemPrompt || "", "utf8") +
-            (turn.tools.length > 0 ? Buffer.byteLength(JSON.stringify(turn.tools), "utf8") : 0);
-          const flushEarly =
-            keyPool.enabledKeyCount(clientAuth.accountGroup) > 0 &&
-            (approxPayloadBytes > SSE_EARLY_FLUSH_BYTES ||
-              (protocolEntry.tag === "anthropic-messages" && turn.tools.length > 0));
+          let flushEarly = false;
+          if (keyPool.enabledKeyCount(clientAuth.accountGroup) > 0) {
+            if (
+              (protocolEntry.tag === "anthropic-messages" && turn.tools.length > 0) ||
+              turn.images.length > 0 ||
+              (turn.files && turn.files.length > 0) ||
+              /(?:smart|think|max)/i.test(turn.requestedModel)
+            ) {
+              flushEarly = true;
+            } else {
+              const transcriptStr = turn.fullTranscriptText || "";
+              const sysStr = turn.systemPrompt || "";
+              // Fast UTF-16 length lower-bound avoids UTF-8 byte scans and `JSON.stringify(turn.tools)` on large payloads.
+              if (transcriptStr.length + sysStr.length > SSE_EARLY_FLUSH_BYTES) {
+                flushEarly = true;
+              } else {
+                const textBytes = Buffer.byteLength(transcriptStr, "utf8") + Buffer.byteLength(sysStr, "utf8");
+                if (textBytes > SSE_EARLY_FLUSH_BYTES) {
+                  flushEarly = true;
+                } else if (turn.tools.length > 0) {
+                  flushEarly = textBytes + Buffer.byteLength(JSON.stringify(turn.tools), "utf8") > SSE_EARLY_FLUSH_BYTES;
+                }
+              }
+            }
+          }
           await pipeSseStream(
             res,
             protocolAdapter.streamSse(events, turn),
@@ -951,6 +1006,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
                 ? {
                   flushEarlyController,
                   ...(options.flushEarlyDelayMs !== undefined ? { flushEarlyDelayMs: options.flushEarlyDelayMs } : {}),
+                  ...(options.flushEarlyMaxTotalWaitMs !== undefined
+                    ? { flushEarlyMaxTotalWaitMs: options.flushEarlyMaxTotalWaitMs }
+                    : {}),
                 }
                 : {}),
               ...(protocolEntry.tag === "anthropic-messages"
@@ -1198,9 +1256,10 @@ if (isMain) {
         lbStrategy: config.lbStrategy
       })
     );
-    // Non-blocking staggered standby WS + OAuth token pre-warm after listen.
+    // Non-blocking staggered standby WS + OAuth token pre-warm + auto-replenishment after listen.
     const standbyStartTimer = setTimeout(() => {
       instance.engine.warmStandbyPool(instance.keyPool);
+      instance.engine.startStandbyMaintenance(instance.keyPool);
     }, 1_500);
     standbyStartTimer.unref?.();
   });

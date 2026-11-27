@@ -22,6 +22,7 @@ import { normalizeAccountGroup, type PoolRoutingSettings, type UpstreamKeyPool }
 import {
   GatewayError,
   parseRoutedModelThinkingMode,
+  parseSanitizeClientSystemPromptMode,
   type GatewayConfig,
   type GatewayStreamEvent,
 } from "../core/types.js";
@@ -245,6 +246,7 @@ export async function tryHandleWebAdminRoute(
     sendJson(res, 200, {
       object: "gateway.overview",
       ...ctx.usageLedger.overview(range),
+      runtime: engine.runtimeStats(),
       ipRecorded: config.recordClientIp !== false,
       ...(persistenceError ? { storageWarning: persistenceError } : {}),
       groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
@@ -333,8 +335,33 @@ export async function tryHandleWebAdminRoute(
     if (typeof body.customAgentPrompt === "string") {
       patch.customAgentPrompt = body.customAgentPrompt;
     }
-    if (typeof body.sanitizeClientSystemPrompt === "boolean") {
-      patch.sanitizeClientSystemPrompt = body.sanitizeClientSystemPrompt;
+    if (body.sanitizeClientSystemPrompt !== undefined) {
+      if (typeof body.sanitizeClientSystemPrompt === "boolean") {
+        patch.sanitizeClientSystemPrompt = parseSanitizeClientSystemPromptMode(body.sanitizeClientSystemPrompt);
+      } else if (typeof body.sanitizeClientSystemPrompt === "string") {
+        const rawMode = body.sanitizeClientSystemPrompt.trim().toLowerCase();
+        if (
+          rawMode !== "false" &&
+          rawMode !== "off" &&
+          rawMode !== "true" &&
+          rawMode !== "sanitize" &&
+          rawMode !== "strip" &&
+          rawMode !== "drop"
+        ) {
+          throw new GatewayError(
+            "Invalid `sanitizeClientSystemPrompt` value (expected 'false', 'true', or 'strip').",
+            400,
+            "invalid_request_error",
+          );
+        }
+        patch.sanitizeClientSystemPrompt = parseSanitizeClientSystemPromptMode(rawMode);
+      } else {
+        throw new GatewayError(
+          "Invalid `sanitizeClientSystemPrompt` value (expected 'false', 'true', or 'strip').",
+          400,
+          "invalid_request_error",
+        );
+      }
     }
     if (body.showRoutedModelInThinking !== undefined) {
       if (typeof body.showRoutedModelInThinking === "boolean") {
@@ -387,11 +414,13 @@ export async function tryHandleWebAdminRoute(
     config.autoRephraseOnContentFilter = nextSettings.autoRephraseOnContentFilter;
     config.contentFilterRephrasePrompt = nextSettings.contentFilterRephrasePrompt;
     config.contentFilterRephraseModel = nextSettings.contentFilterRephraseModel;
-    if (
-      (prevSettings.chatAgentId || "") !== (nextSettings.chatAgentId || "") ||
-      prevSettings.incognitoMode !== nextSettings.incognitoMode
-    ) {
+    if (prevSettings.incognitoMode !== nextSettings.incognitoMode) {
       engine.invalidateWarmSessionsAll();
+    } else if (
+      (prevSettings.chatAgentId || "") !== (nextSettings.chatAgentId || "") ||
+      prevSettings.sanitizeClientSystemPrompt !== nextSettings.sanitizeClientSystemPrompt
+    ) {
+      engine.invalidateWarmSessionsAll({ keepStandby: true });
     }
     sendJson(res, 200, {
       ok: true,
@@ -1332,8 +1361,9 @@ export async function tryHandleWebAdminRoute(
     if (body.setAsDefault === true) {
       keyPool.updateSlotMeta(slotId, { chatAgentId: updated.agentId });
     }
-    // Always invalidate warm sessions for this slot so active threads pick up the newly published instructions/agentId immediately.
-    engine.invalidateWarmSessionsForSlot(slotId);
+    // Always invalidate warm sessions for this slot so active threads pick up the newly published instructions/agentId immediately
+    // while keeping healthy standby sockets open (`session_connect` does not bind `chat_agent_id`).
+    engine.invalidateWarmSessionsForSlot(slotId, { keepStandby: true });
     const agents = await engine.listChatAgentsForKey(target.rawKey, target.proxyUrl).catch(() => []);
     sendJson(res, 200, {
       ok: true,
@@ -1371,15 +1401,15 @@ export async function tryHandleWebAdminRoute(
         ...(body.clearCooldown === true ? { clearCooldown: true } : {})
       });
       const after = keyPool.allManagedKeys().find((k) => k.slotId === slotId);
-      if (
-        !before ||
-        !after ||
-        (before.chatAgentId || "") !== (after.chatAgentId || "") ||
-        (before.proxyUrl || "") !== (after.proxyUrl || "") ||
-        (before.group || "") !== (after.group || "") ||
-        (before.enabled && !after.enabled)
-      ) {
+      const proxyChanged = !before || !after || (before.proxyUrl || "") !== (after.proxyUrl || "");
+      const disabledNow = Boolean(before && after && before.enabled && !after.enabled);
+      if (proxyChanged || disabledNow) {
         engine.invalidateWarmSessionsForSlot(slotId);
+      } else if (
+        (before.chatAgentId || "") !== (after.chatAgentId || "") ||
+        (before.group || "") !== (after.group || "")
+      ) {
+        engine.invalidateWarmSessionsForSlot(slotId, { keepStandby: true });
       }
       sendJson(res, 200, {
         ok: true,

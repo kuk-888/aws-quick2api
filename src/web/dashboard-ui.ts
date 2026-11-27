@@ -316,7 +316,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     /* Segmented 1px Metric Strip */
     .metric-strip {
       display: grid;
-      grid-template-columns: repeat(4, 1fr);
+      grid-template-columns: repeat(5, 1fr);
       background: var(--border);
       gap: 1px;
       border: 1px solid var(--border);
@@ -325,7 +325,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       margin-bottom: 18px;
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
     }
-    @media (max-width: 900px) { .metric-strip { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 1120px) { .metric-strip { grid-template-columns: repeat(3, 1fr); } }
+    @media (max-width: 720px) { .metric-strip { grid-template-columns: repeat(2, 1fr); } }
     .metric-cell { background: var(--panel); padding: 15px 18px; }
     .metric-k { font-size: 12px; color: var(--fg-muted); margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
     .metric-v { font-size: 23px; font-weight: 600; letter-spacing: -0.025em; line-height: 1.2; font-variant-numeric: tabular-nums; }
@@ -535,6 +536,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .setting-row:last-child { border-bottom: none; }
     .setting-info h3 { font-size: 13px; font-weight: 500; margin-bottom: 2px; }
     .setting-info p { font-size: 12px; color: var(--fg-muted); max-width: 640px; }
+    .setting-hint {
+      margin-top: 6px; padding: 6px 10px; border-radius: 6px; max-width: 640px;
+      font-size: 11.5px; line-height: 1.5; color: var(--fg-secondary, var(--fg-muted));
+      background: var(--bg-subtle, rgba(127,127,127,0.06)); border: 1px solid var(--border);
+    }
 
     .switch { position: relative; display: inline-block; width: 34px; height: 19px; flex-shrink: 0; }
     .switch input { opacity: 0; width: 0; height: 0; }
@@ -1004,6 +1010,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               <div class="metric-v" id="mActiveKeys">0 / 0</div>
               <div class="metric-s" id="mInflightSub">活跃并发流: 0 · 自动熔断: 0</div>
             </div>
+            <div class="metric-cell" id="ovWarmPoolCard">
+              <div class="metric-k"><span>预热池 &amp; 热会话</span><span class="mono" id="ovStandbyTag">待命 0</span></div>
+              <div class="metric-v" id="ovWarmPoolVal">0 / 0</div>
+              <div class="metric-s" id="ovWarmPoolSub">预热待命 WS: 0 · 停泊热会话: 0</div>
+            </div>
           </div>
 
           <div class="ov-grid">
@@ -1347,31 +1358,31 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           <div class="panel-box">
             <div class="panel-hdr">
               <div>
-                <h2>多账号调度、亲和性与熔断策略</h2>
-                <p>修改后立即生效并自动持久化写回服务器 .env</p>
+                <h2>账号分配与防误拦策略</h2>
+                <p>修改后立即生效并自动保存，无需重启服务</p>
               </div>
-              <button class="btn-solid" id="saveRoutingBtn">保存路由配置</button>
+              <button class="btn-solid" id="saveRoutingBtn">保存配置</button>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>负载均衡算法 (Load Balancing Strategy)</h3>
-                <p>Quota-Aware 会综合检测账号剩余月度额度与短时限额，优先分配给余量充足且当前并发最少的健康账号。</p>
+                <h3>多账号分配方式 (Load Balancing)</h3>
+                <p>决定每次对话交给哪个账号处理。推荐「智能按余量分配」，自动挑额度最充足、当前最空闲的健康账号。</p>
               </div>
-              <select id="cfgLbStrategy" style="width:240px;min-width:240px;flex-shrink:0;">
-                <option value="quota-aware">Quota-Aware (余量感知 + 最少并发)</option>
-                <option value="least-busy">Least-Busy (最少活跃并发优先)</option>
-                <option value="round-robin">Round-Robin (均匀轮询)</option>
+              <select id="cfgLbStrategy" style="width:264px;min-width:264px;flex-shrink:0;" aria-label="多账号分配方式">
+                <option value="quota-aware">智能按余量分配（推荐 · 最空闲）</option>
+                <option value="least-busy">按空闲优先（谁最闲给谁）</option>
+                <option value="round-robin">依次轮流使用（均匀轮询）</option>
               </select>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>会话粘性亲和 (Sticky Session Affinity)</h3>
-                <p>开启后，同一对话窗口在有效期内始终锁定同一健康账号执行，防止跨号跳跃；若原账号耗尽或限流则自动漂移至健康账号。</p>
+                <h3>同一对话固定用同一账号 (Sticky Session)</h3>
+                <p>开启后，同一个聊天窗口在有效期内会一直用同一个账号续聊（响应更快、上下文不断层）；原账号没额度或限流时会自动换到其他健康账号。</p>
               </div>
               <div style="display:flex;align-items:center;gap:12px;">
-                <span style="font-size:12px;color:var(--fg-muted);">TTL(秒):</span>
+                <span style="font-size:12px;color:var(--fg-muted);">保留时长(秒):</span>
                 <input id="cfgAffinityTtl" type="number" min="60" max="86400" style="width:90px;" class="mono" />
                 <label class="switch"><input type="checkbox" id="cfgAffinityEnabled" /><span class="slider"></span></label>
               </div>
@@ -1379,24 +1390,24 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>额度耗尽 / 鉴权失效自动停用 (Auto-Disable on Exhaustion)</h3>
-                <p>当某个账号额度耗尽或返回 401 鉴权失效时，当场无缝切流至其他健康账号完成回复，并自动暂停该账号（周期重置后自动唤醒）。</p>
+                <h3>账号失效或没额度时自动跳过 (Auto-Disable)</h3>
+                <p>某个账号额度用完或登录过期时，当前对话会无感切到其他健康账号继续回答，同时自动暂停故障账号（等额度重置后会自动恢复）。</p>
               </div>
               <label class="switch"><input type="checkbox" id="cfgAutoDisable" /><span class="slider"></span></label>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>无痕隐私模式 (Incognito Privacy Mode)</h3>
-                <p>默认开启。使用 AWS Quick 官方原生无痕模式（incognito），不写入云端历史且不产生高频删会话请求；关闭后对话将保留在 AWS Quick 云端记录中，可随时在凭证页一键清理。</p>
+                <h3>无痕隐私模式（不留云端记录） (Incognito)</h3>
+                <p>默认开启。聊天内容不会保存到 AWS Quick 云端历史记录，隐私更安全；如果关闭，对话会留在云端，之后可在「凭证与额度池」一键清空。</p>
               </div>
               <label class="switch"><input type="checkbox" id="cfgIncognitoMode" checked /><span class="slider"></span></label>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>自动创建 / 绑定极简编程 Agent (AUTO_ENSURE_CODING_AGENT)</h3>
-                <p>默认开启。首次调用未绑定 Agent 的账号时自动创建并绑定极简编程 Agent，提升工具调用稳定性；支持自定义新建 Agent 的默认提示词模板。</p>
+                <h3>自动配置编程专用助手 (AUTO_ENSURE_CODING_AGENT)</h3>
+                <p>默认开启。首次使用新账号时自动创建并绑定轻量编程助手，让写代码和调用工具更稳定；点右侧可自定义默认提示词。</p>
               </div>
               <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
                 <span id="agentPromptStateBadge" class="badge" style="font-size:11px;">默认模板</span>
@@ -1407,33 +1418,38 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>思考块显示路由模型与思考程度 (SHOW_ROUTED_MODEL_IN_THINKING)</h3>
-                <p>默认开启（推荐）。仅在开启思考（effort≠off 或上游输出思考）时于思考块首行展示档位、思考程度及底层实际模型（routed= / routed≈），不污染纯文本 effort=off 响应；选「强制全显」则所有请求均显示。关闭后仍保留响应头与后台日志记录。</p>
+                <h3>在思考过程顶部显示实际模型 (SHOW_ROUTED_MODEL_IN_THINKING)</h3>
+                <p>默认开启（推荐）。开启深度思考时，会在思考内容第一行标出实际命中的底层模型和思考档位，方便核对有没有走错模型；普通不思考的对话不会额外插字。</p>
               </div>
-              <select id="cfgShowRoutedModel" style="width:240px;min-width:240px;flex-shrink:0;" aria-label="思考块显示路由模型">
-                <option value="true">默认显示 (true · 推荐)</option>
-                <option value="always">强制全显 (always)</option>
-                <option value="false">关闭 (false)</option>
+              <select id="cfgShowRoutedModel" style="width:264px;min-width:264px;flex-shrink:0;" aria-label="在思考过程顶部显示实际模型">
+                <option value="true">仅思考时显示（默认 · 推荐）</option>
+                <option value="always">每次对话都显示（强制全显）</option>
+                <option value="false">不显示（仅后台日志记录）</option>
               </select>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)</h3>
-                <p>默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 &lt;user_rules&gt;/&lt;system-reminder&gt; 转为中性标题（完整保留业务规则正文）。</p>
+                <h3>客户端系统提示词兼容模式 (SANITIZE_CLIENT_SYSTEM_PROMPT)</h3>
+                <p>接入 Claude Code、Cursor、Kilo、ZCode 等编程助手时，若频繁遇到误拦或拒绝调用工具，可在此切换兼容模式（普通对话保持默认即可）。</p>
+                <div id="sanitizeModeHint" class="setting-hint">当前效果：完整透传客户端原始指令，不做任何修改；普通聊天或未遇到误拦时选它最稳妥。</div>
               </div>
-              <label class="switch"><input type="checkbox" id="cfgSanitizeClientSystemPrompt" /><span class="slider"></span></label>
+              <select id="cfgSanitizeClientSystemPrompt" style="width:264px;min-width:264px;flex-shrink:0;" aria-label="客户端系统提示词兼容模式">
+                <option value="false">保持原样（默认 · 适合普通对话）</option>
+                <option value="true">智能兼容（推荐 · 防误拦且保留规则）</option>
+                <option value="strip">强力精简（抗误拦最强 · 仅保留工具）</option>
+              </select>
             </div>
 
             <div class="setting-row">
               <div class="setting-info">
-                <h3>内容过滤触发时自动重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)</h3>
-                <p>默认关闭。仅当上游返回 content_filtered 且未吐正文时，用辅助模型将敏感措辞改写为中性专业表达，并死守原模型重试 1 次（热会话优先走原生 edit_message 分支）。</p>
+                <h3>被误拦时自动换词重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)</h3>
+                <p>正常写代码却被安全审核误拦时，自动把提问里的敏感词换成中性技术表达，再用你选的原模型重新回答 1 次。仅改写当前最后一句，保留文件路径与代码原意，绝不偷偷降级换小模型（默认关闭）。</p>
               </div>
               <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end;">
-                <select id="cfgContentFilterRephraseModel" style="min-width:140px;display:none;" aria-label="重述辅助模型">
-                  <option value="quick-fast">quick-fast (推荐)</option>
-                  <option value="quick-balanced">quick-balanced</option>
+                <select id="cfgContentFilterRephraseModel" style="min-width:168px;display:none;" aria-label="换词辅助模型">
+                  <option value="quick-fast">quick-fast（更快 · 推荐）</option>
+                  <option value="quick-balanced">quick-balanced（更稳）</option>
                 </select>
                 <span id="rephrasePromptStateBadge" class="badge" style="font-size:11px;display:none;">默认模板</span>
                 <button type="button" class="btn-xs" id="editRephrasePromptBtn" style="display:none;">编辑模板</button>
@@ -1445,20 +1461,20 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           <div class="panel-box">
             <div class="panel-hdr">
               <div>
-                <h2>当前活跃粘性会话路由表</h2>
-                <p>展示会话指纹与上游账号的实时绑定关系</p>
+                <h2>当前固定绑定的活跃对话</h2>
+                <p>查看哪些对话窗口正在固定复用哪个账号，清空后会重新自由分配</p>
               </div>
-              <button id="clearAffinityBtn">清空亲和绑定</button>
+              <button id="clearAffinityBtn">清空绑定</button>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>会话指纹 (Conversation Key)</th>
-                    <th>锁定账号槽位</th>
-                    <th>亲和命中次数</th>
+                    <th>对话标识 (Conversation Key)</th>
+                    <th>绑定账号</th>
+                    <th>复用次数</th>
                     <th>最近活跃</th>
-                    <th>剩余有效期</th>
+                    <th>剩余时间</th>
                   </tr>
                 </thead>
                 <tbody id="affinityTableBody"></tbody>
@@ -1937,14 +1953,14 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "对齐 CPA 生产级路由机制，修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist to .env",
       "保存路由配置": "Save Routing",
       "内容过滤触发时自动防御性重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto Defensive Rephrase on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
-      "思考块显示路由模型与思考程度 (SHOW_ROUTED_MODEL_IN_THINKING)": "Show Routed Model & Effort in Thinking Header (SHOW_ROUTED_MODEL_IN_THINKING)",
-      "思考块显示路由模型": "Show Routed Model in Thinking Header",
+      "在思考过程顶部显示实际模型 (SHOW_ROUTED_MODEL_IN_THINKING)": "Show Actual Model in Thinking Header (SHOW_ROUTED_MODEL_IN_THINKING)",
+      "在思考过程顶部显示实际模型": "Show Actual Model in Thinking Header",
       "搜邮箱 / 备注 / 分组 / 代理...": "Search email / note / group / proxy...",
       "输入新分组名称，例如：研发一组 / team-a / vip": "Enter new group name, e.g. team-a / vip",
-      "默认开启（推荐）。仅在开启思考（effort≠off 或上游输出思考）时于思考块首行展示档位、思考程度及底层实际模型（routed= / routed≈），不污染纯文本 effort=off 响应；选「强制全显」则所有请求均显示。关闭后仍保留响应头与后台日志记录。": "On by default (recommended). Shows mode, effort, and live observed upstream model (routed= / routed≈) on line 1 of thinking blocks only when thinking is active (effort != off or upstream emits thinking), keeping plain effort=off replies clean; choose Always to show on every turn. HTTP response headers and trace logs always remain enabled.",
-      "默认显示 (true · 推荐)": "Default On (true · Recommended)",
-      "强制全显 (always)": "Force Always (always)",
-      "关闭 (false)": "Off (false)",
+      "默认开启（推荐）。开启深度思考时，会在思考内容第一行标出实际命中的底层模型和思考档位，方便核对有没有走错模型；普通不思考的对话不会额外插字。": "On by default (recommended). When thinking is enabled, shows the actual upstream model and effort on line 1 of the thinking block without touching plain non-thinking replies.",
+      "仅思考时显示（默认 · 推荐）": "Thinking Only (Default · Recommended)",
+      "每次对话都显示（强制全显）": "Show Every Turn (Always)",
+      "不显示（仅后台日志记录）": "Off (Logs Only)",
       "分组管理": "Manage Groups",
       "全部分组": "All Groups",
       "未分组": "Ungrouped",
@@ -1955,8 +1971,12 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "绑定账号分组（留空 = 全局号池）": "Bound Account Group (Blank = Global Pool)",
       "全局号池（不限制分组）": "Global Pool (Unrestricted)",
       "严格号池隔离：仅调度组内账号，组内全不可用时直接返回 503/429，绝不跨组或回退全局池。": "Strict pool isolation: schedules only accounts in this group; returns 503/429 when unavailable and never falls back to global pool.",
-      "深度净化客户端框架 System Prompt (SANITIZE_CLIENT_SYSTEM_PROMPT)": "Deep-Sanitize Heavy Client Framework System Prompts (SANITIZE_CLIENT_SYSTEM_PROMPT)",
-      "默认关闭（用户自定义 system 提示词 100% 原样透传）。使用 Claude Code / Cursor / Kilo / Antigravity / ZCode 等重型 Agent 客户端遇 smart 频繁误拦或拒调本地工具时建议开启：自动柔化冲突身份声明、剥离客户端内置安全样板词并将 <user_rules>/<system-reminder> 转为中性标题（完整保留业务规则正文）。": "Off by default (user-supplied system prompts pass through untouched). Recommended when heavy agent IDEs (Claude Code, Cursor, Kilo, Antigravity, ZCode) hit false-positive smart blocks or refuse local tool calls: softens conflicting AI identities, strips IDE anti-bypass boilerplate, and unwraps <user_rules>/<system-reminder> tags while preserving all workspace rule content.",
+      "客户端系统提示词兼容模式 (SANITIZE_CLIENT_SYSTEM_PROMPT)": "Client System Prompt Compatibility (SANITIZE_CLIENT_SYSTEM_PROMPT)",
+      "客户端系统提示词兼容模式": "Client System Prompt Compatibility",
+      "接入 Claude Code、Cursor、Kilo、ZCode 等编程助手时，若频繁遇到误拦或拒绝调用工具，可在此切换兼容模式（普通对话保持默认即可）。": "When using coding agents (Claude Code, Cursor, Kilo, ZCode), switch mode here if you hit false content-filter blocks or tool refusals (keep Default for normal chat).",
+      "保持原样（默认 · 适合普通对话）": "Keep Original (Default · Normal Chat)",
+      "智能兼容（推荐 · 防误拦且保留规则）": "Smart Compat (Recommended · Keep Rules)",
+      "强力精简（抗误拦最强 · 仅保留工具）": "Minimal Strip (Strongest · Tools Only)",
       "同步 Agent": "Sync Cloud Agents",
       "同步云端智能体": "Sync Cloud Agents",
       "智能体名称": "Agent Name",
@@ -2002,6 +2022,9 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "缓存读取占输入侧比例": "Cached reads as share of input",
       "可用账号": "Active Accounts",
       "活跃并发流: 0 · 自动熔断: 0": "In-flight: 0 · Auto-tripped: 0",
+      "预热池 & 热会话": "Warm & Standby Pool",
+      "待命 0": "Ready 0",
+      "预热待命 WS: 0 · 停泊热会话: 0": "Standby WS: 0 · Parked Warm: 0",
       "模型分布（按 Token）": "Model Breakdown (by Tokens)",
       "Token 趋势": "Token Trend",
       "2 步快速开始使用": "Quick Start in 2 Steps",
@@ -2097,27 +2120,32 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "所属扣费池": "Quota Pool",
       "支持调节参数": "Supported Params",
       "点击左侧菜单自动加载实时模型目录...": "Loading live model catalog...",
-      "多账号调度、亲和性与熔断策略": "Routing, Sticky Affinity & Circuit Breaker",
-      "对齐 CPA 生产级路由机制，修改后立即生效并自动持久化写回服务器 .env": "Changes take effect immediately and persist to .env",
-      "保存路由配置": "Save Routing",
-      "负载均衡算法 (Load Balancing Strategy)": "Load Balancing Strategy",
-      "Quota-Aware 会识别请求模型所属额度池（Session 池 vs Monthly 10h 池），优先分配给仍有余量且当前活跃并发最少的账号。": "Quota-Aware inspects the target pool (Session vs Monthly 10h) and picks the healthiest account with remaining quota and lowest concurrency.",
-      "Quota-Aware (余量感知 + 最少并发)": "Quota-Aware (Balance + Least Busy)",
-      "Least-Busy (最少活跃并发优先)": "Least-Busy (Lowest In-Flight)",
-      "Round-Robin (均匀轮询)": "Round-Robin",
-      "会话粘性亲和 (Sticky Session Affinity)": "Sticky Session Affinity",
-      "开启后，同一对话窗口在有效期内始终锁定同一健康账号执行，防止跨号跳跃；若原账号耗尽或限流则自动漂移至健康账号。": "Keeps multi-turn conversations pinned to the same healthy account within TTL; fails over automatically on exhaustion or 429.",
-      "TTL(秒):": "TTL (s):",
-      "账号没钱 / 鉴权失效自动熔断关停 (Auto-Disable on Exhaustion)": "Auto-Disable on Exhaustion / 401",
-      "当 A 账号返回额度耗尽、双池余量均归零或 401 失效时，当场无缝切流至 B 账号完成回复，并自动关停 A 账号（下个周期自动唤醒）。": "Fails over mid-request when an account runs out of quota or returns 401, and disables it until billing reset.",
-      "当前活跃粘性会话路由表": "Active Sticky Session Bindings",
-      "展示会话指纹与上游账号的实时绑定关系": "Live mapping between conversation hashes and upstream account slots",
-      "清空亲和绑定": "Clear Bindings",
-      "会话指纹 (Conversation Key)": "Conversation Key",
-      "锁定账号槽位": "Pinned Account Slot",
-      "亲和命中次数": "Affinity Hits",
+      "账号分配与防误拦策略": "Account Routing & Safety Policies",
+      "修改后立即生效并自动保存，无需重启服务": "Changes take effect immediately and save automatically",
+      "保存配置": "Save Settings",
+      "多账号分配方式 (Load Balancing)": "Account Distribution (Load Balancing)",
+      "多账号分配方式": "Account Distribution",
+      "决定每次对话交给哪个账号处理。推荐「智能按余量分配」，自动挑额度最充足、当前最空闲的健康账号。": "Controls which account handles each request. Smart Quota-Aware (recommended) picks the healthiest account with the most headroom and lowest concurrency.",
+      "智能按余量分配（推荐 · 最空闲）": "Smart Quota-Aware (Recommended)",
+      "按空闲优先（谁最闲给谁）": "Least Busy First",
+      "依次轮流使用（均匀轮询）": "Round-Robin",
+      "同一对话固定用同一账号 (Sticky Session)": "Pin Conversation to Same Account (Sticky Session)",
+      "开启后，同一个聊天窗口在有效期内会一直用同一个账号续聊（响应更快、上下文不断层）；原账号没额度或限流时会自动换到其他健康账号。": "Keeps the same chat window pinned to one healthy account within TTL for faster warm turns; fails over automatically on exhaustion or rate limits.",
+      "保留时长(秒):": "TTL (s):",
+      "账号失效或没额度时自动跳过 (Auto-Disable)": "Auto-Skip Exhausted or Expired Accounts",
+      "某个账号额度用完或登录过期时，当前对话会无感切到其他健康账号继续回答，同时自动暂停故障账号（等额度重置后会自动恢复）。": "Seamlessly fails over mid-request to another healthy account when an account runs out of quota or expires, and pauses it until reset.",
+      "无痕隐私模式（不留云端记录） (Incognito)": "Incognito Privacy Mode (No Cloud History)",
+      "默认开启。聊天内容不会保存到 AWS Quick 云端历史记录，隐私更安全；如果关闭，对话会留在云端，之后可在「凭证与额度池」一键清空。": "On by default. Keeps chats out of AWS Quick cloud history; when disabled, chats stay in cloud history until cleared from Credentials.",
+      "自动配置编程专用助手 (AUTO_ENSURE_CODING_AGENT)": "Auto-Configure Coding Assistant (AUTO_ENSURE_CODING_AGENT)",
+      "默认开启。首次使用新账号时自动创建并绑定轻量编程助手，让写代码和调用工具更稳定；点右侧可自定义默认提示词。": "On by default. Automatically creates and binds a lightweight coding assistant for new accounts to improve coding & tool-call reliability.",
+      "当前固定绑定的活跃对话": "Active Pinned Conversations",
+      "查看哪些对话窗口正在固定复用哪个账号，清空后会重新自由分配": "See which conversations are currently pinned to which account slots; clearing re-enables free routing",
+      "清空绑定": "Clear Bindings",
+      "对话标识 (Conversation Key)": "Conversation Key",
+      "绑定账号": "Pinned Account",
+      "复用次数": "Reuse Hits",
       "最近活跃": "Last Active",
-      "剩余有效期": "Remaining TTL",
+      "剩余时间": "Remaining TTL",
       "在线拨测台 (Live Request Tester)": "Live Request Playground",
       "发送测试消息后，可切到左侧「实时请求日志」查看该请求的执行模式、耗时与 token": "Send a test prompt, then inspect its execution mode, TTFT, and tokens in Request Logs",
       "发送测试": "Send Test",
@@ -2218,10 +2246,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "默认开启。首次调用未绑定 Agent 的账号时自动创建并绑定极简编程 Agent，提升工具调用稳定性；支持自定义新建 Agent 的默认提示词模板。": "On by default. Automatically creates and binds a minimal Coding Agent on first use to improve tool-call reliability; supports custom default instructions.",
       "默认模板": "Default",
       "编辑模板": "Edit Template",
-      "内容过滤触发时自动重述重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto-Rephrase Retry on Content Filter (AUTO_REPHRASE_ON_CONTENT_FILTER)",
-      "默认关闭。仅当上游返回 content_filtered 且未吐正文时，用辅助模型将敏感措辞改写为中性专业表达，并死守原模型重试 1 次（热会话优先走原生 edit_message 分支）。": "Off by default. Only when upstream returns content_filtered before emitting text, rephrases phrasing via a helper model and retries once on the exact same model.",
-      "quick-fast (推荐)": "quick-fast (Recommended)",
-      "重述辅助模型": "Rephrase Helper Model"
+      "被误拦时自动换词重试 (AUTO_REPHRASE_ON_CONTENT_FILTER)": "Auto-Rephrase Retry on False Block (AUTO_REPHRASE_ON_CONTENT_FILTER)",
+      "正常写代码却被安全审核误拦时，自动把提问里的敏感词换成中性技术表达，再用你选的原模型重新回答 1 次。仅改写当前最后一句，保留文件路径与代码原意，绝不偷偷降级换小模型（默认关闭）。": "Off by default. If a normal coding prompt gets blocked by content moderation, automatically rewrites only the latest user turn into neutral engineering phrasing—keeping file paths and intent—and retries once on your exact chosen model (never downgrades).",
+      "quick-fast（更快 · 推荐）": "quick-fast (Faster · Recommended)",
+      "quick-balanced（更稳）": "quick-balanced (Steadier)",
+      "换词辅助模型": "Rephrase Helper Model"
     };
 
 
@@ -2356,6 +2385,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       document.documentElement.lang = currentLang === "en" ? "en" : "zh-CN";
       applyDomI18n();
       if (typeof syncAllSelects === 'function') syncAllSelects();
+      if (typeof window.__syncPromptUiState === 'function') window.__syncPromptUiState();
       if ($("langToggleBtn")) $("langToggleBtn").querySelector(".tb-lbl").textContent = currentLang === "en" ? "EN" : "中文";
       if ($("loginLangBtn")) $("loginLangBtn").textContent = currentLang === "en" ? "中文" : "EN";
       if ($("pgPrompt") && ($("pgPrompt").value === "请先思考一下：为什么 0.1 + 0.2 在浮点数里不等于 0.3？用一句话总结。" || $("pgPrompt").value === "Briefly explain in one sentence why 0.1 + 0.2 !== 0.3 in floating-point arithmetic.")) {
@@ -2933,6 +2963,29 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       renderOvDist(lastOverviewData);
     };
 
+    function renderWarmPoolCard(runtime, pool) {
+      if (!$("ovWarmPoolVal")) return;
+      const rt = runtime || {};
+      const standby = Number(rt.standbyWs || 0);
+      const warmIdle = Number(rt.warmIdleSessions || 0);
+      const warmTracked = Number(rt.warmIncrementalSessions || 0);
+      const oauthEnabled = Array.isArray(pool)
+        ? pool.filter((s) => s.enabled && s.authType === "oauth").length
+        : 0;
+      const tag = $("ovStandbyTag");
+      if (tag) {
+        tag.textContent = oauthEnabled > 0
+          ? tr("待命 ", "Ready ") + standby + "/" + oauthEnabled
+          : tr("待命 ", "Ready ") + standby;
+        tag.style.color = standby > 0 ? "var(--ok)" : "var(--fg-muted)";
+      }
+      $("ovWarmPoolVal").textContent = standby + " / " + warmIdle;
+      $("ovWarmPoolSub").textContent =
+        tr("预热待命 WS: ", "Standby WS: ") + standby +
+        tr(" · 停泊热会话: ", " · Parked Warm: ") + warmIdle +
+        (warmTracked > warmIdle ? tr("（追踪 ", " (Tracked ") + warmTracked + tr("）", ")") : "");
+    }
+
     function renderOverview(o) {
       lastOverviewData = o;
       const t = o.totals || {};
@@ -2942,6 +2995,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("ovTok").innerHTML = tokSpan(t.totalTokens);
       $("ovTokSub").textContent = tr("输入 ", "In ") + fmtTok(t.inputTokens) + tr(" · 缓存 ", " · Cache ") + fmtTok(t.cacheReadTokens) + tr(" · 输出 ", " · Out ") + fmtTok(t.outputTokens);
       $("ovCache").textContent = (t.cacheHitRatePercent || 0) + "%";
+      if (o.runtime) renderWarmPoolCard(o.runtime, o.keyPool);
       renderOvDist(o);
       $("ovTrend").innerHTML = ovTrend(o.trend || [], o.bucketHours || 1);
       bindOvTrendHover(o.trend || [], o.bucketHours || 1);
@@ -3162,6 +3216,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("mStrategyTag").textContent = settings.lbStrategy || "quota-aware";
       $("mActiveKeys").textContent = enabledCount + " / " + pool.length;
       $("mInflightSub").textContent = tr("活跃并发流: ", "In-flight: ") + inflight + tr(" · 自动熔断: ", " · Auto-tripped: ") + autoTripped;
+      if (data.runtime) renderWarmPoolCard(data.runtime, pool);
 
       const onlinePool = pool.filter((s) => s.enabled).sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0));
       const ovLimit = 3;
@@ -3202,7 +3257,14 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         syncSelectUi($("cfgShowRoutedModel"));
       }
       if ($("cfgSanitizeClientSystemPrompt")) {
-        $("cfgSanitizeClientSystemPrompt").checked = settings.sanitizeClientSystemPrompt === true;
+        const sVal =
+          settings.sanitizeClientSystemPrompt === true
+            ? "true"
+            : settings.sanitizeClientSystemPrompt === false || !settings.sanitizeClientSystemPrompt
+              ? "false"
+              : String(settings.sanitizeClientSystemPrompt);
+        $("cfgSanitizeClientSystemPrompt").value = sVal;
+        syncSelectUi($("cfgSanitizeClientSystemPrompt"));
       }
       const rephraseOn = settings.autoRephraseOnContentFilter === true;
       if ($("cfgAutoRephraseOnContentFilter")) {
@@ -5804,7 +5866,31 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    window.__syncSanitizeModeHint = () => {
+      const hintEl = $("sanitizeModeHint");
+      const selEl = $("cfgSanitizeClientSystemPrompt");
+      if (!hintEl || !selEl) return;
+      const mode = selEl.value || "false";
+      if (mode === "true") {
+        hintEl.textContent = tr(
+          "当前效果：自动柔化容易触发审核的身份设定和标签，同时完整保留 CLAUDE.md / AGENTS.md 等项目规则，编程助手首选。",
+          "Active effect: Softens conflicting agent identity & XML wrappers while keeping CLAUDE.md / AGENTS.md project rules intact. Best choice for coding IDEs."
+        );
+      } else if (mode === "strip") {
+        hintEl.textContent = tr(
+          "当前效果：丢弃客户端自带的长篇系统说明，仅保留工具定义和输出格式；频繁被误拦时的兜底方案，但会忽略 CLAUDE.md 等自定义规则。",
+          "Active effect: Drops long client system instructions and keeps only tool definitions & output format. Strongest anti-block fallback, but ignores CLAUDE.md / AGENTS.md."
+        );
+      } else {
+        hintEl.textContent = tr(
+          "当前效果：完整透传客户端原始指令，不做任何修改；普通聊天或未遇到误拦时选它最稳妥。",
+          "Active effect: Passes client system instructions through untouched. Safest default for general chat or when you are not seeing false blocks."
+        );
+      }
+    };
+
     window.__syncPromptUiState = () => {
+      window.__syncSanitizeModeHint();
       const hasCustomAgent = !!(window.__activeCustomAgentPrompt && window.__activeCustomAgentPrompt.trim() && window.__activeCustomAgentPrompt.trim() !== (window.__defaultCustomAgentPrompt || "").trim());
       if ($("agentPromptStateBadge")) {
         $("agentPromptStateBadge").textContent = hasCustomAgent ? tr("已自定义", "Custom") : tr("默认模板", "Default");
@@ -5834,10 +5920,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const curVal = isAgent ? (window.__activeCustomAgentPrompt || "") : (window.__activeContentFilterRephrasePrompt || "");
       $("promptEditorTitle").textContent = isAgent
         ? tr("编辑极简编程 Agent 默认模板", "Edit Coding Agent Default Prompt")
-        : tr("编辑内容过滤自动重述模板", "Edit Content-Filter Rephrase Prompt");
+        : tr("编辑「被误拦时自动换词」提示词模板", "Edit Auto-Rephrase Prompt Template");
       $("promptEditorDesc").textContent = isAgent
         ? tr("新建或自动创建自定义 Agent 时写入的默认指令（留空或恢复默认将使用内置模板）。", "Default instruction written when creating a new Coding Agent (blank or reset uses built-in).")
-        : tr("仅在触发上游 content_filtered 时用于中性改写提问本身，不改变用户原意也不替代主模型。", "Used only to neutrally rephrase blocked prompts without changing user intent or downgrading the main model.");
+        : tr("仅在请求被安全审核误拦时，用于把最后一句提问改写得更中性；不会替你直接作答，也不会替换原本的主模型（留空或恢复默认即使用内置模板）。", "Used only to neutrally rewrite the final user turn when blocked by moderation—never answers the question itself and never downgrades your main model (blank or Reset uses built-in).");
       $("promptEditorTextarea").value = curVal.trim() || defVal;
       $("promptEditorModal").classList.add("open");
     }
@@ -5882,6 +5968,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         window.__syncPromptUiState();
       };
     }
+    if ($("cfgSanitizeClientSystemPrompt")) {
+      $("cfgSanitizeClientSystemPrompt").onchange = () => {
+        window.__syncSanitizeModeHint();
+      };
+    }
 
     $("saveRoutingBtn").onclick = async () => {
       try {
@@ -5904,8 +5995,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               ? $("cfgShowRoutedModel").value
               : "true",
             sanitizeClientSystemPrompt: $("cfgSanitizeClientSystemPrompt")
-              ? $("cfgSanitizeClientSystemPrompt").checked
-              : false,
+              ? $("cfgSanitizeClientSystemPrompt").value
+              : "false",
             autoRephraseOnContentFilter: $("cfgAutoRephraseOnContentFilter")
               ? $("cfgAutoRephraseOnContentFilter").checked
               : false,

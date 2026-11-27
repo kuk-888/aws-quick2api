@@ -193,11 +193,11 @@ docker compose pull && docker compose up -d
 | `AWS_QUICK_LOCALE` | `en-US` | 上行区域语言 |
 | `AWS_QUICK_APP_VERSION` | `1.2.4757` | 桌面端版本号请求头覆盖 |
 | `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` | - | 全局默认出口代理（兼容大小写与 `NO_PROXY`；单账号 `http://`/`https://`/`socks5://` 及简写代理可在管理台单独覆盖） |
-| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | 可选开关（管理台支持热切换，默认关闭以保证用户自定义 `system` 提示词 100% 原样透传）：重型 Agent 客户端（Claude Code / Cursor / Kilo / Antigravity / ZCode 等）遇 `smart` 频繁误拦或拒调本地工具时建议开启，自动柔化冲突身份声明与伪系统 XML 标签，完整保留业务规则正文 |
+| `SANITIZE_CLIENT_SYSTEM_PROMPT` | `false` | 三态策略（管理台支持热切换，默认 `false` 原样透传）：`false`（保持原样）、`true`（柔化冲突身份/伪系统标签，并折叠超长 `<skills>` 高敏摘要，保留完整工具与业务规则）、`strip`（重度剥离客户端 `system` 文本，仅保留 `<tool_call>` 协议与 JSON 结构化输出约束，解决重型 IDE 客户端误拦） |
 | `AUTO_REPHRASE_ON_CONTENT_FILTER` | `false` | 可选开关（管理台支持热切换）：开启后仅在收到上游 `content_filtered` 且未吐正文时，用辅助模型润色最后一句提问并死守原模型重试 1 次（热会话走原生 `edit_message` 分支） |
 | `CONTENT_FILTER_REPHRASE_PROMPT` | - | 防御性重述提示词模板（留空使用内置默认模板，可在管理台直接微调并一键恢复默认） |
 | `CONTENT_FILTER_REPHRASE_MODEL` | `quick-fast` | 仅用于短文本重述的辅助模型（`quick-fast` 或 `quick-balanced`），绝不替代最终回答模型 |
-| `WARM_SESSION_TTL_MS` / `MAX_WARM_SESSIONS` | `1800000` / `256` | 多轮增量热复用的会话缓存时长（30 分钟）与上限 |
+| `WARM_SESSION_TTL_MS` / `PARKED_WS_IDLE_TTL_MS` / `MAX_WARM_SESSIONS` | `3600000` / `3600000` / `256` | 单账号单 WS 16 路热会话复用缓存与空载保活时长（直连 OAuth 默认 60 分钟；走出口代理或 Web Cookie/Outpost 模式自动封顶 25 分钟以规避代理空闲断流） |
 | `UPDATE_CHECK_REPO` | `kuk-888/aws-quick2api` | 管理台新版本提示仓库（设为 `off` 关闭） |
 | `DISABLE_SELF_UPDATE` | `false` | 设为 `true` 可彻底禁用 Web 管理台一键热更新与回滚接口 |
 
@@ -206,8 +206,8 @@ docker compose pull && docker compose up -d
 ## 已知限制
 
 - **采样参数（`temperature` / `top_p` / `max_tokens` / `stop` / `seed`）**：上游不强制执行；网关兼容接收并通过响应头声明。
-- **`response_format`（`json_object` / `json_schema`）与 `n > 1`**：暂不支持，返回明确 `400` 错误。
-- **附件**：支持图片（PNG/JPG/WebP/GIF，单轮最多 10 张，超限返回明确 `400`）与 PDF/文档（Anthropic `document`、OpenAI Chat `file`、Responses `input_file`，单轮最多 5 份，超限返回明确 `400`）。OAuth 凭证下多图（≥2 张或 >20KB）与 PDF 等二进制文件直接走原生带外附件通道高清无损上传（单文件上限 10MB，上传失败显性报错不静默降级），非 OAuth 凭证或单张小图使用 `sharp` 等比压缩内联。暂不支持音频。
+- **`response_format` 与 `n > 1`**：已三协议兼容结构化 JSON 输出（OpenAI Chat `response_format`、`Responses` `text.format`、Anthropic `output_config.format` 均以软约束桥接至上游，不返回 `400`）；`n > 1` 暂不支持，返回明确 `400` 错误。
+- **附件**：支持图片（PNG/JPG/WebP/GIF，单轮最多 10 张，超限返回明确 `400`）与 PDF/文档（Anthropic `document`、OpenAI Chat `file`、Responses `input_file`，单轮最多 5 份，超限返回明确 `400`）。OAuth 与 Web Cookie 凭证下多图（≥2 张或 >20KB）与 PDF 等二进制文件直接走原生带外附件通道高清无损上传（单文件上限 10MB，上传失败显性报错不静默降级），其他凭证或单张小图使用 `sharp` 等比压缩内联。暂不支持音频。
 - **非对话接口**：不支持 Embeddings、文生图、TTS 与 Whisper。
 
 ---

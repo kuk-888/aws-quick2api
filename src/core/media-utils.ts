@@ -68,10 +68,10 @@ export function buildOutOfBandContextPrompt(
   const totalChars = fullPrompt.length;
   const label = isIncremental ? "full incremental context" : "full conversation/context";
   if (maxInlineChars <= 0) {
-    return `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`. Inspect \`${filename}\` in a single targeted search/read without narrating the file read, then respond directly.]`;
+    return `[The ${label} (${totalChars.toLocaleString()} chars) is attached as an AWS Quick cloud workspace file \`${filename}\` (NOT a local file on the user's machine; never call client \`<tool_call>\` tools to read \`${filename}\`). Inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
   }
 
-  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached in \`${filename}\`, with the latest request and recent context excerpted below. Answer directly if the excerpt below already has everything needed; if earlier details, code, or facts are missing or referenced, inspect \`${filename}\` in a single targeted search/read without narrating the file read, then respond directly.]`;
+  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached as an AWS Quick cloud workspace file \`${filename}\` (NOT a local file on the user's machine; never call client \`<tool_call>\` tools to read \`${filename}\`), with the latest request and recent context excerpted below. Answer directly if the excerpt below already has everything needed; if earlier details, code, or facts are missing or referenced, inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
 
   if (totalChars <= maxInlineChars) {
     return [header, "", fullPrompt.trim()].join("\n");
@@ -141,12 +141,16 @@ async function compressImageForQuickFrame(
   mimeType: string,
   maxBase64Chars: number,
 ): Promise<{ buf: Buffer; mimeType: string; base64: string }> {
-  const origBase64 = buf.toString("base64");
-  if (origBase64.length <= maxBase64Chars) {
-    return { buf, mimeType, base64: origBase64 };
+  const maxRawBytes = Math.floor(maxBase64Chars / 4) * 3;
+  if (buf.byteLength <= maxRawBytes) {
+    const origBase64 = buf.toString("base64");
+    if (origBase64.length <= maxBase64Chars) {
+      return { buf, mimeType, base64: origBase64 };
+    }
   }
 
-  // Progressive downscale + JPEG re-encode ladder (fast ~15-30ms via sharp/libvips)
+  // Binary search the progressive downscale + JPEG ladder (<=3 sharp passes instead of up to 7)
+  // to pick the highest-quality step that fits inside the 50KB single-frame budget.
   const steps: Array<[number, number]> = [
     [1280, 72],
     [1024, 64],
@@ -157,29 +161,59 @@ async function compressImageForQuickFrame(
     [320, 28],
   ];
 
-  let smallest: Buffer | null = null;
-  for (const [maxDim, quality] of steps) {
+  const encodeStep = async (idx: number): Promise<Buffer | null> => {
+    const [maxDim, quality] = steps[idx]!;
     try {
-      const candidate = await sharp(buf, { failOn: "none" })
+      return await sharp(buf, { failOn: "none" })
         .rotate()
         .resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true })
         .flatten({ background: { r: 255, g: 255, b: 255 } })
         .jpeg({ quality, mozjpeg: true })
         .toBuffer();
-      if (!smallest || candidate.byteLength < smallest.byteLength) {
-        smallest = candidate;
-      }
-      const b64 = candidate.toString("base64");
-      if (b64.length <= maxBase64Chars) {
-        return { buf: candidate, mimeType: "image/jpeg", base64: b64 };
-      }
     } catch {
-      break;
+      return null;
+    }
+  };
+
+  let lo = 0;
+  let hi = steps.length - 1;
+  let bestFit: Buffer | null = null;
+  let smallest: Buffer | null = null;
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const candidate = await encodeStep(mid);
+    if (!candidate) break;
+    if (!smallest || candidate.byteLength < smallest.byteLength) {
+      smallest = candidate;
+    }
+    if (candidate.byteLength <= maxRawBytes) {
+      bestFit = candidate;
+      hi = mid - 1; // Try higher quality / resolution
+    } else {
+      lo = mid + 1; // Need smaller size
     }
   }
 
-  if (smallest && smallest.toString("base64").length <= maxBase64Chars + 4_000) {
-    return { buf: smallest, mimeType: "image/jpeg", base64: smallest.toString("base64") };
+  if (bestFit) {
+    const b64 = bestFit.toString("base64");
+    if (b64.length <= maxBase64Chars) {
+      return { buf: bestFit, mimeType: "image/jpeg", base64: b64 };
+    }
+  }
+
+  if (!smallest || smallest.byteLength > maxRawBytes) {
+    const lastCandidate = await encodeStep(steps.length - 1);
+    if (lastCandidate && (!smallest || lastCandidate.byteLength < smallest.byteLength)) {
+      smallest = lastCandidate;
+    }
+  }
+
+  if (smallest) {
+    const b64 = smallest.toString("base64");
+    if (b64.length <= maxBase64Chars + 4_000) {
+      return { buf: smallest, mimeType: "image/jpeg", base64: b64 };
+    }
   }
 
   throw new GatewayError(
@@ -251,8 +285,8 @@ export async function resolveRawImagePayloads(
         if (!ct || !ct.startsWith("image/")) {
           throw new GatewayError("Remote image URL did not return an image/* Content-Type.", 400, "invalid_image_type");
         }
-        mimeType = ct;
-        rawBase64 = buf.toString("base64");
+        if (buf.byteLength === 0) return null;
+        return { buf, mimeType: ct };
       } else {
         return null;
       }
@@ -285,7 +319,9 @@ export async function prepareHighResImageForOutOfBand(
     }
   }
   try {
-    const outBuf = await sharp(buf, { failOn: "none" })
+    // Standard libjpeg-turbo q=92 is ~8x faster than mozjpeg on 4K WebP/PNG while visually identical;
+    // fall back to mozjpeg only if the encoded output still exceeds MAX_HIGHRES_RAW_BYTES (8MB).
+    let outBuf = await sharp(buf, { failOn: "none" })
       .rotate()
       .resize({
         width: MAX_HIGHRES_IMAGE_DIMENSION,
@@ -294,8 +330,21 @@ export async function prepareHighResImageForOutOfBand(
         withoutEnlargement: true,
       })
       .flatten({ background: { r: 255, g: 255, b: 255 } })
-      .jpeg({ quality: 92, mozjpeg: true })
+      .jpeg({ quality: 92 })
       .toBuffer();
+    if (outBuf.byteLength > MAX_HIGHRES_RAW_BYTES) {
+      outBuf = await sharp(buf, { failOn: "none" })
+        .rotate()
+        .resize({
+          width: MAX_HIGHRES_IMAGE_DIMENSION,
+          height: MAX_HIGHRES_IMAGE_DIMENSION,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .flatten({ background: { r: 255, g: 255, b: 255 } })
+        .jpeg({ quality: 88, mozjpeg: true })
+        .toBuffer();
+    }
     return { buf: outBuf, mimeType: "image/jpeg" };
   } catch {
     if (OAUTH_DIRECT_IMAGE_MIMES.has(normMime)) {
@@ -382,13 +431,25 @@ export async function buildQuickImageAttachments(
   return compressResolvedImagesForQuickFrame(resolved, totalBase64Budget);
 }
 
-export function mapAttachmentUploadError(err: unknown, contextLabel: string): GatewayError {
+export function mapAttachmentUploadError(
+  err: unknown,
+  contextLabel: string,
+  clientSignal?: AbortSignal,
+): GatewayError {
   if (err instanceof GatewayError) return err;
-  if (
-    err instanceof Error &&
-    (err.name === "AbortError" || /this operation was aborted|the operation was aborted/i.test(err.message))
-  ) {
+  if (clientSignal?.aborted) {
     return new GatewayError("Request aborted by client.", 499, "client_aborted");
+  }
+  if (err instanceof Error) {
+    const isTimeoutAbort =
+      err.name === "TimeoutError" ||
+      /aborted due to timeout|timed out/i.test(err.message);
+    if (isTimeoutAbort) {
+      return new GatewayError(`${contextLabel}: ${redactSecrets(err.message || "timed out")}`, 504, "timeout_error");
+    }
+    if (err.name === "AbortError" || /this operation was aborted|the operation was aborted/i.test(err.message)) {
+      return new GatewayError("Request aborted by client.", 499, "client_aborted");
+    }
   }
   const raw = err instanceof Error ? err.message : String(err || "unknown");
   const reason = redactSecrets(raw);
