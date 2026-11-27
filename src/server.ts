@@ -29,6 +29,7 @@ import {
 import { ClientGatewayKeyManager } from "./services/client-keys.js";
 import { ModelAccessController } from "./services/model-access.js";
 import {
+  contextWindowForModel,
   formatOpenAiModelList,
   listLiveModels,
   resolveKnownModelId,
@@ -182,12 +183,19 @@ function isAnthropicCaller(req: http.IncomingMessage): boolean {
   return Boolean(req.headers["anthropic-version"]) || (!req.headers.authorization && Boolean(req.headers["x-api-key"]));
 }
 
-function anthropicModelEntry(m: { id: string; name?: string; created?: number }): Record<string, unknown> {
+function anthropicModelEntry(m: {
+  id: string;
+  name?: string;
+  created?: number;
+  context_length?: number;
+  max_input_tokens?: number;
+}): Record<string, unknown> {
   return {
     type: "model",
     id: m.id,
     display_name: m.name || m.id,
-    created_at: new Date((m.created || 0) * 1000).toISOString()
+    created_at: new Date((m.created || 0) * 1000).toISOString(),
+    max_input_tokens: m.max_input_tokens ?? m.context_length ?? contextWindowForModel(m.id),
   };
 }
 
@@ -676,6 +684,7 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
   });
 
   const activeByClientKey = new Map<string, number>();
+  const activeByClientKeyIp = new Map<string, number>();
   const server = http.createServer({ maxHeaderSize: 16_384 }, async (req, res) => {
     const route = normalizeRoutePath(req.url);
     const adminSurface = isAdminSurfaceRoute(route, config.dashboardPath);
@@ -857,6 +866,26 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
         turn.scope = clientKeyId ?? "master";
         if (turn.conversationKey) turn.conversationKey = `${turn.scope}:${turn.conversationKey}`;
         const concurrencyLimit = clientKeyId ? clientKeys.concurrencyLimitFor(clientKeyId, config.clientKeyMaxConcurrent) : 0;
+        const perIpConcurrencyLimit = clientKeyId ? clientKeys.perIpConcurrencyLimitFor(clientKeyId) : 0;
+        const perIpBucketKey =
+          clientKeyId && perIpConcurrencyLimit > 0
+            ? `${clientKeyId}\0${clientIpOf(req, config.trustProxy) || "unknown"}`
+            : "";
+
+        // Atomic pre-checks before mutating any counter: 1) Per-IP concurrency -> 2) Key-wide concurrency.
+        if (perIpBucketKey) {
+          const activeIp = activeByClientKeyIp.get(perIpBucketKey) ?? 0;
+          if (activeIp >= perIpConcurrencyLimit) {
+            throw Object.assign(
+              new GatewayError(
+                `Too many concurrent requests from your IP for this API key (limit ${perIpConcurrencyLimit} per IP).`,
+                429,
+                "ip_concurrency_limit_exceeded"
+              ),
+              { retryAfter: 3 }
+            );
+          }
+        }
         if (clientKeyId && concurrencyLimit > 0) {
           const active = activeByClientKey.get(clientKeyId) ?? 0;
           if (active >= concurrencyLimit) {
@@ -869,18 +898,45 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
               { retryAfter: 2 }
             );
           }
-          activeByClientKey.set(clientKeyId, active + 1);
+        }
+
+        // Bail out before mutating concurrency counters if client already disconnected during body read.
+        if (res.closed || res.writableEnded || abortController.signal.aborted) {
+          return;
+        }
+
+        // Both gates passed — increment active counters atomically and guarantee release via BOTH
+        // socket lifecycle listeners AND `try ... finally` (eliminating early-disconnect counter leaks).
+        const trackKeyConc = Boolean(clientKeyId && concurrencyLimit > 0);
+        const trackIpConc = Boolean(perIpBucketKey);
+        if (trackKeyConc && clientKeyId) {
+          activeByClientKey.set(clientKeyId, (activeByClientKey.get(clientKeyId) ?? 0) + 1);
+        }
+        if (trackIpConc) {
+          activeByClientKeyIp.set(perIpBucketKey, (activeByClientKeyIp.get(perIpBucketKey) ?? 0) + 1);
+        }
+        let releaseConcurrency: (() => void) | undefined;
+        if (trackKeyConc || trackIpConc) {
           let released = false;
           const release = () => {
             if (released) return;
             released = true;
-            const n = (activeByClientKey.get(clientKeyId) ?? 1) - 1;
-            if (n <= 0) activeByClientKey.delete(clientKeyId);
-            else activeByClientKey.set(clientKeyId, n);
+            if (trackKeyConc && clientKeyId) {
+              const n = (activeByClientKey.get(clientKeyId) ?? 1) - 1;
+              if (n <= 0) activeByClientKey.delete(clientKeyId);
+              else activeByClientKey.set(clientKeyId, n);
+            }
+            if (trackIpConc) {
+              const n = (activeByClientKeyIp.get(perIpBucketKey) ?? 1) - 1;
+              if (n <= 0) activeByClientKeyIp.delete(perIpBucketKey);
+              else activeByClientKeyIp.set(perIpBucketKey, n);
+            }
           };
+          releaseConcurrency = release;
           res.once("close", release);
           res.once("finish", release);
         }
+        try {
         const ua = sanitizeUserAgent(req.headers["user-agent"]);
         const recordedIp = config.recordClientIp !== false ? clientIpOf(req, config.trustProxy) : "";
         const traceId = config.enableDashboard
@@ -1021,6 +1077,9 @@ export function createGatewayServer(options: GatewayServerOptions): GatewayServe
           sendJson(res, 200, json, { allowCors: true, extraHeaders: buildProtocolResponseHeaders() });
         }
         return;
+        } finally {
+          releaseConcurrency?.();
+        }
       }
 
       const allow = isModelsRoute

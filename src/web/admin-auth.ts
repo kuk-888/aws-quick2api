@@ -25,6 +25,9 @@ export function clientIpOf(
   const peer = req.socket?.remoteAddress || "unknown";
   const trusted = trustProxy === "all" || (trustProxy === "loopback" && isLoopbackAddress(peer));
   if (trusted) {
+    const cfIp = req.headers["cf-connecting-ip"];
+    const cfRaw = Array.isArray(cfIp) ? cfIp[0] : cfIp;
+    if (cfRaw?.trim()) return cfRaw.trim().slice(0, 64);
     const xff = req.headers["x-forwarded-for"];
     const raw = Array.isArray(xff) ? xff.join(",") : xff;
     if (raw) {

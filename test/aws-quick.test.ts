@@ -9305,10 +9305,13 @@ setInterval(() => {}, 10_000);
     assert.equal(mappedClientAbort.status, 499);
     assert.equal(mappedClientAbort.code, "client_aborted");
 
-    // 3. OOB `.txt` prompt forbids local `<tool_call>` reads + tool-bridge compactForCustomAgent & state machine fixes
-    const oobMsg = buildOutOfBandContextPrompt("x".repeat(5000), "conversation_context_1234.txt", 1000);
-    assert.ok(oobMsg.includes("AWS Quick cloud workspace file"));
-    assert.ok(oobMsg.includes("never call client `<tool_call>` tools"));
+    // 3. OOB `.txt` prompt separates archive from local repo without negative `<tool_call>` poison pill or explicit filename cue
+    const oobMsg = buildOutOfBandContextPrompt("x".repeat(5000), "conversation_context_1234.txt", 1000, false, undefined, true);
+    assert.ok(oobMsg.includes("Earlier transcript archive of this session"));
+    assert.ok(oobMsg.includes("Client tool reminder"));
+    assert.ok(!oobMsg.includes("conversation_context_1234.txt"), "client-tool OOB header must omit explicit filename affordance");
+    assert.ok(!oobMsg.includes("AWS Quick cloud workspace file"), "must not prime AWS Quick cloud workspace persona");
+    assert.ok(!oobMsg.includes("never call client `<tool_call>` tools"), "must not suppress client <tool_call> tools");
     const compactBridge = buildToolBridgePrompt(
       [{ name: "Read", description: "read file", inputSchema: { type: "object", properties: { path: { type: "string" } } } }],
       "auto",
@@ -9676,5 +9679,714 @@ setInterval(() => {}, 10_000);
       shortPool.disposeAll();
       await new Promise<void>((res) => wss.close(() => res()));
     }
+  });
+
+  it("v0.1.24: generic 3rd-party agent identity softening, quick-fast local tool priority, 1M /v1/models metadata & batch set-proxy", async () => {
+    const { deepSanitizeClientSystemPrompt } = await import("../src/core/tool-bridge.js");
+    const { DEFAULT_MODEL_CONTEXT_WINDOW } = await import("../src/services/model-catalog.js");
+    const { renderDashboardHtml } = await import("../src/web/dashboard-ui.js");
+
+    // 1) Generic third-party Agent identity softening (DeepSeek Harness + arbitrary future agent)
+    const dshPrompt = [
+      "You are an AI agent powered by DeepSeek Harness.",
+      "Always inspect files before editing.",
+    ].join("\n");
+    const softenedDsh = sanitizeClientSystemPromptForQuick(dshPrompt);
+    assert.ok(!/DeepSeek Harness/i.test(softenedDsh), "must soften DeepSeek Harness identity declaration");
+    assert.ok(softenedDsh.includes("Always inspect files before editing."), "must preserve technical instructions");
+
+    const futureAgentPrompt = [
+      "You are NovaCoder, an AI coding assistant running in the user's terminal.",
+      "You are an autonomous agent built by Acme Labs.",
+      "You are reviewing a Go PR for race conditions.",
+    ].join("\n");
+    const softenedFuture = sanitizeClientSystemPromptForQuick(futureAgentPrompt);
+    assert.ok(!/NovaCoder/i.test(softenedFuture), "must soften unknown brand-name AI agent identity");
+    assert.ok(!/built by Acme Labs/i.test(softenedFuture), "must soften generic 'built by' AI agent identity");
+    assert.ok(softenedFuture.includes("You are reviewing a Go PR for race conditions."), "must NOT alter normal task sentences");
+
+    const deepIdentity = deepSanitizeClientSystemPrompt(
+      "<identity>You are an AI coding assistant powered by DeepSeek Harness.</identity>\nUse strict types.",
+    );
+    assert.ok(!/DeepSeek Harness/i.test(deepIdentity), "deepSanitize must strip generic third-party <identity> blocks");
+    assert.ok(deepIdentity.includes("Use strict types."));
+
+    // 2) quick-fast local <tool_call> priority boost vs smart/balanced pure-positive preservation
+    const sampleTools = [
+      {
+        name: "write_file",
+        description: "Write content to a local file path",
+        inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } }, required: ["path", "content"] },
+      },
+    ];
+    const fastBridge = buildToolBridgePrompt(sampleTools, "auto", { preferLocalToolsStrictly: true });
+    assert.ok(fastBridge.includes("qw-file://workspace"), "quick-fast bridge must explicitly override cloud workspace artifacts");
+    assert.ok(fastBridge.includes("NEVER use built-in cloud workspace/sandbox"), "quick-fast bridge must boost local <tool_call> priority");
+
+    const smartBridge = buildToolBridgePrompt(sampleTools, "auto", { preferLocalToolsStrictly: false });
+    assert.ok(!smartBridge.includes("qw-file://workspace"), "quick-smart/balanced bridge must stay pure-positive without negative rules");
+    assert.ok(!smartBridge.includes("NEVER use built-in cloud workspace/sandbox"));
+
+    // 3) /v1/models accurate context window metadata (200K for quick-fast / Haiku, 1M for Sonnet/Opus/auto/advanced)
+    assert.equal(DEFAULT_MODEL_CONTEXT_WINDOW, 1_000_000);
+    const oaiList = formatOpenAiModelList(AWS_QUICK_MODELS);
+    assert.ok(oaiList.length > 0);
+    for (const item of oaiList) {
+      const expectedCtx = item.id === "quick-fast" ? 200_000 : 1_000_000;
+      assert.equal(item.context_length, expectedCtx, `${item.id} must expose context_length=${expectedCtx}`);
+      assert.equal(item.max_input_tokens, expectedCtx, `${item.id} must expose max_input_tokens=${expectedCtx}`);
+    }
+
+    // 4) Live local server check: /v1/models dual-protocol + POST /v1/admin/keys/batch action=set-proxy
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-v0124-"));
+    const adminPath = "/adm-v0124-test";
+    const tok = "sk-aq-test-real-token-v0124-9876543210";
+    const mkJwt = (id: number) => `host${id}.aws.dev|eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: `u${id}` })).toString("base64url")}.sig${id}`;
+    const cfg = loadConfigFromEnv({
+      HOST: "127.0.0.1",
+      PORT: "0",
+      GATEWAY_TOKEN: tok,
+      ADMIN_PASSWORD: "V0124TestPassword!",
+      ADMIN_PATH: adminPath,
+      QUICK_TOKENS: [mkJwt(1), mkJwt(2), mkJwt(3), mkJwt(4)].join(","),
+      DATA_DIR: tmpDir,
+      ENV_FILE_PATH: path.join(tmpDir, ".env"),
+      ENABLE_DASHBOARD: "true",
+    });
+    const gw = createGatewayServer({ config: cfg });
+    await new Promise<void>((res) => gw.server.listen(0, "127.0.0.1", res));
+    const port = (gw.server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      // OpenAI /v1/models
+      const oaiRes = await fetch(`${base}/v1/models`, { headers: { authorization: `Bearer ${tok}` } });
+      assert.equal(oaiRes.status, 200);
+      const oaiBody = (await oaiRes.json()) as { data: Array<{ id: string; context_length?: number; max_input_tokens?: number }> };
+      const smartEntry = oaiBody.data.find((m) => m.id === "quick-smart-think");
+      assert.equal(smartEntry?.context_length, 1_000_000);
+      assert.equal(smartEntry?.max_input_tokens, 1_000_000);
+
+      // Anthropic /v1/models
+      const anthRes = await fetch(`${base}/v1/models`, {
+        headers: { "x-api-key": tok, "anthropic-version": "2023-06-01" },
+      });
+      assert.equal(anthRes.status, 200);
+      const anthBody = (await anthRes.json()) as { data: Array<{ id: string; max_input_tokens?: number }> };
+      const anthSmart = anthBody.data.find((m) => m.id === "quick-smart-think");
+      assert.equal(anthSmart?.max_input_tokens, 1_000_000);
+
+      // Admin login
+      const loginRes = await fetch(`${base}/v1/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: "V0124TestPassword!" }),
+      });
+      assert.equal(loginRes.status, 200);
+      const { token: adminSessionToken } = (await loginRes.json()) as { token: string };
+      const adminHdrs = { authorization: `Bearer ${adminSessionToken}`, "content-type": "application/json" };
+
+      // List initial slots via /v1/admin/overview
+      const listRes = await fetch(`${base}/v1/admin/overview`, { headers: adminHdrs });
+      assert.equal(listRes.status, 200);
+      const listBody = (await listRes.json()) as { keyPool: Array<{ slotId: string; maskedProxy?: string }> };
+      const slotIds = listBody.keyPool.map((s) => s.slotId);
+      assert.equal(slotIds.length, 4);
+
+      // Atomic validation failure: invalid proxy scheme in array must return 400 and mutate 0 slots
+      const badRes = await fetch(`${base}/v1/admin/keys/batch`, {
+        method: "POST",
+        headers: adminHdrs,
+        body: JSON.stringify({ action: "set-proxy", slotIds, proxyUrls: ["http://127.0.0.1:10819", "ftp://bad-scheme:21"] }),
+      });
+      assert.equal(badRes.status, 400);
+
+      // Multi-URL round-robin including `direct` / `直连`
+      const rrRes = await fetch(`${base}/v1/admin/keys/batch`, {
+        method: "POST",
+        headers: adminHdrs,
+        body: JSON.stringify({
+          action: "set-proxy",
+          slotIds,
+          proxyUrls: ["http://127.0.0.1:10819", "http://127.0.0.1:10829", "直连"],
+        }),
+      });
+      assert.equal(rrRes.status, 200);
+      const rrBody = (await rrRes.json()) as {
+        ok: boolean;
+        affected: number;
+        changed: number;
+        keyPool: Array<{ slotId: string; maskedProxy?: string }>;
+      };
+      assert.equal(rrBody.ok, true);
+      assert.equal(rrBody.affected, 4);
+      assert.equal(rrBody.changed, 3, "slot 3 received direct (unchanged from direct), slots 1/2/4 changed");
+      const byId = new Map(rrBody.keyPool.map((s) => [s.slotId, s.maskedProxy || ""]));
+      assert.equal(byId.get(slotIds[0]!), "http://127.0.0.1:10819");
+      assert.equal(byId.get(slotIds[1]!), "http://127.0.0.1:10829");
+      assert.equal(byId.get(slotIds[2]!), "");
+      assert.equal(byId.get(slotIds[3]!), "http://127.0.0.1:10819");
+
+      // Single-URL set-proxy via proxyUrl field
+      const singleRes = await fetch(`${base}/v1/admin/keys/batch`, {
+        method: "POST",
+        headers: adminHdrs,
+        body: JSON.stringify({ action: "set-proxy", slotIds: [slotIds[2]!], proxyUrl: "socks5://127.0.0.1:1080" }),
+      });
+      assert.equal(singleRes.status, 200);
+      const singleBody = (await singleRes.json()) as { changed: number; keyPool: Array<{ slotId: string; maskedProxy?: string }> };
+      assert.equal(singleBody.changed, 1);
+      assert.equal(singleBody.keyPool.find((s) => s.slotId === slotIds[2])?.maskedProxy, "socks5://127.0.0.1:1080");
+
+      // One-click clear to direct
+      const clearRes = await fetch(`${base}/v1/admin/keys/batch`, {
+        method: "POST",
+        headers: adminHdrs,
+        body: JSON.stringify({ action: "set-proxy", slotIds, proxyUrls: [""] }),
+      });
+      assert.equal(clearRes.status, 200);
+      const clearBody = (await clearRes.json()) as { affected: number; changed: number; keyPool: Array<{ maskedProxy?: string }> };
+      assert.equal(clearBody.affected, 4);
+      assert.equal(clearBody.changed, 4);
+      assert.ok(clearBody.keyPool.every((s) => !s.maskedProxy), "all slots must be cleared back to direct");
+
+      // Dashboard HTML includes batch proxy button + modal + valid JS syntax
+      const html = renderDashboardHtml(adminPath);
+      assert.ok(html.includes('id="credBatchProxyBtn"'));
+      assert.ok(html.includes('id="batchProxyModal"'));
+      assert.ok(html.includes('id="batchProxyClearAllBtn"'));
+      assert.ok(html.includes("poolSlotsCache"));
+      assert.ok(!html.includes("cachedKeyPool"), "must not reference nonexistent cachedKeyPool variable");
+      const scriptMatch = html.match(/<script\b[^>]*>([\s\S]*?)<\/script>/);
+      assert.ok(scriptMatch?.[1], "dashboard must contain inline script");
+      new vm.Script(scriptMatch[1]);
+    } finally {
+      await gw.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("enforces native per-IP concurrency harmoniously with key-wide concurrency & minimalist Golden-3 sub-key UI", async () => {
+    const { renderDashboardHtml } = await import("../src/web/dashboard-ui.js");
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), "aws-quick-perip-"));
+    const adminPass = "PerIpTestPassword123!";
+    const masterTok = "sk-aq-perip-master-token-9876543210";
+    const mkJwt = (id: number) =>
+      `host${id}.aws.dev|eyJhbGciOiJIUzI1NiJ9.${Buffer.from(JSON.stringify({ sub: `u${id}` })).toString("base64url")}.sig${id}`;
+
+    const releaseWaiters: Array<() => void> = [];
+    let holdNext = false;
+    const cfg = loadConfigFromEnv({
+      HOST: "127.0.0.1",
+      PORT: "0",
+      TRUST_PROXY: "true",
+      GATEWAY_TOKEN: masterTok,
+      ADMIN_PASSWORD: adminPass,
+      QUICK_TOKENS: [mkJwt(1), mkJwt(2)].join(","),
+      DATA_DIR: tmpDir,
+      ENV_FILE_PATH: path.join(tmpDir, ".env"),
+      ENABLE_DASHBOARD: "true",
+    });
+
+    const gw = createGatewayServer({ config: cfg });
+    gw.engine.executeTurnWithPool = (async function* () {
+      if (holdNext) {
+        await new Promise<void>((res) => releaseWaiters.push(res));
+      }
+      yield { type: "text", text: "OK" };
+      yield { type: "done", stopReason: "stop" };
+    }) as typeof gw.engine.executeTurnWithPool;
+    await new Promise<void>((res) => gw.server.listen(0, "127.0.0.1", res));
+    const port = (gw.server.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+
+    try {
+      const loginRes = await fetch(`${base}/v1/admin/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ password: adminPass }),
+      });
+      assert.equal(loginRes.status, 200);
+      const { token: adminToken } = (await loginRes.json()) as { token: string };
+      const ah = { authorization: `Bearer ${adminToken}`, "content-type": "application/json" };
+
+      // Create sub-key: perIpMaxConcurrent=2, maxConcurrent=3 (backend maxRequests stays backward-compatible via API)
+      const createRes = await fetch(`${base}/v1/admin/client-keys`, {
+        method: "POST",
+        headers: ah,
+        body: JSON.stringify({
+          name: "public-trial-perip",
+          perIpMaxConcurrent: 2,
+          maxConcurrent: 3,
+        }),
+      });
+      assert.equal(createRes.status, 200);
+      const created = (await createRes.json()) as {
+        rawToken: string;
+        key: { id: string; perIpMaxConcurrent: number | null; maxConcurrent: number | null };
+      };
+      assert.equal(created.key.perIpMaxConcurrent, 2);
+      assert.equal(created.key.maxConcurrent, 3);
+      const subTok = created.rawToken;
+
+      const sendChat = (ip: string) =>
+        fetch(`${base}/v1/chat/completions`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${subTok}`,
+            "content-type": "application/json",
+            "x-forwarded-for": ip,
+          },
+          body: JSON.stringify({ model: "quick-balanced", stream: false, messages: [{ role: "user", content: "hi" }] }),
+        });
+
+      // 1) Hold 2 concurrent requests from IP A + 1 from IP B (= 3/3 key-wide concurrency)
+      holdNext = true;
+      const pA1 = sendChat("203.0.113.10");
+      const pA2 = sendChat("203.0.113.10");
+      await new Promise((r) => setTimeout(r, 40));
+
+      // IP A's 3rd simultaneous request must be rejected by per-IP concurrency (429)
+      const pA3 = await sendChat("203.0.113.10");
+      assert.equal(pA3.status, 429);
+      const a3Body = (await pA3.json()) as { error?: { code?: string } };
+      assert.equal(a3Body.error?.code, "ip_concurrency_limit_exceeded");
+
+      // Non-inference endpoints (/v1/models & /v1/messages/count_tokens) MUST stay exempt even while IP A is at 2/2!
+      const modelsRes = await fetch(`${base}/v1/models`, {
+        headers: { authorization: `Bearer ${subTok}`, "x-forwarded-for": "203.0.113.10" },
+      });
+      assert.equal(modelsRes.status, 200);
+      const countRes = await fetch(`${base}/v1/messages/count_tokens`, {
+        method: "POST",
+        headers: {
+          "x-api-key": subTok,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+          "x-forwarded-for": "203.0.113.10",
+        },
+        body: JSON.stringify({ model: "quick-balanced", messages: [{ role: "user", content: "hello" }] }),
+      });
+      assert.equal(countRes.status, 200);
+
+      // IP B's 1st request succeeds (proves per-IP isolation), filling total key concurrency to 3/3
+      const pB1 = sendChat("203.0.113.20");
+      await new Promise((r) => setTimeout(r, 40));
+
+      // IP C's request hits key-wide maxConcurrent=3 cleanly without conflicting with per-IP limiter
+      const pC1 = await sendChat("203.0.113.30");
+      assert.equal(pC1.status, 429);
+      const c1Body = (await pC1.json()) as { error?: { code?: string } };
+      assert.equal(c1Body.error?.code, "concurrency_limit_exceeded");
+
+      // Release all held streams -> all 3 return 200 and counters release cleanly
+      holdNext = false;
+      while (releaseWaiters.length) releaseWaiters.shift()!();
+      const [rA1, rA2, rB1] = await Promise.all([pA1, pA2, pB1]);
+      assert.equal(rA1.status, 200);
+      assert.equal(rA2.status, 200);
+      assert.equal(rB1.status, 200);
+
+      // After release, IP A can immediately send again
+      const rA4Ok = await sendChat("203.0.113.10");
+      assert.equal(rA4Ok.status, 200);
+
+      // 2) PATCH updates & persists across reload
+      const patchRes = await fetch(`${base}/v1/admin/client-keys/${created.key.id}`, {
+        method: "PATCH",
+        headers: ah,
+        body: JSON.stringify({ perIpMaxConcurrent: 4 }),
+      });
+      assert.equal(patchRes.status, 200);
+      const patched = (await patchRes.json()) as { key: { perIpMaxConcurrent: number | null } };
+      assert.equal(patched.key.perIpMaxConcurrent, 4);
+
+      const reloadedMgr = new ClientGatewayKeyManager(cfg);
+      const reloadedKey = reloadedMgr.listKeys().find((k) => k.id === created.key.id);
+      assert.equal(reloadedKey?.perIpMaxConcurrent, 4);
+
+      // 3) Minimalist Golden-3 modal UI check: keeps per-IP conc + key conc + expiry, omits noisy RPM & maxReq inputs
+      const html = renderDashboardHtml("/adm-test");
+      assert.ok(html.includes('id="ckPerIpConcInput"'));
+      assert.ok(html.includes('id="ckMaxConcInput"'));
+      assert.ok(html.includes('id="ckExpiresInput"'));
+      assert.ok(html.includes("applyCkPreset"));
+      assert.ok(!html.includes('id="ckPerIpRpmInput"'), "UI should omit redundant per-IP RPM input");
+      assert.ok(!html.includes('id="ckMaxReqInput"'), "UI should omit maxRequests input");
+      assert.ok(!html.includes('id="ckAdvancedDetails"'), "UI should have no redundant collapsible section");
+      const scriptMatch = html.match(/<script\b[^>]*>([\s\S]*?)<\/script>/);
+      assert.ok(scriptMatch?.[1]);
+      new vm.Script(scriptMatch[1]);
+    } finally {
+      await gw.close();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("Issues #16/#15/#17: version-safe agent softening, 60-tool compaction, pure-positive local bridge & cumulative zero-output hang cap", async () => {
+    const { runTurnStream } = await import("../src/core/turn-stream-runner.js");
+    const { WarmSessionPool } = await import("../src/core/warm-session-pool.js");
+    const { UsageTracker } = await import("../src/services/usage-tracker.js");
+    const { WebSocketServer, WebSocket: WsClient } = await import("ws");
+
+    // 1) Version-safe & domain-safe agent identity softening (no dangling `.2.2.` fragments) + pi/Orca harness
+    const verDsh = sanitizeClientSystemPromptForQuick(
+      "You are an AI agent powered by DeepSeek Harness v0.2.2.\nYou are running inside the pi/Orca multi-agent orchestration environment.\nYou are an expert Go engineer reviewing a PR.",
+      true,
+    );
+    assert.ok(!/DeepSeek Harness|v0\.2|\.2\.2|pi\/Orca/i.test(verDsh), `must cleanly soften versioned brand & pi/Orca: ${verDsh}`);
+    assert.ok(verDsh.includes("You are an expert Go engineer reviewing a PR."), "must preserve normal engineering prompts");
+
+    // Pure chat (hasTools=false) must never be altered
+    const pureChat = "You are an AI agent powered by DeepSeek Harness v0.2.2.";
+    assert.equal(sanitizeClientSystemPromptForQuick(pureChat, false), pureChat);
+
+    // 2) 60-tool large schema compaction fits comfortably under single-frame budget (< 24KB)
+    const verboseTools60 = Array.from({ length: 60 }, (_, i) => ({
+      name: `workspace_tool_${i}`,
+      description: `Detailed workspace tool #${i} for executing local actions, searching symbols, reading files, and managing orchestration state in the local repository.`,
+      inputSchema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Absolute or relative file path inside the user's local project directory." },
+          command: { type: "string", description: "Shell command or structured operation arguments to run." },
+          query: { type: "string", description: "Search query string or regex pattern for matching files." },
+          flags: { type: "object", description: "Optional execution flags and tuning options." },
+        },
+        required: ["path"],
+      },
+    }));
+    const smart60Bridge = buildToolBridgePrompt(verboseTools60, "auto", {
+      compactForCustomAgent: true,
+      preferClientToolsOverWorkspace: true,
+      preferLocalToolsStrictly: false,
+    });
+    assert.ok(Buffer.byteLength(smart60Bridge, "utf8") < 24_000, `60 verbose tools must compact < 24KB (got ${Buffer.byteLength(smart60Bridge, "utf8")})`);
+    assert.ok(smart60Bridge.includes("local project files, directories, and shell run on their machine"), "pure-positive local workspace authorization must be present");
+    assert.ok(!/\b(?:NEVER|IGNORE|FORBIDDEN|OVERRIDE)\b/.test(smart60Bridge), "smart/balanced bridge must stay purely positive without negative override keywords");
+
+    // 3) Cumulative zero-output hang cap terminates multi-segment thinking + cloud-tool infinite loops (#16)
+    const sendCloudOut = (sock: import("ws").WebSocket, ev: Record<string, unknown>) => {
+      const b64 = Buffer.from(JSON.stringify(ev), "utf8").toString("base64");
+      sock.send(
+        encodeEventStream(
+          { ":event-type": "rawOutputEvent", ":content-type": "application/json", ":message-type": "event" },
+          Buffer.from(JSON.stringify({ payload: b64 }), "utf8"),
+        ),
+      );
+    };
+    const wss = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+    await new Promise<void>((res) => wss.once("listening", res));
+    const port = (wss.address() as { port: number }).port;
+    wss.on("connection", (sock) => {
+      sock.on("message", (raw) => {
+        let inner: { type?: string; payload?: Record<string, unknown> } | undefined;
+        try {
+          const outer = JSON.parse(raw.toString("utf8")) as { payload?: { payload?: string } };
+          if (outer.payload?.payload) inner = JSON.parse(Buffer.from(outer.payload.payload, "base64").toString("utf8"));
+        } catch { return; }
+        if (!inner) return;
+        if (inner.type === "session_connect") {
+          sendCloudOut(sock, { type: "session_established", payload: {} });
+        } else if (inner.type === "user_message") {
+          const tid = String(inner.payload?.thread_id || "th-hang");
+          let tick = 0;
+          // Continuously alternate thinking_delta -> thinking_complete -> cloud tool_start/result every 30ms with ZERO text_delta!
+          const iv = setInterval(() => {
+            if (sock.readyState !== sock.OPEN) {
+              clearInterval(iv);
+              return;
+            }
+            tick += 1;
+            if (tick % 3 === 1) sendCloudOut(sock, { type: "thinking_delta", thread_id: tid, payload: { delta: "planning... " } });
+            else if (tick % 3 === 2) sendCloudOut(sock, { type: "thinking_complete", thread_id: tid, payload: {} });
+            else {
+              sendCloudOut(sock, { type: "tool_start", thread_id: tid, payload: { tool_id: `t${tick}` } });
+              sendCloudOut(sock, { type: "tool_result", thread_id: tid, payload: { tool_id: `t${tick}` } });
+            }
+          }, 30);
+          sock.once("close", () => clearInterval(iv));
+        }
+      });
+    });
+
+    const warmPool = new WarmSessionPool({ maxWarmSessions: 4, warmSessionTtlMs: 60_000 });
+    try {
+      const ws = new WsClient(`ws://127.0.0.1:${port}`);
+      const turn = parseChatCompletionsRequest({ model: "quick-smart-think", messages: [{ role: "user", content: "hang test" }] });
+      const t0 = Date.now();
+      let caught: unknown;
+      try {
+        for await (const _ev of runTurnStream({
+          ws,
+          isReusedOpenWs: false,
+          encodeFrame: encodeCloudInputFrame,
+          decodeFrame: decodeCloudOutputFrame,
+          isWeb: false,
+          surfaceType: "QUICK_WORK_DESKTOP_MAC",
+          appVersion: "1.2.4757",
+          surfaceName: "desktop",
+          outpostId: "op-hang",
+          turn: { ...turn, currentInputPrefixHash: "hash-hang-1" },
+          apiKey: "dummy-key",
+          slotId: "slot-hang",
+          execMode: "incognito",
+          selection: { model: "quick-smart-think", agentMode: "smart", thinkingEffort: "max" },
+          isIncognito: true,
+          isWarmIncremental: false,
+          isInternalHelperCall: false,
+          threadId: "th-hang-16",
+          effectiveRootThreadId: "th-hang-16",
+          chunks: ["hang test"],
+          effectiveCustomPrompt: null,
+          attachments: [],
+          rawPromptForRephrase: "hang test",
+          toolFilter: null,
+          uiTagSanitizer: new StreamingUiTagSanitizer(),
+          runMaxTimeoutMs: 5_000,
+          runIdleTimeoutMs: 120, // cumulative cap = 3 * 120 = 360ms
+          showRoutedModelInThinking: false,
+          webSearchEnabled: false,
+          usageTracker: new UsageTracker(),
+          warmPool,
+        })) {
+          // drain
+        }
+      } catch (err) {
+        caught = err;
+      }
+      const elapsed = Date.now() - t0;
+      assert.ok(caught instanceof GatewayError, "multi-segment infinite zero-output loop must throw GatewayError");
+      assert.equal(caught.status, 504);
+      assert.equal(caught.code, "timeout_error");
+      assert.match(caught.message, /no assistant text or tool call/i);
+      assert.ok(elapsed >= 300 && elapsed < 2_500, `must terminate near cumulative cap (~360ms), got ${elapsed}ms`);
+    } finally {
+      warmPool.disposeAll();
+      await new Promise<void>((res) => wss.close(() => res()));
+    }
+  });
+
+  it("long-session 30+ turn tool-call alignment: <tool_call> cold replay, zero-mutation framing, clean OOB & hijack poison guard", async () => {
+    const { parseAnthropicMessagesRequest } = await import("../src/protocols/anthropic.js");
+    const { parseChatCompletionsRequest, parseResponsesRequest } = await import("../src/protocols/openai.js");
+    const { formatHistoryToolCall, sanitizeClientSystemPromptForQuick } = await import("../src/core/tool-bridge.js");
+    const { buildOutOfBandContextPrompt } = await import("../src/core/media-utils.js");
+    const { isLikelySoftRefusal } = await import("../src/core/upstream-errors.js");
+
+    // 1) Historical assistant tool calls in cold replay use exact `<tool_call>` JSON format across all 3 protocols
+    const anthTurn = parseAnthropicMessagesRequest({
+      model: "quick-balanced",
+      max_tokens: 1024,
+      messages: [
+        { role: "user", content: "Inspect config" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Reading config." },
+            { type: "tool_use", id: "toolu_1", name: "read_file", input: { path: "src/config.ts" } },
+          ],
+        },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "export const t = 5000;" }] },
+      ],
+    });
+    assert.ok(
+      anthTurn.fullTranscriptText.includes('<tool_call>{"name":"read_file","arguments":{"path":"src/config.ts"}}</tool_call>'),
+      "Anthropic cold replay must format prior tool_use as <tool_call> for few-shot alignment",
+    );
+    assert.ok(!anthTurn.fullTranscriptText.includes("[ASSISTANT_TOOL_CALLS]"));
+    assert.ok(anthTurn.priorPrefixHash && anthTurn.currentInputPrefixHash);
+
+    const oaiChat = parseChatCompletionsRequest({
+      model: "quick-balanced",
+      messages: [
+        { role: "user", content: "List files" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "list_dir", arguments: '{"path":"."}' } }],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "src/\npackage.json" },
+      ],
+    });
+    assert.ok(
+      oaiChat.fullTranscriptText.includes('<tool_call>{"name":"list_dir","arguments":{"path":"."}}</tool_call>'),
+      "OpenAI Chat cold replay must format prior tool_calls as <tool_call>",
+    );
+
+    const oaiResp = parseResponsesRequest({
+      model: "quick-smart-think",
+      input: [
+        { role: "user", content: "Run check" },
+        { type: "function_call", call_id: "fc_1", name: "exec_command", arguments: '{"cmd":"ls"}' },
+        { type: "function_call_output", call_id: "fc_1", output: "ok" },
+      ],
+    });
+    assert.ok(
+      oaiResp.fullTranscriptText.includes('<tool_call>{"name":"exec_command","arguments":{"cmd":"ls"}}</tool_call>'),
+      "OpenAI Responses cold replay must format prior function_call as <tool_call>",
+    );
+    assert.equal(formatHistoryToolCall("apply_patch", "raw diff text"), '<tool_call>{"name":"apply_patch","arguments":{"input":"raw diff text"}}</tool_call>');
+
+    // 2) Opt-in deep sanitizer also handles Chinese agent identity & `Identity:` lines
+    const cnSoft = sanitizeClientSystemPromptForQuick("你是 DeepSeek 研发的智能编程代理。遵守代码规范。", true);
+    assert.ok(!cnSoft.includes("DeepSeek"), "opt-in sanitizer must soften Chinese third-party agent identity");
+    assert.ok(cnSoft.includes("遵守代码规范。"));
+    const idLine = sanitizeClientSystemPromptForQuick("Identity: DeepSeek Harness v0.2.2, an autonomous agent.\nKeep diffs small.", true);
+    assert.ok(!idLine.includes("DeepSeek Harness"));
+    assert.ok(idLine.includes("Keep diffs small."));
+
+    // 3) Clean OOB archive prompt for tool-enabled sessions includes trailing client-tool reminder & zero cloud-workspace poison
+    const oobTools = buildOutOfBandContextPrompt("a".repeat(8000), "conversation_context_999.txt", 1200, false, undefined, true);
+    assert.ok(oobTools.includes("Client tool reminder"));
+    assert.ok(!oobTools.includes("AWS Quick cloud workspace"));
+    assert.ok(!oobTools.includes("never call client"));
+
+    // 4) Cloud-hijack / identity-refusal responses must be classified as soft refusals so warmPool never parks poisoned threads
+    assert.equal(
+      isLikelySoftRefusal("我找不到 src/config.ts。这次请求是从云端处理的，访问不到你的电脑，所以也读不到你的本地项目文件。"),
+      true,
+    );
+    assert.equal(
+      isLikelySoftRefusal("目前我看不到任何可访问的本地文件夹，请在 AWS Quick 桌面应用的本地文件夹设置里添加目录。"),
+      true,
+    );
+    assert.equal(
+      isLikelySoftRefusal("我是 AWS Quick 里的 Coding Assistant，无法直接读取你电脑上的文件。"),
+      true,
+    );
+    assert.equal(
+      isLikelySoftRefusal("目前看不到可访问的本地文件夹，请添加权限。"),
+      true,
+      "must match without optional '任何' (fixed regex typo)",
+    );
+    assert.equal(isLikelySoftRefusal("I'm actually AWS Quick, not running inside your local harness."), true);
+    assert.equal(isLikelySoftRefusal("已修改 src/config.ts 里的超时配置为 5000ms。"), false);
+
+    // 4b) Incremental warm OOB for tool-enabled sessions (e.g. Sonnet >46.5KB tool_result) preserves filename & current-turn label
+    const oobIncTools = buildOutOfBandContextPrompt("b".repeat(8000), "conversation_context_inc.txt", 1200, true, undefined, true);
+    assert.ok(oobIncTools.includes("conversation_context_inc.txt"), "warm incremental tool_result OOB must preserve attachment filename");
+    assert.ok(!oobIncTools.includes("Earlier transcript archive"), "warm incremental tool_result must not be mislabeled as earlier archive");
+
+    // 4c) Parallel tool call `[call_id=...]` correlation & array rejection in formatHistoryToolCall
+    assert.ok(anthTurn.fullTranscriptText.includes("[call_id=toolu_1]\n<tool_call>"), "Anthropic cold replay must preserve call_id correlation");
+    assert.ok(oaiChat.fullTranscriptText.includes("[call_id=call_1]\n<tool_call>"), "OpenAI Chat cold replay must preserve call_id correlation");
+    assert.ok(oaiResp.fullTranscriptText.includes("[call_id=fc_1]\n<tool_call>"), "OpenAI Responses cold replay must preserve call_id correlation");
+    assert.equal(
+      formatHistoryToolCall("batch", "[1,2,3]"),
+      '<tool_call>{"name":"batch","arguments":{"input":"[1,2,3]"}}</tool_call>',
+      "JSON arrays must be wrapped as object arguments",
+    );
+
+    // 5) inline-first OOB policy (pure chat & balanced keep fast 1-frame OOB >46.5KB; smart/advanced/fast client-tool turns stay inline up to 185KB)
+    const { shouldOffloadPromptToOob, resolveToolOobMinPromptBytes } = await import("../src/core/turn-attachment-builder.js");
+    const { buildOutboundChatFrame } = await import("../src/core/turn-frame-builder.js");
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 85_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: false, agentMode: "smart" }),
+      true,
+      "pure chat >46.5KB must still offload to fast 1-frame OOB",
+    );
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 85_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: true, agentMode: "balanced" }),
+      true,
+      "balanced (Sonnet) keeps fast 1-frame OOB >46.5KB (~6s, 100% tool pass)",
+    );
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 125_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: true, agentMode: "smart" }),
+      false,
+      "smart (Opus) 125KB client-tool session stays inline-first (attachments: []) to prevent cloud-workspace hijack",
+    );
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 125_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: true, agentMode: "advanced" }),
+      false,
+      "advanced (Opus Max) 125KB client-tool session stays inline-first too",
+    );
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 85_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: true, agentMode: "fast" }),
+      false,
+      "fast (Haiku) 85KB client-tool session stays inline-first to prevent cloud-workspace hijack",
+    );
+    assert.equal(
+      shouldOffloadPromptToOob({ promptJsonBytes: 200_000, customPromptBytes: 4_000, safeSingleFrameTotal: 46_500, hasClientTools: true, agentMode: "smart" }),
+      true,
+      "smart >185KB extreme session falls back to OOB archive cleanly",
+    );
+    // Extreme env override is safely capped at 460KB so it never causes 413 payload_too_large
+    const prevOobMin = process.env.OOB_MIN_TOOL_PROMPT_BYTES;
+    try {
+      process.env.OOB_MIN_TOOL_PROMPT_BYTES = "9999999";
+      assert.equal(resolveToolOobMinPromptBytes(), 460_000);
+    } finally {
+      if (prevOobMin === undefined) delete process.env.OOB_MIN_TOOL_PROMPT_BYTES;
+      else process.env.OOB_MIN_TOOL_PROMPT_BYTES = prevOobMin;
+    }
+
+    // Intermediate inline chunk uses `fast` mode + explicit `thinking_effort: "off"`; final chunk restores requested `smart` mode
+    const midFrame = buildOutboundChatFrame({
+      chunkText: "seg1",
+      msgId: "m1",
+      isFinal: false,
+      isInternalRephraseCall: false,
+      webSearchEnabled: false,
+      turn: anthTurn,
+      agentMode: "smart",
+      thinkingEffort: "high",
+      effectiveCustomPrompt: "sys",
+      attachments: [],
+      surfaceType: "QUICK_WORK_DESKTOP_MAC",
+      outpostId: "op",
+      appVersion: "1.0",
+      surfaceName: "desktop",
+      threadId: "t1",
+      isIncognito: true,
+    });
+    const finFrame = buildOutboundChatFrame({
+      chunkText: "seg2",
+      msgId: "m2",
+      isFinal: true,
+      isInternalRephraseCall: false,
+      webSearchEnabled: false,
+      turn: anthTurn,
+      agentMode: "smart",
+      thinkingEffort: "high",
+      effectiveCustomPrompt: "sys",
+      attachments: [],
+      surfaceType: "QUICK_WORK_DESKTOP_MAC",
+      outpostId: "op",
+      appVersion: "1.0",
+      surfaceName: "desktop",
+      threadId: "t1",
+      isIncognito: true,
+    });
+    assert.equal((midFrame.payload as Record<string, unknown>).agent_mode, "fast");
+    assert.equal((midFrame.payload as Record<string, unknown>).thinking_effort, "off");
+    assert.equal((finFrame.payload as Record<string, unknown>).agent_mode, "smart");
+    assert.equal((finFrame.payload as Record<string, unknown>).thinking_effort, "high");
+
+    // 6) Bare-fence `<tool_call>` recovery strips the ENTIRE wrapping fence cleanly (zero dangling ```)
+    //    while StreamingToolCallFilter keeps fenced docs strictly untouched
+    const { parseToolCallsFromText, StreamingToolCallFilter } = await import("../src/core/tool-bridge.js");
+    const bareFenced = '我先读取 src/index.ts。\n\n```\n<tool_call>{"name":"read_file","arguments":{"path":"src/index.ts"}}</tool_call>\n```';
+    const parsedBare = parseToolCallsFromText(bareFenced, new Set(["read_file"]));
+    assert.equal(parsedBare.toolCalls.length, 1, "bare trailing fence wrapping only <tool_call> must be recovered");
+    assert.equal(parsedBare.toolCalls[0]!.name, "read_file");
+    assert.equal(parsedBare.cleanText, "我先读取 src/index.ts。", "wrapping backticks must be stripped cleanly without dangling ```");
+
+    const streamDocFence = new StreamingToolCallFilter(new Set(["read_file"]));
+    const evsDocFence = [...streamDocFence.feedIncremental(bareFenced).events, ...streamDocFence.flushIncremental().events];
+    assert.equal(evsDocFence.length, 0, "streaming filter must never leak dangling ``` or hijack bare-fenced docs mid-stream");
+
+    const labeledDoc = 'Example:\n```xml\n<tool_call>{"name":"read_file","arguments":{"path":"a.ts"}}</tool_call>\n```';
+    assert.equal(parseToolCallsFromText(labeledDoc, new Set(["read_file"])).toolCalls.length, 0, "labeled ```xml fence must stay ignored");
+    const codeProseFence = '```\nconst s = "<tool_call>{\\"name\\":\\"read_file\\",\\"arguments\\":{}}</tool_call>";\n```';
+    assert.equal(parseToolCallsFromText(codeProseFence, new Set(["read_file"])).toolCalls.length, 0, "code line inside bare fence must stay ignored");
+
+    // 7) clientIpOf prioritizes cf-connecting-ip behind trusted proxy (Cloudflare -> Nginx -> gateway)
+    const { clientIpOf } = await import("../src/web/admin-auth.js");
+    const fakeReq = {
+      socket: { remoteAddress: "127.0.0.1" },
+      headers: { "cf-connecting-ip": "198.51.100.77", "x-forwarded-for": "172.70.1.5" },
+    } as unknown as import("node:http").IncomingMessage;
+    assert.equal(clientIpOf(fakeReq, "loopback"), "198.51.100.77");
+    assert.equal(clientIpOf(fakeReq, "off"), "127.0.0.1");
   });
 });

@@ -23,6 +23,41 @@ import { normalizeSystemReminderTagsForUpstream, stripHighRiskClientHeaders } fr
 import { GatewayError, type ParsedProtocolTurn } from "./types.js";
 
 export const MAX_INLINE_CHUNKS = 12;
+// Empirically calibrated OOB vs inline-first split (measured live across 60KB–180KB):
+// - Pure chat & `balanced` (Sonnet): fast 1-frame OOB at >46.5KB (~5.6–6.3s, 100% tool pass on Sonnet).
+// - `smart` (Opus 5.5), `advanced` (Opus Max), & `fast` (Haiku) with client tools: stay inline-first
+//   (2–4 pure-text frames with `attachments: []`, intermediate ack frames on `fast` with `thinking_effort: "off"`)
+//   up to 185KB (~60 turns) so AWS Quick's attachment file-agent affordance never hijacks local `<tool_call>` tools.
+export const DEFAULT_TOOL_OOB_MIN_PROMPT_BYTES = 185_000;
+const MAX_SAFE_INLINE_OOB_THRESHOLD_BYTES = 460_000;
+
+export function resolveToolOobMinPromptBytes(): number {
+  const raw = process.env.OOB_MIN_TOOL_PROMPT_BYTES?.trim();
+  if (raw) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Math.min(parsed, MAX_SAFE_INLINE_OOB_THRESHOLD_BYTES);
+    }
+  }
+  return DEFAULT_TOOL_OOB_MIN_PROMPT_BYTES;
+}
+
+export function shouldOffloadPromptToOob(params: {
+  promptJsonBytes: number;
+  customPromptBytes: number;
+  safeSingleFrameTotal: number;
+  hasClientTools: boolean;
+  agentMode?: string;
+}): boolean {
+  const { promptJsonBytes, customPromptBytes, safeSingleFrameTotal, hasClientTools, agentMode } = params;
+  if (promptJsonBytes <= 2_048) return false;
+  if (promptJsonBytes + customPromptBytes <= safeSingleFrameTotal) return false;
+  const preferInlineFirst =
+    hasClientTools && (agentMode === "smart" || agentMode === "advanced" || agentMode === "fast");
+  if (!preferInlineFirst) return true;
+  const toolThreshold = Math.max(safeSingleFrameTotal, resolveToolOobMinPromptBytes());
+  return promptJsonBytes > toolThreshold;
+}
 
 export interface TurnAttachmentBuildInput {
   turn: ParsedProtocolTurn;
@@ -37,6 +72,7 @@ export interface TurnAttachmentBuildInput {
   webCred?: WebCookieCredential;
   effectiveProxy?: string;
   reqAttCache?: RequestAttachmentCache;
+  agentMode?: string;
 }
 
 export async function buildPromptAndAttachmentsForTurn(
@@ -55,6 +91,7 @@ export async function buildPromptAndAttachmentsForTurn(
     webCred,
     effectiveProxy,
     reqAttCache,
+    agentMode,
   } = input;
 
   const rawSourceImages = incremental ? (turn.incrementalImages ?? []) : turn.images;
@@ -212,10 +249,23 @@ export async function buildPromptAndAttachmentsForTurn(
       }
     }
     if (!uploadedHighRes) {
-      const willUseOutOfBandText = ((isOAuthAccount && Boolean(oauthCred)) || (isWeb && Boolean(webCred))) && approxTextBytes > 42_000;
+      const hasClientToolsForImg = turn.tools.length > 0 && turn.toolChoice !== "none";
+      const baseSafeForImg = Math.max(4_096, MAX_WS_PAYLOAD_UTF8_BYTES - WS_FRAME_ENVELOPE_MARGIN_BYTES);
+      const willUseOutOfBandText =
+        ((isOAuthAccount && Boolean(oauthCred)) || (isWeb && Boolean(webCred))) &&
+        shouldOffloadPromptToOob({
+          promptJsonBytes: jsonStringUtf8Bytes(rawPromptText || ""),
+          customPromptBytes: jsonStringUtf8Bytes(customPrompt || ""),
+          safeSingleFrameTotal: baseSafeForImg,
+          hasClientTools: hasClientToolsForImg,
+          agentMode,
+        });
+      const willChunkInline = approxTextBytes > baseSafeForImg && !willUseOutOfBandText;
       const adaptiveImageBudget = willUseOutOfBandText
         ? 34_000
-        : Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
+        : willChunkInline
+          ? 28_000
+          : Math.max(8_000, Math.min(38_000, 42_000 - approxTextBytes));
       const inlineImgs = await compressResolvedImagesForQuickFrame(resolvedImgs, adaptiveImageBudget);
       imgResults.push(...inlineImgs);
     }
@@ -260,9 +310,18 @@ export async function buildPromptAndAttachmentsForTurn(
         .filter(Boolean)
         .join("\n\n");
       const predictedPromptJsonBytes = jsonStringUtf8Bytes(predictedCombined);
-      const predictedTotalBytes = predictedPromptJsonBytes + jsonStringUtf8Bytes(customPrompt || "");
+      const predictedCustomBytes = jsonStringUtf8Bytes(customPrompt || "");
       const baseSafeSingleFrame = Math.max(4_096, MAX_WS_PAYLOAD_UTF8_BYTES - WS_FRAME_ENVELOPE_MARGIN_BYTES);
-      if (predictedTotalBytes > baseSafeSingleFrame && predictedPromptJsonBytes > 2_048) {
+      const hasClientToolsForPre = turn.tools.length > 0 && turn.toolChoice !== "none";
+      if (
+        shouldOffloadPromptToOob({
+          promptJsonBytes: predictedPromptJsonBytes,
+          customPromptBytes: predictedCustomBytes,
+          safeSingleFrameTotal: baseSafeSingleFrame,
+          hasClientTools: hasClientToolsForPre,
+          agentMode,
+        })
+      ) {
         const suffix = incremental ? `_${crypto.randomUUID().slice(0, 4)}` : "";
         const fileName = `conversation_context_${threadId.slice(0, 8)}${suffix}.txt`;
         const promptBytes = Buffer.from(predictedCombined, "utf8");
@@ -333,6 +392,7 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
   webCred?: WebCookieCredential;
   effectiveProxy?: string;
   reqAttCache?: RequestAttachmentCache;
+  agentMode?: string;
 }): Promise<{
   chunks: string[];
   effectiveCustomPrompt: string | null;
@@ -353,6 +413,7 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
     webCred,
     effectiveProxy,
     reqAttCache,
+    agentMode,
   } = params;
   let prompt = params.prompt;
   let attachments = params.attachments;
@@ -367,11 +428,21 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
       currentAttBytes > 0 ? Math.max(4_000, MAX_WS_PAYLOAD_UTF8_BYTES - currentAttBytes) : MAX_WS_PAYLOAD_UTF8_BYTES;
     const safeSingleFrameTotal = Math.max(4_096, currentFrameBudget - WS_FRAME_ENVELOPE_MARGIN_BYTES);
     const promptJsonBytes = jsonStringUtf8Bytes(prompt);
-    const estimatedTotalBytes = promptJsonBytes + jsonStringUtf8Bytes(customPrompt || "");
-    // Only offload `prompt` to an OOB `.txt` attachment when `prompt` itself is large enough (>2KB)
-    // that offloading actually shrinks the WS frame; never upload a tiny warm turn like "continue"
-    // just because `customPrompt` alone is near the frame ceiling.
-    if (estimatedTotalBytes > safeSingleFrameTotal && promptJsonBytes > 2_048) {
+    const customPromptBytesForOob = jsonStringUtf8Bytes(customPrompt || "");
+    const hasClientToolsForOob = turn.tools.length > 0 && turn.toolChoice !== "none";
+    // Offload to an OOB `.txt` attachment only when warranted:
+    // - pure chat & `balanced` (Sonnet): >46.5KB single frame (fast 1-frame OOB);
+    // - `smart` / `advanced` / `fast` client-tool sessions: inline-first up to ~185KB (2–4 frames, `attachments: []`)
+    //   to prevent AWS Quick's attachment file-agent mode from hijacking 20–60 turn coding cold-replays.
+    if (
+      shouldOffloadPromptToOob({
+        promptJsonBytes,
+        customPromptBytes: customPromptBytesForOob,
+        safeSingleFrameTotal,
+        hasClientTools: hasClientToolsForOob,
+        agentMode,
+      })
+    ) {
       const uploadTimeoutSignal = turn.signal
         ? AbortSignal.any([turn.signal, AbortSignal.timeout(65_000)])
         : AbortSignal.timeout(65_000);
@@ -435,13 +506,14 @@ export async function finalizePromptChunksAndOutOfBandText(params: {
         } else {
           realPromptRoom = Math.max(0, postOobSafeFinalTotal - customPromptBytes - 128);
         }
+        const hasClientTools = turn.tools.length > 0 && turn.toolChoice !== "none";
         const fitInlineExcerpt = (hint: string | undefined): { lo: number; wrapped: string } => {
           let lo = 0;
           let hi = Math.min(32_000, prompt.length);
-          let bestWrapped = buildOutOfBandContextPrompt(prompt, fileName, 0, isWarmIncremental, hint);
+          let bestWrapped = buildOutOfBandContextPrompt(prompt, fileName, 0, isWarmIncremental, hint, hasClientTools);
           while (lo < hi) {
             const mid = Math.ceil((lo + hi) / 2);
-            const candidate = buildOutOfBandContextPrompt(prompt, fileName, mid, isWarmIncremental, hint);
+            const candidate = buildOutOfBandContextPrompt(prompt, fileName, mid, isWarmIncremental, hint, hasClientTools);
             if (jsonStringUtf8Bytes(candidate) <= realPromptRoom) {
               lo = mid;
               bestWrapped = candidate;

@@ -146,11 +146,23 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
   }
   const res = stripHighRiskClientHeaders(systemPrompt)
     .replace(
-      /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|Hermes|Antigravity|ZCode|Windsurf|Aider|Augment|Trae)\b[^\n.]*\.?/gi,
+      /\bYou are (?:Claude Code|Codex|Cline|Roo Code|Roo|Kilo Code|Kilo|Cursor|OpenCode|OpenChamber|Hermes|Antigravity|ZCode|Windsurf|Aider|Augment|Trae|DeepSeek Harness|Witan|Devin|Goose|Continue)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
       "You are assisting a developer through an external coding client.",
     )
     .replace(
-      /\bYou are Claude,\s+Anthropic's[^\n.]*\.?/gi,
+      /\bYou are (?:an?\s+)?(?:AI|autonomous|agentic|coding|software|developer|interactive)(?:\s+(?:AI|coding|software|developer|interactive))*\s+(?:agent|assistant|CLI|IDE|tool|copilot|harness)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*?\b(?:powered by|built by|created by|made by|developed by|designed by|running in(?:side)?|operating in(?:side)?|from)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
+      "You are assisting a developer through an external coding client.",
+    )
+    .replace(
+      /(^|\n)You are (?:running|operating) inside [^\n.]*?\b(?:environment|harness|orchestration|agent|CLI|IDE)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
+      "$1You are assisting a developer working in a local coding environment.",
+    )
+    .replace(
+      /(^|\n)You are [A-Z][A-Za-z0-9._-]{1,28}(?:\s+[A-Z][A-Za-z0-9._-]{1,20}){0,2},\s+(?:an?|the)\s+(?:AI|autonomous|agentic|coding|software|developer|interactive)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/g,
+      "$1You are assisting a developer through an external coding client.",
+    )
+    .replace(
+      /\bYou are Claude,\s+Anthropic's(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
       "You are assisting a developer through an external coding client.",
     )
     .replace(
@@ -158,11 +170,48 @@ export function sanitizeClientSystemPromptForQuick(systemPrompt: string, hasTool
       "You are assisting a developer using an interactive CLI client",
     )
     .replace(
-      /\bYou are a coding agent running in[^\n.]*\.?/gi,
+      /\bYou are a coding agent running in(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
       "You are assisting a developer working in a local coding environment.",
+    )
+    .replace(
+      /(^|\n)(?:Identity|Persona):\s*[^\n.]*?\b(?:agent|assistant|CLI|IDE|harness|Claude|Codex|DeepSeek|Cursor|OpenCode)\b(?:[^\n.]|\.(?=\d|[a-z0-9-]+\.[a-z]{2,}))*\.?/gi,
+      "$1Context: assisting a developer through an external coding client.",
+    )
+    .replace(
+      /(^|\n)你是[^\n。]{1,28}(?:研发|开发|打造|推出)的[^\n。]{0,28}(?:代理|助手|智能体|工具)[^\n。]*。?/g,
+      "$1你正在协助开发者在本地代码仓库中完成软件工程任务。",
     );
   if (cacheKey) lruSet(sanitizedSysPromptCache, cacheKey, res, MAX_SYS_PROMPT_CACHE);
   return res;
+}
+
+/**
+ * Formats a historical assistant tool call inside cold-replay transcripts using the exact same
+ * `<tool_call>` JSON envelope emitted on warm incremental threads, preserving in-context few-shot
+ * alignment AND `[call_id=...]` correlation with `[TOOL_RESULT id=...]` across 30+ turn failovers,
+ * warm expiries, and OOB `.txt` context archives.
+ */
+export function formatHistoryToolCall(name: string, args: unknown, callId?: string): string {
+  const safeName = (name || "").trim();
+  let parsedArgs: unknown = args;
+  if (typeof args === "string") {
+    const trimmed = args.trim();
+    if (!trimmed) {
+      parsedArgs = {};
+    } else {
+      try {
+        const parsed = JSON.parse(trimmed);
+        parsedArgs = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : { input: args };
+      } catch {
+        parsedArgs = { input: args };
+      }
+    }
+  } else if (args === undefined || args === null || typeof args !== "object" || Array.isArray(args)) {
+    parsedArgs = args === undefined || args === null ? {} : { input: args };
+  }
+  const block = `${TOOL_CALL_OPEN}${JSON.stringify({ name: safeName, arguments: parsedArgs })}${TOOL_CALL_CLOSE}`;
+  const safeId = typeof callId === "string" ? callId.trim() : "";
+  return safeId ? `[call_id=${safeId}]\n${block}` : block;
 }
 
 const PAIRED_XML_TAG_RES: Record<string, RegExp> = {
@@ -247,7 +296,7 @@ export function deepSanitizeClientSystemPrompt(systemPrompt: string): string {
   // 1. Replace `<identity>...</identity>` persona blocks when they assert a third-party AI identity
   text = replacePairedXmlBlockLinear(text, "identity", (inner) => {
     if (
-      /\b(?:You are|designed by|Anthropic|OpenAI|Google Deepmind|Antigravity|Claude|Codex|ZCode|Cursor|Kilo|Cline|Roo|Windsurf)\b/i.test(
+      /\b(?:You are|powered by|built by|designed by|AI agent|coding assistant|Anthropic|OpenAI|Google Deepmind|DeepSeek|Antigravity|Claude|Codex|ZCode|Cursor|Kilo|Cline|Roo|Windsurf)\b/i.test(
         inner,
       )
     ) {
@@ -330,8 +379,8 @@ function serializeCompactedToolSchemas(tools: readonly NormalizedTool[]): string
   }));
   serialized = JSON.stringify(compactSpecs);
 
-  if (utf8ByteLengthExceeds(serialized, 28_000)) {
-    // Tier 3: preserve concise descriptions on required parameters so complex MCP tools stay callable.
+  if (utf8ByteLengthExceeds(serialized, 20_000)) {
+    // Tier 3 (25-40 tools): preserve concise descriptions on required parameters so complex MCP tools stay callable.
     const requiredOnlySpecs = tools.map((t) => ({
       name: t.name,
       ...(t.description ? { description: trimText(t.description, 100) } : {}),
@@ -339,14 +388,24 @@ function serializeCompactedToolSchemas(tools: readonly NormalizedTool[]): string
     }));
     serialized = JSON.stringify(requiredOnlySpecs);
   }
-  if (utf8ByteLengthExceeds(serialized, 36_000)) {
-    // Tier 4 (extreme 40+ MCP tools): strip all parameter descriptions to stay safely under frame budget.
+  if (utf8ByteLengthExceeds(serialized, 26_000)) {
+    // Tier 4 (40-60+ MCP/orchestration tools): strip all parameter descriptions so `custom_prompt` keeps headroom
+    // for the client's system prompt inside the single-frame 36KB budget (avoiding slow 2-chunk splitting).
     const minimalSpecs = tools.map((t) => ({
       name: t.name,
-      ...(t.description ? { description: trimText(t.description, 80) } : {}),
+      ...(t.description ? { description: trimText(t.description, 72) } : {}),
       parameters: compactJsonSchema(t.inputSchema, 0),
     }));
     serialized = JSON.stringify(minimalSpecs);
+  }
+  if (utf8ByteLengthExceeds(serialized, 30_000)) {
+    // Tier 5 (extreme 60+ oversized schemas): ultra-compact tool descriptions so schema + system prompt stay single-frame.
+    const ultraSpecs = tools.map((t) => ({
+      name: t.name,
+      ...(t.description ? { description: trimText(t.description, 40) } : {}),
+      parameters: compactJsonSchema(t.inputSchema, 0),
+    }));
+    serialized = JSON.stringify(ultraSpecs);
   }
 
   lruSet(toolSchemaHashCache, hashKey, serialized, MAX_TOOL_SCHEMA_CACHE);
@@ -361,7 +420,7 @@ function serializeCompactedToolSchemas(tools: readonly NormalizedTool[]): string
 export function buildToolBridgePrompt(
   tools: readonly NormalizedTool[],
   toolChoice: ToolChoiceMode,
-  opts?: { compactForCustomAgent?: boolean; preferClientToolsOverWorkspace?: boolean },
+  opts?: { compactForCustomAgent?: boolean; preferClientToolsOverWorkspace?: boolean; preferLocalToolsStrictly?: boolean },
 ): string {
   if (!tools.length || toolChoice === "none") return "";
 
@@ -376,9 +435,11 @@ export function buildToolBridgePrompt(
           ? "When a tool above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text."
           : "Whenever a client tool schema above fits the user's request, emit the corresponding `<tool_call>` block; otherwise reply in plain text.";
 
-  const fastPriorityLine = opts?.preferClientToolsOverWorkspace
-    ? "For file, shell, and workspace actions, emit matching `<tool_call>` blocks from the schemas above."
-    : "";
+  const fastPriorityLine = opts?.preferLocalToolsStrictly
+    ? "IMPORTANT: For listing, searching, reading, creating, or editing local files/directories and running shell commands, ALWAYS emit a matching `<tool_call>` block from the schemas above so the caller executes it on the user's machine; NEVER use built-in cloud workspace/sandbox tools or inspect `/workspace` / `artifacts/` / `attached_files/` or return `qw-file://workspace` links when a matching client tool exists."
+    : opts?.preferClientToolsOverWorkspace
+      ? "For file, shell, and workspace actions, emit matching `<tool_call>` blocks from the schemas above — the user's local project files, directories, and shell run on their machine and are accessed directly through these client tools."
+      : "";
 
   // Keep custom_prompt concise and purely positive so client tools stay reliable with minimal overhead.
   if (opts?.compactForCustomAgent) {
@@ -719,8 +780,25 @@ export function parseToolCallsFromText(
     textParts.push(text.slice(cursor));
   }
 
+  let cleanText = textParts.join("").trim();
+  // Conservative recovery when a model wrapped its ONLY trailing tool call(s) inside a bare
+  // unlabeled code fence (````\n<tool_call>...</tool_call>\n````) at the very end of the turn:
+  // strip the ENTIRE wrapping fence cleanly so no dangling ```` ```\n\n``` ```` ever leaks.
+  if (toolCalls.length === 0 && allowedToolNames && allowedToolNames.size > 0) {
+    const bareFenceRe = /(?:^|\n)([`~]{3,})[ \t]*\n([ \t]*<tool_call>[\s\S]*?<\/tool_call>[ \t]*)\n\1[ \t]*$/i;
+    const m = bareFenceRe.exec(cleanText);
+    if (m) {
+      const inner = m[2]!.trim();
+      const innerParsed = parseToolCallsFromText(inner, allowedToolNames, customToolNames);
+      if (innerParsed.toolCalls.length > 0 && innerParsed.cleanText === "") {
+        toolCalls.push(...innerParsed.toolCalls);
+        cleanText = cleanText.slice(0, m.index).trim();
+      }
+    }
+  }
+
   return {
-    cleanText: textParts.join("").trim(),
+    cleanText,
     toolCalls,
   };
 }

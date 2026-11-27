@@ -251,10 +251,14 @@ export const SOFT_REFUSAL_PATTERNS: readonly RegExp[] = [
   /\binjected\s+system\s+prompts?\b/i,
   /\breplayed\s+against\s+a\s+real\s+system\b/i,
   /\b(?:no\s+device\s+(?:is\s+)?connected|connect\s+(?:a|your)\s+local\s+device\s+in\s+(?:amazon|aws)\s+quick)\b/i,
-  /\bAs\s+an\s+(?:Amazon|AWS)\s+Quick\s+assistant\b/i,
+  /\b(?:As\s+an|I(?:'m|\s+am)\s+actually)\s+(?:Amazon|AWS)\s+Quick\b/i,
   /\bmake\s+me\s+output\s+tool\s+calls?\b/i,
   /检测到.*(?:提示词注入|越狱|社会工程)/,
   /(?:没有|未)连接本地设备.*(?:无法|不能)/,
+  /(?:没有|看不到)(?:任何)?(?:可访问的|已索引的)?本地文件夹/,
+  /(?:在|从).*?AWS\s*Quick\s*(?:桌面)?应用.*?(?:发起|添加|开启索引)/i,
+  /这次请求(?:是从云端处理的|在云端运行).*?(?:访问不到|连不上|看不到)/,
+  /我是\s*(?:Amazon|AWS)\s*Quick/i,
 ];
 
 export function isLikelySoftRefusal(text: string): boolean {

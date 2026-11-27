@@ -64,10 +64,12 @@ export function buildOutboundChatFrame(params: OutboundTurnFrameParams): Record<
         : hasClientTools && !forceWebSearchWithTools
           ? false
           : webSearchEnabled;
-  // Match official desktop capture: explicitly send `"off"` for `fast` mode instead of omitting.
+  const effectiveAgentMode = isFinal ? agentMode : "fast";
+  // Match official desktop capture: explicitly send `"off"` for `fast` mode instead of omitting
+  // (including intermediate inline-chunk ack frames which run on `fast`).
   const effectiveThinkingEffort = isInternalRephraseCall
     ? undefined
-    : agentMode === "fast"
+    : effectiveAgentMode === "fast"
       ? "off"
       : thinkingEffort;
 
@@ -126,9 +128,9 @@ export function buildOutboundChatFrame(params: OutboundTurnFrameParams): Record<
       ...(isFinal && effectiveCustomPrompt ? { custom_prompt: effectiveCustomPrompt } : {}),
       ...(isFinal && attachments.length > 0 ? { attachments } : {}),
       message_id: msgId,
-      agent_mode: agentMode,
+      agent_mode: effectiveAgentMode,
       ...(chatAgentId ? { chat_agent_id: chatAgentId } : {}),
-      ...(isFinal && effectiveThinkingEffort ? { thinking_effort: effectiveThinkingEffort } : {}),
+      ...(effectiveThinkingEffort ? { thinking_effort: effectiveThinkingEffort } : {}),
       auto_routing: isFinal && turn.requestedModel.trim().toLowerCase() === "auto",
       web_search_enabled: effectiveWebSearch,
       direct_chat: false,

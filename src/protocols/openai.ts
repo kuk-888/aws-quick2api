@@ -11,6 +11,7 @@ import {
 } from "../core/types.js";
 import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
+import { formatHistoryToolCall } from "../core/tool-bridge.js";
 import { buildStructuredOutputBridgePrompt, officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
 function inferFileMimeFromName(filename: string): string {
@@ -369,17 +370,21 @@ export function parseChatCompletionsRequest(
             const id = typeof tc.id === "string" ? tc.id : "";
             const fn = isRecord(tc.function) ? tc.function : {};
             const name = typeof fn.name === "string" ? fn.name : "";
-            const args =
-              typeof fn.arguments === "string"
+            const rawArgs =
+              typeof fn.arguments === "string" || (fn.arguments && typeof fn.arguments === "object")
                 ? fn.arguments
-                : fn.arguments && typeof fn.arguments === "object"
-                  ? JSON.stringify(fn.arguments)
-                  : "{}";
+                : {};
             if (id || name) toolCallRefs.push({ id, name });
-            return `${name}(${args}) [id=${id}]`;
+            return formatHistoryToolCall(name, rawArgs, id);
           })
           .filter(Boolean);
-        if (callsDesc.length) parts.push(`[ASSISTANT_TOOL_CALLS]:\n${callsDesc.join("\n")}`);
+        if (callsDesc.length) {
+          if (text.trim()) {
+            parts[parts.length - 1] = `[ASSISTANT]:\n${text}\n${callsDesc.join("\n")}`;
+          } else {
+            parts.push(`[ASSISTANT]:\n${callsDesc.join("\n")}`);
+          }
+        }
       }
       if (parts.length > 0) {
         items.push({
@@ -611,19 +616,19 @@ export function parseResponsesRequest(
                   : "";
         const ns = typeof item.namespace === "string" && item.namespace.trim() ? item.namespace.trim() : "";
         const name = ns && rawName ? `${ns}__${rawName}` : rawName;
-        const args =
+        const rawRespArgs =
           itemType === "custom_tool_call"
             ? typeof item.input === "string"
               ? item.input
-              : JSON.stringify(item.input ?? "")
+              : (item.input ?? "")
             : itemType === "local_shell_call" || itemType === "shell_call"
-              ? JSON.stringify(item.action ?? {})
+              ? (item.action ?? {})
               : itemType === "apply_patch_call"
-                ? JSON.stringify(item.operation ?? item.input ?? {})
-                : typeof item.arguments === "string"
+                ? (item.operation ?? item.input ?? {})
+                : typeof item.arguments === "string" || (item.arguments && typeof item.arguments === "object")
                   ? item.arguments
-                  : "{}";
-        const toolCallLine = `[ASSISTANT_TOOL_CALLS]:\n${name}(${args}) [id=${callId}]`;
+                  : {};
+        const toolCallLine = `[ASSISTANT]:\n${formatHistoryToolCall(name, rawRespArgs, callId)}`;
         transcriptLines.push(toolCallLine);
         items.push({
           role: "assistant",

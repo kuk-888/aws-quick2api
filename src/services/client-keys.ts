@@ -34,6 +34,8 @@ export interface ClientGatewayKeyView {
   maxRequests: number | null;
   /** Max simultaneous in-flight requests for this key; `null` = use the gateway default (unlimited unless configured). */
   maxConcurrent: number | null;
+  /** Max simultaneous in-flight inference requests per client IP for this key; `null` = unlimited. */
+  perIpMaxConcurrent: number | null;
   /** ISO-8601 expiration timestamp; `null` = never expires. */
   expiresAt: string | null;
   isExpired: boolean;
@@ -53,6 +55,7 @@ interface InternalClientKey {
   accountGroup: string | null;
   maxRequests: number | null;
   maxConcurrent: number | null;
+  perIpMaxConcurrent: number | null;
   expiresAt: string | null;
   createdAt: string;
   source: ClientKeySource;
@@ -194,6 +197,7 @@ export class ClientGatewayKeyManager {
               accountGroup: loadedGroup,
               maxRequests: normalizeMaxRequests(rec.maxRequests),
               maxConcurrent: normalizeMaxRequests(rec.maxConcurrent),
+              perIpMaxConcurrent: normalizeMaxRequests(rec.perIpMaxConcurrent),
               expiresAt,
               createdAt: typeof rec.createdAt === "string" ? rec.createdAt : new Date().toISOString(),
               source,
@@ -252,6 +256,7 @@ export class ClientGatewayKeyManager {
         accountGroup: null,
         maxRequests: null,
         maxConcurrent: null,
+        perIpMaxConcurrent: null,
         expiresAt: null,
         createdAt: new Date().toISOString(),
         source: "env",
@@ -275,6 +280,7 @@ export class ClientGatewayKeyManager {
       accountGroup: k.accountGroup,
       maxRequests: k.maxRequests,
       maxConcurrent: k.maxConcurrent,
+      perIpMaxConcurrent: k.perIpMaxConcurrent,
       expiresAt: k.expiresAt,
       createdAt: k.createdAt,
       source: k.source,
@@ -340,6 +346,12 @@ export class ClientGatewayKeyManager {
   concurrencyLimitFor(keyId: string, defaultLimit: number): number {
     const k = this.keys.find((x) => x.id === keyId);
     return k?.maxConcurrent ?? defaultLimit;
+  }
+
+  /** Effective per-IP concurrency cap for a key (`0` = unlimited). */
+  perIpConcurrencyLimitFor(keyId: string): number {
+    const k = this.keys.find((x) => x.id === keyId);
+    return k?.perIpMaxConcurrent ?? 0;
   }
 
   authenticateClient(clientToken: string, opts: { checkQuotaCap?: boolean } = {}): AuthenticatedClientIdentity {
@@ -476,6 +488,7 @@ export class ClientGatewayKeyManager {
     accountGroup?: string | null;
     maxRequests?: unknown;
     maxConcurrent?: unknown;
+    perIpMaxConcurrent?: unknown;
     expiresAt?: unknown;
   }): { view: ClientGatewayKeyView; rawToken: string } {
     const name = params.name.trim() || "New Sub-Key";
@@ -506,6 +519,7 @@ export class ClientGatewayKeyManager {
       accountGroup,
       maxRequests: normalizeMaxRequests(params.maxRequests),
       maxConcurrent: normalizeMaxRequests(params.maxConcurrent),
+      perIpMaxConcurrent: normalizeMaxRequests(params.perIpMaxConcurrent),
       expiresAt: normalizeExpiresAt(params.expiresAt),
       createdAt: new Date().toISOString(),
       source: "dashboard",
@@ -531,6 +545,7 @@ export class ClientGatewayKeyManager {
       accountGroup?: string | null;
       maxRequests?: unknown;
       maxConcurrent?: unknown;
+      perIpMaxConcurrent?: unknown;
       expiresAt?: unknown;
       resetRequests?: boolean;
     }
@@ -554,6 +569,8 @@ export class ClientGatewayKeyManager {
       patch.maxRequests !== undefined ? normalizeMaxRequests(patch.maxRequests) : entry.maxRequests;
     const nextMaxConcurrent =
       patch.maxConcurrent !== undefined ? normalizeMaxRequests(patch.maxConcurrent) : entry.maxConcurrent;
+    const nextPerIpMaxConcurrent =
+      patch.perIpMaxConcurrent !== undefined ? normalizeMaxRequests(patch.perIpMaxConcurrent) : entry.perIpMaxConcurrent;
     const nextExpiresAt =
       patch.expiresAt !== undefined ? normalizeExpiresAt(patch.expiresAt) : entry.expiresAt;
 
@@ -564,6 +581,7 @@ export class ClientGatewayKeyManager {
     entry.accountGroup = nextAccountGroup;
     entry.maxRequests = nextMaxRequests;
     entry.maxConcurrent = nextMaxConcurrent;
+    entry.perIpMaxConcurrent = nextPerIpMaxConcurrent;
     entry.expiresAt = nextExpiresAt;
     if (patch.resetRequests === true) {
       entry.stats.requests = 0;
@@ -644,6 +662,7 @@ export class ClientGatewayKeyManager {
       accountGroup: k.accountGroup,
       maxRequests: k.maxRequests,
       maxConcurrent: k.maxConcurrent,
+      perIpMaxConcurrent: k.perIpMaxConcurrent,
       expiresAt: k.expiresAt,
       isExpired,
       isQuotaExhausted,

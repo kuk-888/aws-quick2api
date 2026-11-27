@@ -257,18 +257,33 @@ export function resolveModelSelection(
   };
 }
 
+export const DEFAULT_MODEL_CONTEXT_WINDOW = 1_000_000;
+export const FAST_MODEL_CONTEXT_WINDOW = 200_000;
+
+export function contextWindowForModel(modelId: string): number {
+  const canonical = resolveKnownModelId(modelId) ?? modelId.trim().toLowerCase();
+  return canonical === "quick-fast" ? FAST_MODEL_CONTEXT_WINDOW : DEFAULT_MODEL_CONTEXT_WINDOW;
+}
+
 export function formatOpenAiModelList(models: SDKModel[]): Array<{
   id: string;
   object: "model";
   created: number;
   owned_by: string;
   name?: string;
+  context_length: number;
+  max_input_tokens: number;
 }> {
-  return models.map((m) => ({
-    id: m.id,
-    object: "model",
-    created: 0,
-    owned_by: "aws-quick",
-    ...(m.displayName ? { name: m.displayName } : {}),
-  }));
+  return models.map((m) => {
+    const ctx = contextWindowForModel(m.id);
+    return {
+      id: m.id,
+      object: "model",
+      created: 0,
+      owned_by: "aws-quick",
+      ...(m.displayName ? { name: m.displayName } : {}),
+      context_length: ctx,
+      max_input_tokens: ctx,
+    };
+  });
 }

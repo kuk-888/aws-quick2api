@@ -42,6 +42,7 @@ import {
 } from "../services/self-updater.js";
 import { checkLatestVersion } from "../services/update-checker.js";
 import type { UsageTracker } from "../services/usage-tracker.js";
+import { validateProxyUrl } from "../utils/proxy-agent.js";
 import { AdminAuthManager, clientIpOf, isDirectLoopbackRequest } from "./admin-auth.js";
 import { resolveAdminLang } from "./admin-i18n.js";
 import { renderDashboardHtml } from "./dashboard-ui.js";
@@ -601,6 +602,7 @@ export async function tryHandleWebAdminRoute(
             : undefined,
       maxRequests: body.maxRequests,
       maxConcurrent: body.maxConcurrent,
+      perIpMaxConcurrent: body.perIpMaxConcurrent,
       expiresAt: body.expiresAt
     });
     if (view.accountGroup) {
@@ -652,6 +654,7 @@ export async function tryHandleWebAdminRoute(
           : {}),
         ...(body.maxRequests !== undefined ? { maxRequests: body.maxRequests } : {}),
         ...(body.maxConcurrent !== undefined ? { maxConcurrent: body.maxConcurrent } : {}),
+        ...(body.perIpMaxConcurrent !== undefined ? { perIpMaxConcurrent: body.perIpMaxConcurrent } : {}),
         ...(body.expiresAt !== undefined ? { expiresAt: body.expiresAt } : {}),
         ...(body.resetRequests === true ? { resetRequests: true } : {})
       });
@@ -810,10 +813,80 @@ export async function tryHandleWebAdminRoute(
       throw new GatewayError("`action` and `slotIds` array required.", 400, "invalid_request_error");
     }
     const action = body.action;
-    if (action !== "enable" && action !== "disable" && action !== "delete" && action !== "recheck" && action !== "set-group") {
+    if (
+      action !== "enable" &&
+      action !== "disable" &&
+      action !== "delete" &&
+      action !== "recheck" &&
+      action !== "set-group" &&
+      action !== "set-proxy"
+    ) {
       throw new GatewayError("Unsupported batch action.", 400, "invalid_request_error");
     }
     const ids = body.slotIds.filter((x): x is string => typeof x === "string");
+    if (action === "set-proxy") {
+      let rawEntries: string[];
+      if (Array.isArray(body.proxyUrls)) {
+        if (!body.proxyUrls.every((x): x is string => typeof x === "string")) {
+          throw new GatewayError(
+            "`proxyUrl` string/null or `proxyUrls` string array required for `set-proxy` action.",
+            400,
+            "invalid_request_error",
+          );
+        }
+        rawEntries = body.proxyUrls.length > 0 ? body.proxyUrls : [""];
+      } else if (body.proxyUrl === null || typeof body.proxyUrl === "string") {
+        rawEntries = [body.proxyUrl ?? ""];
+      } else {
+        throw new GatewayError(
+          "`proxyUrl` string/null or `proxyUrls` string array required for `set-proxy` action.",
+          400,
+          "invalid_request_error",
+        );
+      }
+
+      const normalizedTargets: string[] = [];
+      for (const rawItem of rawEntries) {
+        const trimmed = rawItem.trim();
+        if (!trimmed || /^direct$/i.test(trimmed) || trimmed === "直连") {
+          normalizedTargets.push("");
+          continue;
+        }
+        try {
+          normalizedTargets.push(validateProxyUrl(trimmed) ?? "");
+        } catch (err) {
+          throw new GatewayError(
+            err instanceof Error ? err.message : "Invalid proxy URL.",
+            400,
+            "invalid_request_error",
+          );
+        }
+      }
+
+      const uniqueIds = [...new Set(ids)];
+      let affected = 0;
+      let changed = 0;
+      for (const id of uniqueIds) {
+        const before = keyPool.allManagedKeys().find((k) => k.slotId === id);
+        if (!before) continue;
+        const nextProxy = normalizedTargets[affected % normalizedTargets.length] ?? "";
+        // `updateSlotMeta` already emits `onSlotInvalidated` -> `invalidateWarmSessionsForSlot` + standby re-warm.
+        keyPool.updateSlotMeta(id, { proxyUrl: nextProxy });
+        const after = keyPool.allManagedKeys().find((k) => k.slotId === id);
+        affected += 1;
+        if ((before.proxyUrl || "") !== (after?.proxyUrl || "")) {
+          changed += 1;
+        }
+      }
+      sendJson(res, 200, {
+        ok: true,
+        affected,
+        changed,
+        groups: keyPool.listGroupSummaries(clientKeys.countByAccountGroup()),
+        keyPool: keyPool.statusSnapshot(),
+      });
+      return true;
+    }
     if (action === "set-group") {
       if (body.group !== null && typeof body.group !== "string") {
         throw new GatewayError("`group` must be a string or null.", 400, "invalid_account_group");

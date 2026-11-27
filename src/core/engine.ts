@@ -54,13 +54,13 @@ import { RequestAttachmentCache } from "./request-attachment-cache.js";
 import {
   buildToolBridgePrompt,
   deepSanitizeClientSystemPrompt,
-  sanitizeClientSystemPromptForQuick,
   StreamingToolCallFilter,
   stripHighRiskClientHeaders,
 } from "./tool-bridge.js";
 import {
   buildPromptAndAttachmentsForTurn,
   finalizePromptChunksAndOutOfBandText,
+  shouldOffloadPromptToOob,
 } from "./turn-attachment-builder.js";
 import {
   parseRoutedModelThinkingMode,
@@ -1477,6 +1477,7 @@ export class QuickExecutionEngine {
     const toolBridgePrompt = buildToolBridgePrompt(turn.tools, turn.toolChoice, {
       compactForCustomAgent: hasCustomAgent,
       preferClientToolsOverWorkspace: true,
+      preferLocalToolsStrictly: selection.agentMode === "fast",
     });
     const sanitizeMode = parseSanitizeClientSystemPromptMode(
       keyPool ? keyPool.getSettings().sanitizeClientSystemPrompt : this.config.sanitizeClientSystemPrompt,
@@ -1493,14 +1494,31 @@ export class QuickExecutionEngine {
     } else if (turn.systemPrompt?.trim()) {
       const rawSys = turn.systemPrompt.trim();
       const deepSanitizeEnabled = sanitizeMode === "true" || Boolean(turnOpts?.isRephraseRetry);
-      const sysText = deepSanitizeEnabled
-        ? deepSanitizeClientSystemPrompt(rawSys)
-        : toolBridgePrompt
-          ? sanitizeClientSystemPromptForQuick(stripHighRiskClientHeaders(rawSys), true)
-          : stripHighRiskClientHeaders(rawSys);
+      const structRule = turn.structuredOutputPrompt?.trim() || "";
+      // Separate gateway-synthesized `structuredOutputPrompt` from caller-authored system prompt
+      // so JSON Schema constraints stay top-level and are never downgraded into caller context notes.
+      const callerRawSys =
+        structRule && rawSys.endsWith(structRule)
+          ? rawSys.slice(0, rawSys.length - structRule.length).trim()
+          : structRule && rawSys.startsWith(structRule)
+            ? rawSys.slice(structRule.length).trim()
+            : rawSys;
+      const sysText = callerRawSys
+        ? deepSanitizeEnabled
+          ? deepSanitizeClientSystemPrompt(callerRawSys)
+          : stripHighRiskClientHeaders(callerRawSys)
+        : "";
       if (sysText) {
-        effectiveSystemPromptChars = sysText.length;
-        customPromptParts.push(sysText);
+        effectiveSystemPromptChars += sysText.length;
+        customPromptParts.push(
+          toolBridgePrompt && !deepSanitizeEnabled
+            ? `## Caller Instructions\nThe instructions below come from the calling application (follow them while executing requested actions via the client \`<tool_call>\` tools below):\n${sysText}`
+            : sysText,
+        );
+      }
+      if (structRule && callerRawSys !== rawSys) {
+        effectiveSystemPromptChars += structRule.length;
+        customPromptParts.push(structRule);
       }
     }
     if (toolBridgePrompt) customPromptParts.push(toolBridgePrompt);
@@ -1731,7 +1749,13 @@ export class QuickExecutionEngine {
       ((isOAuthAccount && Boolean(cred.oauth)) || (isWeb && Boolean(cred.web))) &&
       (rawSourceFiles.length > 0 ||
         rawSourceImages.length > 0 ||
-        jsonStringUtf8Bytes(rawPromptEst || "") + jsonStringUtf8Bytes(customPrompt || "") > 44_000);
+        shouldOffloadPromptToOob({
+          promptJsonBytes: jsonStringUtf8Bytes(rawPromptEst || ""),
+          customPromptBytes: jsonStringUtf8Bytes(customPrompt || ""),
+          safeSingleFrameTotal: 44_000,
+          hasClientTools: turn.tools.length > 0 && turn.toolChoice !== "none",
+          agentMode: selection.agentMode,
+        }));
 
     if (willLikelyUseOob) {
       const oauthClientIdForSpec = cred.mode === "oauth" ? cred.oauth?.clientId : undefined;
@@ -1864,6 +1888,7 @@ export class QuickExecutionEngine {
         webCred: cred.web,
         effectiveProxy,
         reqAttCache,
+        agentMode: selection.agentMode,
       });
       prompt = built.promptText;
       attachments = built.attachments;
@@ -1889,6 +1914,7 @@ export class QuickExecutionEngine {
             webCred: cred.web,
             effectiveProxy,
             reqAttCache,
+            agentMode: selection.agentMode,
           });
           prompt = coldBuilt.promptText;
           attachments = coldBuilt.attachments;
@@ -1956,6 +1982,7 @@ export class QuickExecutionEngine {
         webCred: cred.web,
         effectiveProxy,
         reqAttCache,
+        agentMode: selection.agentMode,
       });
       chunks = prepared.chunks;
       effectiveCustomPrompt = prepared.effectiveCustomPrompt;
@@ -1988,6 +2015,7 @@ export class QuickExecutionEngine {
           webCred: cred.web,
           effectiveProxy,
           reqAttCache,
+          agentMode: selection.agentMode,
         });
         const coldPrepared = await finalizePromptChunksAndOutOfBandText({
           turn,
@@ -2004,6 +2032,7 @@ export class QuickExecutionEngine {
           webCred: cred.web,
           effectiveProxy,
           reqAttCache,
+          agentMode: selection.agentMode,
         });
         chunks = coldPrepared.chunks;
         effectiveCustomPrompt = coldPrepared.effectiveCustomPrompt;
@@ -2038,6 +2067,7 @@ export class QuickExecutionEngine {
             webCred: cred.web,
             effectiveProxy,
             reqAttCache,
+            agentMode: selection.agentMode,
           });
           const coldPrepared = await finalizePromptChunksAndOutOfBandText({
             turn,
@@ -2054,6 +2084,7 @@ export class QuickExecutionEngine {
             webCred: cred.web,
             effectiveProxy,
             reqAttCache,
+            agentMode: selection.agentMode,
           });
           chunks = coldPrepared.chunks;
           effectiveCustomPrompt = coldPrepared.effectiveCustomPrompt;

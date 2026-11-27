@@ -636,8 +636,36 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     .ck-card-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
     .ck-card-id { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .ck-card-name { font-size: 11px; color: var(--fg-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .preset-pills { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 5px; }
-    .field-lbl { font-size: 12px; color: var(--fg-muted); display: block; margin-bottom: 4px; }
+    .preset-pills { display: flex; gap: 4px; flex-wrap: nowrap; margin-top: 6px; }
+    .preset-pills .btn-xs { padding: 3px 8px; font-size: 11px; white-space: nowrap; }
+    .field-lbl { font-size: 12px; font-weight: 500; color: var(--fg); display: block; margin-bottom: 5px; }
+    .ck-preset-bar {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+      padding: 10px 13px; border-radius: 8px; background: var(--subtle); border: 1px solid var(--border);
+    }
+    .ck-preset-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+    .ck-preset-btn {
+      padding: 4px 10px; font-size: 11.5px; border-radius: 6px; cursor: pointer;
+      border: 1px solid var(--border); background: var(--panel); color: var(--fg);
+      transition: background-color 140ms ease, border-color 140ms ease;
+    }
+    .ck-preset-btn:hover { background: var(--panel-hover); border-color: var(--border-strong); }
+    .ck-preset-btn.recommended { border-color: var(--fg); font-weight: 500; }
+    .ck-section {
+      padding: 13px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--subtle);
+    }
+    .ck-section-hdr {
+      display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap;
+      margin-bottom: 10px; padding-bottom: 7px; border-bottom: 1px solid var(--border);
+    }
+    .ck-section-title { font-size: 12px; font-weight: 600; color: var(--fg); }
+    .ck-section-sub { font-size: 11px; color: var(--fg-muted); }
+    .ck-grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 14px; }
+    @media (max-width: 620px) { .ck-grid-2 { grid-template-columns: 1fr; } }
+    .ck-hint { font-size: 11px; color: var(--fg-muted); margin-top: 4px; line-height: 1.45; }
+    .ck-exp-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .ck-exp-row input { flex: 1; min-width: 190px; }
+    .ck-exp-row .preset-pills { margin-top: 0; }
 
     pre.code-block {
       background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
@@ -1202,6 +1230,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
                     <svg class="act-dd-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
                   </button>
                   <div class="act-dd-menu" role="menu">
+                    <button type="button" class="act-dd-item" id="credBatchProxyBtn" role="menuitem">批量设置代理</button>
+                    <div class="act-dd-sep"></div>
                     <button type="button" class="act-dd-item" id="credBatchEnableBtn" role="menuitem">批量启用</button>
                     <button type="button" class="act-dd-item" id="credBatchDisableBtn" role="menuitem">批量停用</button>
                     <div class="act-dd-sep"></div>
@@ -1775,64 +1805,93 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
 
   <!-- Create / Edit Client Gateway Sub-Key Modal -->
   <div class="modal-mask" id="clientKeyModal" role="dialog" aria-modal="true" aria-labelledby="ckModalTitle" data-click-self="closeCkModal">
-    <div class="modal-card" style="max-width: 720px;">
+    <div class="modal-card" style="max-width: 640px;">
       <div class="panel-hdr" style="flex-shrink:0;">
         <h2 id="ckModalTitle">创建网关子密钥</h2>
         <button class="btn-xs btn-ghost" aria-label="关闭弹窗" data-click="closeCkModal">✕</button>
       </div>
-      <div class="modal-body">
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;">
+      <div class="modal-body" style="display:flex;flex-direction:column;gap:12px;">
+        <div class="ck-preset-bar">
+          <div>
+            <div style="font-size:12px;font-weight:600;color:var(--fg);">一键场景模板</div>
+            <div style="font-size:11px;color:var(--fg-muted);">按用途自动填入推荐并发与有效期</div>
+          </div>
+          <div class="ck-preset-btns">
+            <button type="button" class="ck-preset-btn" data-click="applyCkPreset" data-arg="personal">自用不限</button>
+            <button type="button" class="ck-preset-btn recommended" data-click="applyCkPreset" data-arg="public">公益分享 (推荐)</button>
+            <button type="button" class="ck-preset-btn" data-click="applyCkPreset" data-arg="team">小团队共享</button>
+          </div>
+        </div>
+
+        <div class="ck-grid-2">
           <div>
             <label class="field-lbl">密钥名称备注</label>
-            <input id="ckNameInput" type="text" style="width:100%;" placeholder="例如：分享给前端组 Key / 临时测试 Key" />
+            <input id="ckNameInput" type="text" style="width:100%;" placeholder="例如：公益体验站 / 前端组专用 Key" />
           </div>
           <div id="ckTokenFieldWrap">
-            <label class="field-lbl">自定义 Token (留空自动生成 sk-aq-...)</label>
-            <input id="ckTokenInput" type="text" class="mono" style="width:100%;" placeholder="留空自动生成高强度随机密钥" />
+            <label class="field-lbl">自定义 Token（留空自动生成）</label>
+            <input id="ckTokenInput" type="text" class="mono" style="width:100%;" placeholder="留空自动生成 sk-aq-... 高强度密钥" />
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;padding:12px;background:var(--subtle);border:1px solid var(--border);border-radius:6px;">
-          <div>
-            <label class="field-lbl">最大调用次数限制 (留空或 0 = 无限制)</label>
-            <input id="ckMaxReqInput" type="number" min="0" step="1" class="mono" style="width:100%;" placeholder="无次数限制" />
-            <div class="preset-pills">
-              <button type="button" class="btn-xs" data-click="setCkMaxReq" data-arg="">无限制</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxReq" data-arg="50">50 次</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxReq" data-arg="200">200 次</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxReq" data-arg="1000">1,000 次</button>
+        <div class="ck-section">
+          <div class="ck-section-hdr">
+            <span class="ck-section-title">并发保护与有效期</span>
+            <span class="ck-section-sub">留空或 0 表示不限制</span>
+          </div>
+          <div class="ck-grid-2">
+            <div>
+              <label class="field-lbl">单 IP 最大并发</label>
+              <input id="ckPerIpConcInput" type="number" min="0" step="1" class="mono" style="width:100%;" placeholder="不限（公益站建议 2）" />
+              <div class="preset-pills">
+                <button type="button" class="btn-xs" data-click="setCkPerIpConc" data-arg="">不限</button>
+                <button type="button" class="btn-xs" data-click="setCkPerIpConc" data-arg="1">1 并发</button>
+                <button type="button" class="btn-xs" data-click="setCkPerIpConc" data-arg="2">2 并发</button>
+                <button type="button" class="btn-xs" data-click="setCkPerIpConc" data-arg="4">4 并发</button>
+              </div>
+              <div class="ck-hint">防单人多开窗口或子代理占满全池（自动放行 /v1/models 与 count_tokens）；经本机反代默认自动识别真实 IP，跨机反代/CDN 请配 TRUST_PROXY。</div>
+            </div>
+            <div>
+              <label class="field-lbl">整 Key 总并发上限</label>
+              <input id="ckMaxConcInput" type="number" min="0" step="1" class="mono" style="width:100%;" placeholder="不限总并发" />
+              <div class="preset-pills">
+                <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="">不限</button>
+                <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="12">12</button>
+                <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="24">24</button>
+                <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="48">48</button>
+              </div>
+              <div class="ck-hint">给分享 Key 设总并发封顶，为你的自用 Key 留出专属通道。</div>
             </div>
           </div>
-          <div>
-            <label class="field-lbl">最大并发请求数 (留空或 0 = 不限制)</label>
-            <input id="ckMaxConcInput" type="number" min="0" step="1" class="mono" style="width:100%;" placeholder="不限制并发" />
-            <div class="preset-pills">
-              <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="">不限制</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="3">3</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="8">8</button>
-              <button type="button" class="btn-xs" data-click="setCkMaxConc" data-arg="16">16</button>
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border);">
+            <label class="field-lbl">到期失效时间（留空 = 永不过期）</label>
+            <div class="ck-exp-row">
+              <input id="ckExpiresInput" type="datetime-local" class="mono" />
+              <div class="preset-pills">
+                <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="0">永不</button>
+                <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="1">+1天</button>
+                <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="7">+7天</button>
+                <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="30">+30天</button>
+              </div>
             </div>
           </div>
-          <div>
-            <label class="field-lbl">到期失效时间 (留空 = 永不过期)</label>
-            <input id="ckExpiresInput" type="datetime-local" class="mono" style="width:100%;" />
-            <div class="preset-pills">
-              <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="0">永不过期</button>
-              <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="1">+1 天</button>
-              <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="7">+7 天</button>
-              <button type="button" class="btn-xs" data-click="setCkExpDays" data-arg="30">+30 天</button>
-            </div>
+          <div id="ckLegacyMaxReqRow" style="display:none;margin-top:10px;padding:8px 10px;border-radius:6px;border:1px dashed var(--border);background:var(--panel);font-size:11.5px;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+            <span id="ckLegacyMaxReqText" style="color:var(--fg-muted);"></span>
+            <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font-weight:500;color:var(--fg);margin:0;">
+              <input id="ckClearLegacyMaxReq" type="checkbox" />
+              <span>保存时解除旧版次数限制</span>
+            </label>
           </div>
         </div>
 
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;">
+        <div class="ck-grid-2">
           <div>
             <label class="field-lbl">绑定账号分组（留空 = 全局号池）</label>
             <select id="ckGroupSelect" style="width:100%;">
               <option value="">全局号池（不限制分组）</option>
             </select>
             <div id="ckGroupWarnBox" style="display:none;margin-top:6px;"></div>
-            <div style="font-size:11px;color:var(--fg-muted);margin-top:4px;">严格号池隔离：仅调度组内账号，组内全不可用时直接返回 503/429，绝不跨组或回退全局池。</div>
+            <div class="ck-hint">严格隔离：仅调度组内账号，绝不跨组或回退全局池。</div>
           </div>
 
           <div>
@@ -1844,7 +1903,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
           </div>
         </div>
 
-        <div id="ckModelsPickerWrap" style="display:none;border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+        <div id="ckModelsPickerWrap" style="display:none;border:1px solid var(--border);border-radius:8px;overflow:hidden;">
           <div style="padding:9px 12px;background:var(--subtle);border-bottom:1px solid var(--border);display:flex;gap:6px;align-items:center;flex-wrap:wrap;">
             <input id="ckModelSearch" type="text" placeholder="搜索模型 ID 或名称..." style="flex:1;min-width:140px;padding:5px 9px;font-size:12px;" />
             <span class="mono" style="font-size:11.5px;color:var(--fg-muted);margin:0 4px;" id="ckPickedCountLabel">已选 0 项</span>
@@ -1911,6 +1970,32 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     </div>
   </div>
 
+  <!-- Batch Set / Clear Proxy Modal -->
+  <div class="modal-mask" id="batchProxyModal" role="dialog" aria-modal="true" aria-labelledby="batchProxyModalTitle" data-click-self="closeBatchProxyModal">
+    <div class="modal-card" style="max-width: 500px;">
+      <div class="panel-hdr" style="flex-shrink:0;">
+        <h2 id="batchProxyModalTitle">批量设置代理</h2>
+        <button class="btn-xs btn-ghost" aria-label="关闭弹窗" data-click="closeBatchProxyModal">✕</button>
+      </div>
+      <div class="modal-body" style="gap:10px;">
+        <div id="batchProxyModalDesc" style="font-size:12px;color:var(--fg-muted);line-height:1.55;">
+          输入 1 行代理统一应用到所选账号；输入多行代理（每行一个，可写 <code>direct</code> 或 <code>直连</code> 混排）自动轮询均匀分配；留空或点左下角按钮一键清空改为直连。
+        </div>
+        <div class="field">
+          <label for="batchProxyTextarea">代理地址列表（每行一个）</label>
+          <textarea id="batchProxyTextarea" rows="4" class="mono" style="width:100%;resize:vertical;line-height:1.5;font-size:12px;" placeholder="http://127.0.0.1:10819&#10;http://127.0.0.1:10829&#10;direct"></textarea>
+        </div>
+      </div>
+      <div class="modal-foot" style="justify-content:space-between;">
+        <button type="button" id="batchProxyClearAllBtn">一键清空为直连</button>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <button type="button" data-click="closeBatchProxyModal">取消</button>
+          <button type="button" class="btn-solid" id="batchProxyConfirmBtn">确认应用</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="cSelMenu" class="c-sel-menu" role="listbox"></div>
   <div id="ovTip" class="ov-tip" aria-hidden="true"></div>
 
@@ -1965,6 +2050,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "全部分组": "All Groups",
       "未分组": "Ungrouped",
       "批量分组": "Set Group",
+      "批量设置代理": "Set Proxy (Batch)",
+      "一键清空为直连": "Clear to Direct",
+      "确认应用": "Apply Proxy",
+      "代理地址列表（每行一个）": "Proxy URLs (one per line)",
       "账号分组管理 (Account Groups)": "Account Groups",
       "+ 创建分组": "+ Create Group",
       "将上游账号归入不同分组，并在「网关子密钥」中绑定对应分组，即可在单实例内实现严格号池隔离（绝不跨组回退）。": "Assign accounts into groups and bind sub-keys to a group for strict single-instance pool isolation (never falls back to global pool).",
@@ -2170,24 +2259,34 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       "取消": "Cancel",
       "确认导入并同步额度": "Import & Sync Quotas",
       "创建网关子密钥": "Create Client Sub-Key",
+      "一键场景模板": "Quick Presets",
+      "按用途自动填入推荐并发与有效期": "Auto-fill recommended concurrency & expiration",
+      "自用不限": "Personal",
+      "公益分享 (推荐)": "Public Share (Recommended)",
+      "小团队共享": "Team Share",
       "密钥名称备注": "Sub-Key Name",
-      "例如：分享给前端组 Key / 临时测试 Key": "e.g. Frontend Team / Dev Key",
-      "自定义 Token (留空自动生成 sk-aq-...)": "Custom Token (blank = auto-generate sk-aq-...)",
-      "留空自动生成高强度随机密钥": "Leave blank for random high-entropy token",
-      "最大调用次数限制 (留空或 0 = 无限制)": "Max Requests (blank or 0 = unlimited)",
-      "无次数限制": "Unlimited",
-      "无限制": "Unlimited",
-      "50 次": "50",
-      "200 次": "200",
-      "1,000 次": "1,000",
-      "最大并发请求数 (留空或 0 = 不限制)": "Max Concurrent Requests (blank or 0 = unlimited)",
-      "不限制并发": "Unlimited",
-      "不限制": "Unlimited",
-      "到期失效时间 (留空 = 永不过期)": "Expiration Time (blank = never expires)",
-      "永不过期": "Never",
-      "+1 天": "+1d",
-      "+7 天": "+7d",
-      "+30 天": "+30d",
+      "例如：公益体验站 / 前端组专用 Key": "e.g. Public Trial / Frontend Team Key",
+      "自定义 Token（留空自动生成）": "Custom Token (blank = auto-generate)",
+      "留空自动生成 sk-aq-... 高强度密钥": "Leave blank to auto-generate sk-aq-... token",
+      "并发保护与有效期": "Concurrency & Expiration",
+      "留空或 0 表示不限制": "Blank or 0 = unlimited",
+      "单 IP 最大并发": "Max Concurrent per IP",
+      "不限（公益站建议 2）": "Unlimited (2 recommended for public)",
+      "不限": "None",
+      "1 并发": "1",
+      "2 并发": "2",
+      "4 并发": "4",
+      "防单人多开窗口或子代理占满全池（自动放行 /v1/models 与 count_tokens）；经本机反代默认自动识别真实 IP，跨机反代/CDN 请配 TRUST_PROXY。": "Stops one user from saturating the pool (/v1/models & count_tokens exempt); loopback proxies work automatically, configure TRUST_PROXY behind remote proxies/CDNs.",
+      "保存时解除旧版次数限制": "Clear legacy request-count cap on save",
+      "整 Key 总并发上限": "Key-Wide Max Concurrency",
+      "不限总并发": "Unlimited",
+      "给分享 Key 设总并发封顶，为你的自用 Key 留出专属通道。": "Caps total concurrency of this key to keep headroom for your own key.",
+      "到期失效时间（留空 = 永不过期）": "Expiration Time (blank = never)",
+      "永不": "Never",
+      "+1天": "+1d",
+      "+7天": "+7d",
+      "+30天": "+30d",
+      "严格隔离：仅调度组内账号，绝不跨组或回退全局池。": "Strict isolation: schedules only accounts in this group, never falls back.",
       "模型访问权限策略": "Model Access Policy",
       "允许访问全部全局已启用模型 (无单独模型限制)": "Allow all globally enabled models (unrestricted)",
       "仅允许访问下方勾选的指定模型 (自定义模型白名单)": "Allow only checked models below (custom allowlist)",
@@ -3740,6 +3839,96 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       };
     }
 
+    let batchProxyTargetIds = [];
+    window.closeBatchProxyModal = () => {
+      if ($("batchProxyModal")) $("batchProxyModal").classList.remove("open");
+      batchProxyTargetIds = [];
+    };
+    async function submitBatchProxy(proxyUrls) {
+      const ids = [...batchProxyTargetIds];
+      if (!ids.length) return;
+      const isClearing = proxyUrls.length === 1 && proxyUrls[0] === "";
+      const confirmBtn = $("batchProxyConfirmBtn");
+      const clearBtn = $("batchProxyClearAllBtn");
+      if (confirmBtn) confirmBtn.disabled = true;
+      if (clearBtn) clearBtn.disabled = true;
+      try {
+        const r = await api("/v1/admin/keys/batch", {
+          method: "POST",
+          body: JSON.stringify({ action: "set-proxy", slotIds: ids, proxyUrls }),
+        });
+        window.closeBatchProxyModal();
+        const changedCount = typeof r.changed === "number" ? r.changed : (r.affected ?? ids.length);
+        notify(
+          isClearing
+            ? tr("已清空 " + (r.affected ?? ids.length) + " 个账号的代理并切为直连（实际变更 " + changedCount + " 个），正在后台重建预热池。", "Cleared proxy to direct on " + (r.affected ?? ids.length) + " account(s) (" + changedCount + " changed); rebuilding standby pool.")
+            : tr("已为 " + (r.affected ?? ids.length) + " 个账号应用代理配置（" + (proxyUrls.length > 1 ? "按 " + proxyUrls.length + " 条地址轮询分配，" : "") + "实际变更 " + changedCount + " 个）。", "Applied proxy config to " + (r.affected ?? ids.length) + " account(s) (" + (proxyUrls.length > 1 ? "round-robin across " + proxyUrls.length + " URLs, " : "") + changedCount + " changed)."),
+        );
+        await loadConsoleData("");
+      } catch (e) {
+        notify(e.message, true);
+      } finally {
+        if (confirmBtn) confirmBtn.disabled = false;
+        if (clearBtn) clearBtn.disabled = false;
+      }
+    }
+    if ($("credBatchProxyBtn")) {
+      $("credBatchProxyBtn").onclick = () => {
+        const selected = [...selectedCredIds];
+        const fallbackEnabled = (poolSlotsCache || []).filter((k) => k.enabled).map((k) => k.slotId);
+        const ids = selected.length ? selected : fallbackEnabled;
+        if (!ids.length) {
+          return notify(tr("请先勾选凭证或至少启用 1 个账号。", "Select credentials or enable at least one account first."), true);
+        }
+        batchProxyTargetIds = ids;
+        const scopeLabel = selected.length
+          ? tr("已勾选的 " + ids.length + " 个账号", ids.length + " selected account(s)")
+          : tr("全部 " + ids.length + " 个已启用账号（未勾选时默认作用于全部启用号）", "all " + ids.length + " enabled account(s) (default when none selected)");
+        if ($("batchProxyModalTitle")) {
+          $("batchProxyModalTitle").textContent = tr("批量设置代理 (" + ids.length + " 项)", "Batch Set Proxy (" + ids.length + ")");
+        }
+        if ($("batchProxyModalDesc")) {
+          $("batchProxyModalDesc").innerHTML = tr(
+            "作用范围：<strong>" + esc(scopeLabel) + "</strong>。<br/>输入 1 行统一设置；输入多行（每行一个，可填 <code>direct</code> / <code>直连</code> 混排）自动轮询均匀分配；留空或点左下角按钮一键清空改为直连。",
+            "Scope: <strong>" + esc(scopeLabel) + "</strong>.<br/>Enter 1 URL to apply to all, or multiple lines (use <code>direct</code> to mix direct connections) for automatic round-robin; leave empty or click Clear to Direct."
+          );
+        }
+        if ($("batchProxyTextarea")) $("batchProxyTextarea").value = "";
+        if ($("batchProxyModal")) $("batchProxyModal").classList.add("open");
+        setTimeout(() => { if ($("batchProxyTextarea")) $("batchProxyTextarea").focus(); }, 30);
+      };
+    }
+    if ($("batchProxyConfirmBtn")) {
+      $("batchProxyConfirmBtn").onclick = async () => {
+        const raw = $("batchProxyTextarea") ? $("batchProxyTextarea").value : "";
+        const lines = raw.split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean);
+        if (!lines.length) {
+          const n = batchProxyTargetIds.length;
+          const ok = await uiConfirm({
+            title: tr("确认清空代理为直连", "Confirm Clear Proxies to Direct"),
+            desc: tr("输入框为空，确认清空这 " + n + " 个账号的独立出口代理并切换为直连吗？", "Textarea is empty. Clear per-account proxies on " + n + " account(s) and switch to direct?"),
+            okText: tr("确认清空", "Clear to Direct"),
+          });
+          if (!ok) return;
+          void submitBatchProxy([""]);
+          return;
+        }
+        void submitBatchProxy(lines);
+      };
+    }
+    if ($("batchProxyClearAllBtn")) {
+      $("batchProxyClearAllBtn").onclick = async () => {
+        const n = batchProxyTargetIds.length;
+        const ok = await uiConfirm({
+          title: tr("一键清空代理为直连", "Clear Proxies to Direct"),
+          desc: tr("确认清空这 " + n + " 个账号的独立出口代理并切换为直连吗？不会中断正在生成的对话。", "Clear per-account proxies on " + n + " account(s) and switch to direct? Active streams will not be interrupted."),
+          okText: tr("确认清空", "Clear to Direct"),
+        });
+        if (!ok) return;
+        void submitBatchProxy([""]);
+      };
+    }
+
     function renderGroupsModalList() {
       const box = $("groupsModalList");
       if (!box) return;
@@ -4462,12 +4651,30 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
     }
 
     window.setCkMaxConc = (v) => { $("ckMaxConcInput").value = v === "" ? "" : String(v); };
-    window.setCkMaxReq = (v) => { $("ckMaxReqInput").value = v === "" ? "" : String(v); };
+    window.setCkPerIpConc = (v) => { if ($("ckPerIpConcInput")) $("ckPerIpConcInput").value = v === "" ? "" : String(v); };
     window.setCkExpDays = (days) => {
       days = Number(days);
       if (!days) { $("ckExpiresInput").value = ""; return; }
       const target = new Date(Date.now() + days * 86400 * 1000);
       $("ckExpiresInput").value = toLocalDatetimeInputVal(target.toISOString());
+    };
+    window.applyCkPreset = (kind) => {
+      if (kind === "personal") {
+        window.setCkPerIpConc("");
+        window.setCkMaxConc("");
+        window.setCkExpDays(0);
+      } else if (kind === "public") {
+        window.setCkPerIpConc("2");
+        window.setCkMaxConc("24");
+        window.setCkExpDays(7);
+      } else if (kind === "team") {
+        window.setCkPerIpConc("4");
+        window.setCkMaxConc("");
+        window.setCkExpDays(0);
+      }
+      if ($("ckClearLegacyMaxReq") && $("ckLegacyMaxReqRow") && $("ckLegacyMaxReqRow").style.display !== "none") {
+        $("ckClearLegacyMaxReq").checked = true;
+      }
     };
 
     function renderClientKeysTable() {
@@ -4494,14 +4701,20 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
         const st = k.stats || {};
         const reqLimitStr = k.maxRequests != null
           ? (tr('已用 ', 'Used ') + fmt(st.requests) + ' / ' + fmt(k.maxRequests) + tr(' 次', ' reqs'))
-          : (tr('已用 ', 'Used ') + fmt(st.requests) + tr(' 次 (无上限)', ' reqs (unlimited)'));
+          : (tr('累计 ', 'Total ') + fmt(st.requests) + tr(' 次', ' reqs'));
         const expStr = k.expiresAt
           ? (k.isExpired ? (tr('已于 ', 'Expired ') + new Date(k.expiresAt).toLocaleString() + tr(' 过期', '')) : (tr('至 ', 'Until ') + new Date(k.expiresAt).toLocaleString()))
           : tr('永不过期', 'Never expires');
 
         const limitColor = (k.isExpired || k.isQuotaExhausted) ? 'var(--err)' : 'var(--fg)';
+        const rateBadges = [];
+        if (k.perIpMaxConcurrent != null) rateBadges.push(tr('单IP≤', 'IP≤') + k.perIpMaxConcurrent + tr('并发', ' conc'));
+        if (k.maxConcurrent != null) rateBadges.push(tr('总并发≤', 'Total≤') + k.maxConcurrent);
+        const rateSummaryHtml = rateBadges.length
+          ? '<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:3px;">' + rateBadges.map((b) => '<span class="tag" style="font-size:10.5px;">' + esc(b) + '</span>').join('') + '</div>'
+          : '<div style="font-size:11px;color:var(--fg-muted);">' + esc(tr('并发：不限', 'Concurrency: Unlimited')) + '</div>';
         const limitHtml = '<div style="color:' + limitColor + ';font-size:12px;">' +
-          '<div style="font-size:11px;color:var(--fg-muted);">' + esc(tr('并发 ', 'Concurrency ')) + (k.maxConcurrent != null ? esc(k.maxConcurrent) : esc(tr('不限', 'Unlimited'))) + '</div>' +
+          rateSummaryHtml +
           '<div class="mono">' + esc(reqLimitStr) + (k.isQuotaExhausted ? ' <span class="tag" style="color:var(--err);border-color:var(--err);">' + esc(tr('次数耗尽', 'Exhausted')) + '</span>' : '') + '</div>' +
           '<div style="font-size:11px;color:' + (k.isExpired ? 'var(--err)' : 'var(--fg-muted)') + ';">' + esc(expStr) + '</div>' +
         '</div>';
@@ -4601,9 +4814,11 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("ckModalTitle").textContent = tr("创建网关子密钥", "Create Client Sub-Key");
       $("ckNameInput").value = "";
       $("ckTokenInput").value = "";
-      $("ckMaxReqInput").value = "";
       $("ckMaxConcInput").value = "";
+      if ($("ckPerIpConcInput")) $("ckPerIpConcInput").value = "";
       $("ckExpiresInput").value = "";
+      if ($("ckLegacyMaxReqRow")) $("ckLegacyMaxReqRow").style.display = "none";
+      if ($("ckClearLegacyMaxReq")) $("ckClearLegacyMaxReq").checked = false;
       $("ckTokenFieldWrap").style.display = "block";
       $("ckScopeSelect").value = "all";
       syncSelectUi($("ckScopeSelect"));
@@ -4623,11 +4838,26 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const found = clientKeysCache.find((k) => k.id === id);
       if (!found) return;
       editingCkId = id;
-      $("ckModalTitle").textContent = tr("编辑子密钥权限与配额 · ", "Edit Sub-Key · ") + found.name;
+      $("ckModalTitle").textContent = tr("编辑子密钥配置 · ", "Edit Sub-Key · ") + found.name;
       $("ckNameInput").value = found.name;
-      $("ckMaxReqInput").value = found.maxRequests != null ? String(found.maxRequests) : "";
       $("ckMaxConcInput").value = found.maxConcurrent != null ? String(found.maxConcurrent) : "";
+      if ($("ckPerIpConcInput")) $("ckPerIpConcInput").value = found.perIpMaxConcurrent != null ? String(found.perIpMaxConcurrent) : "";
       $("ckExpiresInput").value = toLocalDatetimeInputVal(found.expiresAt);
+      if ($("ckLegacyMaxReqRow")) {
+        if (found.maxRequests != null) {
+          $("ckLegacyMaxReqRow").style.display = "flex";
+          if ($("ckLegacyMaxReqText")) {
+            $("ckLegacyMaxReqText").textContent = tr(
+              "旧版次数上限：已用 " + (found.stats?.requests || 0) + " / " + found.maxRequests + " 次",
+              "Legacy cap: " + (found.stats?.requests || 0) + " / " + found.maxRequests + " reqs",
+            );
+          }
+          if ($("ckClearLegacyMaxReq")) $("ckClearLegacyMaxReq").checked = false;
+        } else {
+          $("ckLegacyMaxReqRow").style.display = "none";
+          if ($("ckClearLegacyMaxReq")) $("ckClearLegacyMaxReq").checked = false;
+        }
+      }
       $("ckTokenFieldWrap").style.display = "none";
       $("ckScopeSelect").value = found.allowAllModels ? "all" : "custom";
       syncSelectUi($("ckScopeSelect"));
@@ -4649,10 +4879,10 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       const allowAllModels = $("ckScopeSelect").value === "all";
       const allowedModels = [...ckPickedModels];
       const accountGroup = $("ckGroupSelect") ? ($("ckGroupSelect").value.trim() || null) : null;
-      const maxReqRaw = $("ckMaxReqInput").value.trim();
-      const maxRequests = maxReqRaw ? Number(maxReqRaw) : null;
       const maxConcRaw = $("ckMaxConcInput").value.trim();
       const maxConcurrent = maxConcRaw ? Number(maxConcRaw) : null;
+      const perIpConcRaw = $("ckPerIpConcInput") ? $("ckPerIpConcInput").value.trim() : "";
+      const perIpMaxConcurrent = perIpConcRaw ? Number(perIpConcRaw) : null;
       const expRaw = $("ckExpiresInput").value.trim();
       const expiresAt = expRaw ? new Date(expRaw).toISOString() : null;
 
@@ -4662,11 +4892,21 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       $("saveCkModalBtn").disabled = true;
       try {
         if (editingCkId) {
+          const clearLegacyCap = Boolean($("ckClearLegacyMaxReq") && $("ckClearLegacyMaxReq").checked);
           await api("/v1/admin/client-keys/" + editingCkId, {
             method: "PATCH",
-            body: JSON.stringify({ name, allowAllModels, allowedModels, accountGroup, maxRequests, maxConcurrent, expiresAt })
+            body: JSON.stringify({
+              name,
+              allowAllModels,
+              allowedModels,
+              accountGroup,
+              maxConcurrent,
+              perIpMaxConcurrent,
+              expiresAt,
+              ...(clearLegacyCap ? { maxRequests: null } : {}),
+            })
           });
-          notify(tr("已保存密钥 「" + name + "」 的权限与有效期配置。", "Saved sub-key '" + name + "'."));
+          notify(tr("已保存密钥 「" + name + "」 的权限与限流配置。", "Saved sub-key '" + name + "'."));
         } else {
           const customToken = $("ckTokenInput").value.trim();
           const created = await api("/v1/admin/client-keys", {
@@ -4677,8 +4917,8 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
               allowAllModels,
               allowedModels,
               accountGroup,
-              maxRequests,
               maxConcurrent,
+              perIpMaxConcurrent,
               expiresAt
             })
           });
@@ -6062,6 +6302,7 @@ export function renderDashboardHtml(dashboardPath = "/dashboard", nonce = ""): s
       else if ($("promptEditorModal") && $("promptEditorModal").classList.contains("open")) closePromptEditor();
       else if ($("updateModal") && $("updateModal").classList.contains("open")) window.closeUpdateModal();
       else if ($("assignGroupModal") && $("assignGroupModal").classList.contains("open")) window.closeAssignGroupModal(null);
+      else if ($("batchProxyModal") && $("batchProxyModal").classList.contains("open")) window.closeBatchProxyModal();
       else if ($("groupsModal") && $("groupsModal").classList.contains("open")) window.closeGroupsModal();
       else if ($("addModal").classList.contains("open")) window.closeAddModal();
       else if ($("clientKeyModal").classList.contains("open")) window.closeCkModal();

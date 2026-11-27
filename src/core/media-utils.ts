@@ -64,17 +64,32 @@ export function buildOutOfBandContextPrompt(
   maxInlineChars = 3_500,
   isIncremental = false,
   openingHintSource?: string,
+  hasClientTools = false,
 ): string {
   const totalChars = fullPrompt.length;
   const label = isIncremental ? "full incremental context" : "full conversation/context";
+  const toolFooter = hasClientTools
+    ? "\n\n[Client tool reminder: For actions matching the Client Tools schema (files, directories, shell, or external APIs), emit matching `<tool_call>` JSON blocks.]"
+    : "";
   if (maxInlineChars <= 0) {
-    return `[The ${label} (${totalChars.toLocaleString()} chars) is attached as an AWS Quick cloud workspace file \`${filename}\` (NOT a local file on the user's machine; never call client \`<tool_call>\` tools to read \`${filename}\`). Inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
+    if (hasClientTools && !isIncremental) {
+      return `[Earlier transcript archive of this session (${totalChars.toLocaleString()} chars; attached for reference only, not a file in the user's local repository). Inspect the attached transcript archive directly only if needed to recover the user's request, then answer or emit client \`<tool_call>\` blocks for requested actions.]${toolFooter}`;
+    }
+    if (hasClientTools && isIncremental) {
+      return `[The ${label} (${totalChars.toLocaleString()} chars, such as large current-turn tool output) is attached as \`${filename}\`. Inspect the attached \`${filename}\` directly to read the omitted content, then answer or emit client \`<tool_call>\` blocks for any next actions.]${toolFooter}`;
+    }
+    return `[The ${label} (${totalChars.toLocaleString()} chars) is attached as \`${filename}\`. Inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
   }
 
-  const header = `[The ${label} (${totalChars.toLocaleString()} chars) is attached as an AWS Quick cloud workspace file \`${filename}\` (NOT a local file on the user's machine; never call client \`<tool_call>\` tools to read \`${filename}\`), with the latest request and recent context excerpted below. Answer directly if the excerpt below already has everything needed; if earlier details, code, or facts are missing or referenced, inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
+  const header =
+    hasClientTools && !isIncremental
+      ? `[Earlier transcript archive of this session (${totalChars.toLocaleString()} chars; attached for reference only, not a file in the user's local repository). Recent turns and the latest request are excerpted below. Answer directly from the excerpt if sufficient; only read the attached transcript archive if older context not shown below is needed. For actions matching the Client Tools schema, emit client \`<tool_call>\` blocks.]`
+      : hasClientTools && isIncremental
+        ? `[The ${label} (${totalChars.toLocaleString()} chars, including large current-turn input or tool output) is attached as \`${filename}\`, with the opening and tail excerpted below. Answer directly if the excerpt below is sufficient; otherwise inspect the attached \`${filename}\` directly for the middle portion, and use client \`<tool_call>\` blocks for any next tool actions.]`
+        : `[The ${label} (${totalChars.toLocaleString()} chars) is attached as \`${filename}\`, with the latest request and recent context excerpted below. Answer directly if the excerpt below already has everything needed; if earlier details, code, or facts are missing or referenced, inspect the attached \`${filename}\` directly in a single targeted search/read without narrating the file read, then respond directly.]`;
 
   if (totalChars <= maxInlineChars) {
-    return [header, "", fullPrompt.trim()].join("\n");
+    return [header, "", fullPrompt.trim()].join("\n") + toolFooter;
   }
 
   const headBudget = Math.min(1_100, Math.floor(maxInlineChars * 0.32));
@@ -133,7 +148,7 @@ export function buildOutOfBandContextPrompt(
       : [`[Opening of latest request]\n${headSnippet}`, "...", `[Trailing context]\n${tailText}`]
     : [tailText];
 
-  return [header, "", ...bodyParts].join("\n");
+  return [header, "", ...bodyParts].join("\n") + toolFooter;
 }
 
 async function compressImageForQuickFrame(

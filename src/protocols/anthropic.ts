@@ -11,6 +11,7 @@ import {
 } from "../core/types.js";
 import { computeDialogPrefixHashes, extractFirstUserTurnText, type HashableDialogItem } from "../utils/hash.js";
 import { deriveConversationAffinityKey } from "../core/session-affinity.js";
+import { formatHistoryToolCall } from "../core/tool-bridge.js";
 import { resolveKnownModelId } from "../services/model-catalog.js";
 import { buildStructuredOutputBridgePrompt, officialErrorType, requireModelField, collectTurnEvents, estimateImageTokens, isRecord, parseDataUrlOrRemoteImage, type ProtocolAdapter } from "./common.js";
 
@@ -414,9 +415,8 @@ export function parseAnthropicMessagesRequest(
       } else if (bType === "tool_use") {
         const id = typeof block.id === "string" ? block.id : "";
         const name = typeof block.name === "string" ? block.name : "";
-        const inputJson = JSON.stringify(block.input ?? {});
         if (id || name) toolCallRefs.push({ id, name });
-        toolUseLines.push(`${name}(${inputJson}) [id=${id}]`);
+        toolUseLines.push(formatHistoryToolCall(name, block.input ?? {}, id));
       } else if (bType === "tool_result") {
         const toolUseId = typeof block.tool_use_id === "string" ? block.tool_use_id.trim() : "";
         const isError = block.is_error === true;
@@ -459,7 +459,13 @@ export function parseAnthropicMessagesRequest(
       formattedParts.push(`[${role.toUpperCase()}]:\n${joinedText || placeholder}`);
     }
     if (toolUseLines.length > 0) {
-      formattedParts.push(`[ASSISTANT_TOOL_CALLS]:\n${toolUseLines.join("\n")}`);
+      const assistantBlock = joinedText
+        ? `[ASSISTANT]:\n${joinedText}\n${toolUseLines.join("\n")}`
+        : `[ASSISTANT]:\n${toolUseLines.join("\n")}`;
+      if (joinedText) {
+        formattedParts.pop();
+      }
+      formattedParts.push(assistantBlock);
     }
 
     if (formattedParts.length > 0) {

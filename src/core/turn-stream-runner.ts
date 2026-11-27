@@ -683,8 +683,8 @@ export async function* runTurnStream(
       totalChunks === 1
         ? chunks[idx]!
         : isFinal
-          ? `[Context segment ${idx + 1}/${totalChunks} — final segment. All context segments are now complete; please answer the request above.]\n\n${chunks[idx]!}`
-          : `[Context segment ${idx + 1}/${totalChunks} uploaded; awaiting remaining segments.]\n\n${chunks[idx]!}`;
+          ? `[Context segment ${idx + 1}/${totalChunks} — final segment.]\n\n${chunks[idx]!}`
+          : `[Context segment ${idx + 1}/${totalChunks} uploaded; awaiting remaining segments. Reply "OK" only and wait for the final segment.]\n\n${chunks[idx]!}`;
     const msgId = `msg-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
     if (isFinal) lastSentMessageId = msgId;
     touchIdleTimer();
@@ -727,10 +727,41 @@ export async function* runTurnStream(
 
   let missedPongs = 0;
   let thinkingOnlyStartedAt = 0;
-  // Cap single-segment continuous thinking-only loops at `runIdleTimeoutMs` (default 10 min;
-  // reset on every thinking_complete / tool_progress / tool_arguments / tool_result / text_delta),
-  // giving `effort=max` deep reasoning full headroom while still bounding infinite thinking loops.
+  let cumulativeNoOutputStartedAt = 0;
+  // Cap continuous thinking-only loops AND monotonic cumulative zero-output loops (never reset by
+  // thinking_complete / cloud tool_start / tool_result; cleared only on non-empty text_delta or tool_call).
+  // Respects user-configured `RUN_IDLE_TIMEOUT_MS` (default 600s) in production while capping multi-segment
+  // infinite thinking/cloud-tool hangs (#16) instead of allowing 15–23 min stuck sessions.
   const maxThinkingOnlyMs = runIdleTimeoutMs > 0 ? runIdleTimeoutMs : 600_000;
+  const maxCumulativeNoOutputMs =
+    runIdleTimeoutMs > 0 && runIdleTimeoutMs < 60_000
+      ? Math.min(runMaxTimeoutMs, runIdleTimeoutMs * 3)
+      : Math.min(runMaxTimeoutMs, maxThinkingOnlyMs);
+  const checkCumulativeNoOutputCap = (): boolean => {
+    if (hasEmittedText || hasEmittedToolCall) return false;
+    const now = Date.now();
+    if (!cumulativeNoOutputStartedAt) {
+      cumulativeNoOutputStartedAt = now;
+      return false;
+    }
+    if (now - cumulativeNoOutputStartedAt > maxCumulativeNoOutputMs) {
+      clearAllStreamTimers();
+      ended = true;
+      push({
+        type: "__error",
+        error: new GatewayError(
+          `AWS Quick produced no assistant text or tool call after ${Math.round(maxCumulativeNoOutputMs / 1000)}s of internal thinking/cloud-tool activity.`,
+          504,
+          "timeout_error",
+        ),
+      });
+      try {
+        ws.terminate();
+      } catch { }
+      return true;
+    }
+    return false;
+  };
   const onWsPong = () => {
     missedPongs = 0;
     clearStandbyLivenessTimer();
@@ -1003,6 +1034,7 @@ export async function* runTurnStream(
       if (evType === "thinking_start") {
         clearPostUsageTimer();
         touchIdleTimer();
+        if (checkCumulativeNoOutputCap()) return;
         proto.onThinkingStart();
         rearmPostUsageIfNeeded();
         continue;
@@ -1011,6 +1043,7 @@ export async function* runTurnStream(
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
         touchIdleTimer();
+        if (checkCumulativeNoOutputCap()) return;
         proto.onThinkingComplete();
         rearmPostUsageIfNeeded();
         continue;
@@ -1019,6 +1052,7 @@ export async function* runTurnStream(
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
         touchIdleTimer();
+        if (checkCumulativeNoOutputCap()) return;
         proto.onCloudToolStart(
           typeof payload.tool_id === "string" ? payload.tool_id : undefined,
           typeof payload.tool_name === "string" ? payload.tool_name : undefined,
@@ -1029,12 +1063,14 @@ export async function* runTurnStream(
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
         touchIdleTimer();
+        if (checkCumulativeNoOutputCap()) return;
         continue;
       }
       if (evType === "tool_result" || evType === "tool_error") {
         clearPostUsageTimer();
         thinkingOnlyStartedAt = 0;
         touchIdleTimer();
+        if (checkCumulativeNoOutputCap()) return;
         proto.onCloudToolResult(
           typeof payload.tool_id === "string" ? payload.tool_id : undefined,
           typeof payload.tool_name === "string" ? payload.tool_name : undefined,
@@ -1054,9 +1090,10 @@ export async function* runTurnStream(
         }
       } else if (evType === "text_delta") {
         clearPostUsageTimer();
-        thinkingOnlyStartedAt = 0;
         const delta = String(payload.delta || "");
         if (delta) {
+          thinkingOnlyStartedAt = 0;
+          cumulativeNoOutputStartedAt = 0;
           touchIdleTimer();
           let afterTools = delta;
           let toolEvents: StreamingToolCallEvent[] = [];
@@ -1090,6 +1127,7 @@ export async function* runTurnStream(
         const delta = String(payload.delta || "");
         if (delta) {
           touchIdleTimer();
+          if (checkCumulativeNoOutputCap()) return;
           if (!thinkingOnlyStartedAt) thinkingOnlyStartedAt = Date.now();
           if (Date.now() - thinkingOnlyStartedAt > maxThinkingOnlyMs) {
             clearAllStreamTimers();

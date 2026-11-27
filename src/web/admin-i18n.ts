@@ -62,7 +62,8 @@ const EXACT_ZH: Record<string, string> = {
   "Invalid proxy URL.": "代理地址格式无效。",
   "Invalid `showRoutedModelInThinking` value (expected 'true', 'always', or 'false').": "`showRoutedModelInThinking` 参数无效（仅支持 'true'、'always' 或 'false'）。",
   "`group` must be a string or null.": "批量分组操作必须传入字符串或 null 类型的 `group` 参数。",
-  "`group` string or null is required for `set-group` action.": "批量分组操作必须传入字符串或 null 类型的 `group` 参数。"
+  "`group` string or null is required for `set-group` action.": "批量分组操作必须传入字符串或 null 类型的 `group` 参数。",
+  "`proxyUrl` string/null or `proxyUrls` string array required for `set-proxy` action.": "批量设置代理必须传入 `proxyUrl` 字符串/null 或 `proxyUrls` 字符串数组。"
 };
 
 const EXACT_EN: Record<string, string> = {
